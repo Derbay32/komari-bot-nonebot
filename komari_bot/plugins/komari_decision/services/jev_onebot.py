@@ -27,6 +27,7 @@ payload 群号 + 缓存签名 + 原文一致），只是消费通用引用 API�
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Final
 
@@ -129,7 +130,7 @@ def _default_bot_resolver(account_id: str) -> object | None:
     return get_bot(account_id)
 
 
-def _message_time(value: object) -> datetime | None:
+def platform_message_time(value: object) -> datetime | None:
     """把协议 ``time``（Unix 秒）转成带时区 UTC 时间；非法返回 ``None``。"""
     if isinstance(value, bool) or not isinstance(value, int):
         return None
@@ -141,7 +142,7 @@ def _message_time(value: object) -> datetime | None:
         return None
 
 
-def _display_name(sender: object) -> str:
+def sender_display_name(sender: object) -> str:
     """发送者展示名：优先群名片，其次昵称（均为不可信数据，不做改写）。"""
     if isinstance(sender, Mapping):
         card = sender.get("card")
@@ -155,52 +156,113 @@ def _display_name(sender: object) -> str:
     return ""
 
 
-class _Segments:
-    """一条原生消息段投影（纯事实，不含任何解析猜测）。"""
+@dataclass(frozen=True, slots=True)
+class NativeSegments:
+    """一条原生消息段的投影事实（不含任何补造或解析猜测）。"""
 
-    __slots__ = (
-        "image_present",
-        "mention_ids",
-        "reference_ids",
-        "text_parts",
-    )
-
-    def __init__(self) -> None:
-        self.reference_ids: list[str] = []
-        self.mention_ids: list[str] = []
-        self.image_present = False
-        self.text_parts: list[str] = []
-
-    @property
-    def text(self) -> str:
-        return "".join(self.text_parts)
+    text: str
+    reference_ids: tuple[str, ...] = ()
+    mention_ids: tuple[str, ...] = ()
+    image_present: bool = False
 
 
-def _project_segments(message: Message) -> _Segments | None:
+def project_native_segments(
+    message: Message,
+    *,
+    strict: bool = True,
+) -> NativeSegments | None:
     """用官方 SDK 解析出的消息段投影引用/提及/媒体/纯文本事实。
 
     只认原生段类型：``reply`` 提供引用标识、``at`` 提供提及标识、``image``
     提供「发送了图片」这一事实。文本段里即便写着 CQ 样式字样也不产生引用边。
+
+    ``strict`` 为真时（引用补取既有语义）任何非法原生标识都判整条消息不可读；
+    入站目标投影用非严格模式跳过非法标识——非法标识只能不构成引用/ summon
+    事实，不能让一条正常正文整条不可读。
     """
-    segments = _Segments()
+    reference_ids: list[str] = []
+    mention_ids: list[str] = []
+    text_parts: list[str] = []
+    image_present = False
     for segment in message:
         kind = segment.type
         if kind == "reply":
             number = canonical_message_id(segment.data.get("id"))
             if number is None:
-                return None
-            _append_unique(segments.reference_ids, str(number))
+                if strict:
+                    return None
+                continue
+            _append_unique(reference_ids, str(number))
         elif kind == "at":
             number = canonical_platform_id(segment.data.get("qq"))
             if number is not None:
-                _append_unique(segments.mention_ids, str(number))
+                _append_unique(mention_ids, str(number))
         elif kind == "image":
-            segments.image_present = True
+            image_present = True
         elif kind == "text":
             value = segment.data.get("text")
             if isinstance(value, str):
-                segments.text_parts.append(value)
-    return segments
+                text_parts.append(value)
+    return NativeSegments(
+        text="".join(text_parts),
+        reference_ids=tuple(reference_ids),
+        mention_ids=tuple(mention_ids),
+        image_present=image_present,
+    )
+
+
+def project_trusted_reply(  # noqa: PLR0911 - 每个显式矛盾都必须独立拒绝
+    reply: Reply,
+    *,
+    native_reply_id: str,
+    group_id: str,
+    bot_self_id: str,
+    receipt_at: datetime,
+) -> DecisionMessage | None:
+    """把**已可获得**的引用消息投影为可信已知引用；任一矛盾返回 ``None``。
+
+    可信条件：原生 ``reply`` 段标识与引用消息标识一致、群来源一致（显式矛盾
+    即拒绝）、引用不晚于本地接收截止点、发送者与时间可解析。私聊引用与凭空
+    猜测都不能成为可信引用或真实平台召唤。
+    """
+    canonical_group = canonical_platform_id(group_id)
+    if canonical_group is None:
+        return None
+    requested_id = canonical_message_id(reply.message_id)
+    if requested_id is None or str(requested_id) != native_reply_id:
+        return None
+    if reply.message_type != "group":
+        return None
+    provided_group = getattr(reply, "group_id", None)
+    if provided_group is not None:
+        canonical_provided = canonical_platform_id(provided_group)
+        if canonical_provided is None or canonical_provided != canonical_group:
+            return None
+    timestamp = platform_message_time(reply.time)
+    if timestamp is None or timestamp > receipt_at:
+        return None
+    sender_id = canonical_platform_id(reply.sender.user_id)
+    if sender_id is None:
+        return None
+    message = reply.message
+    if not isinstance(message, Message):
+        return None
+    segments = project_native_segments(message, strict=False)
+    if segments is None:
+        return None
+    return DecisionMessage(
+        message_id=str(requested_id),
+        group_id=str(canonical_group),
+        sender_id=str(sender_id),
+        text=segments.text,
+        timestamp=timestamp,
+        display_name=sender_display_name(reply.sender),
+        is_bot=str(sender_id) == bot_self_id,
+        reference_ids=segments.reference_ids,
+        mention_ids=segments.mention_ids,
+        image_present=segments.image_present,
+        image_description=None,
+    )
 
 
 def _append_unique(target: list[str], value: str) -> None:
@@ -225,7 +287,7 @@ def _project(  # noqa: PLR0911 - 每个显式矛盾都必须独立拒绝
         return None
     if payload.get("message_type") != "group":
         return None
-    timestamp = _message_time(payload.get("time"))
+    timestamp = platform_message_time(payload.get("time"))
     if timestamp is None:
         return None
     raw_sender = payload.get("sender")
@@ -246,7 +308,7 @@ def _project(  # noqa: PLR0911 - 每个显式矛盾都必须独立拒绝
     message = reply.message
     if not isinstance(message, Message):
         return None
-    segments = _project_segments(message)
+    segments = project_native_segments(message)
     if segments is None:
         return None
     return DecisionMessage(
@@ -255,10 +317,10 @@ def _project(  # noqa: PLR0911 - 每个显式矛盾都必须独立拒绝
         sender_id=str(sender_id),
         text=segments.text,
         timestamp=timestamp,
-        display_name=_display_name(raw_sender),
+        display_name=sender_display_name(raw_sender),
         is_bot=str(sender_id) == str(bot.self_id),
-        reference_ids=tuple(segments.reference_ids),
-        mention_ids=tuple(segments.mention_ids),
+        reference_ids=segments.reference_ids,
+        mention_ids=segments.mention_ids,
         image_present=segments.image_present,
         image_description=None,
     )
@@ -344,8 +406,13 @@ class OneBotReferenceReader:
 
 __all__ = [
     "PROTOCOL",
+    "NativeSegments",
     "OneBotReferenceReader",
     "canonical_message_id",
     "canonical_platform_id",
     "group_business_admitted",
+    "platform_message_time",
+    "project_native_segments",
+    "project_trusted_reply",
+    "sender_display_name",
 ]

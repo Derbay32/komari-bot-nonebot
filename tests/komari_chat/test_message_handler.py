@@ -140,64 +140,22 @@ def _chat_memory_stub(**overrides: object) -> SimpleNamespace:
     return SimpleNamespace(**values)
 
 
-def test_resolve_trigger_message_uses_nonebot_to_me(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    handler = _build_handler()
-    _patch_config(monkeypatch)
+def test_trigger_resolution_lives_in_decision_ingress_only() -> None:
+    """TSK-187：文本别名/适配器 to_me 的直通判定已移出聊天处理器。
 
-    at_trigger, message_content = handler._resolve_trigger_message(
-        _FakeEvent("我不吃药！", to_me=True)
-    )
-
-    assert at_trigger is True
-    assert message_content == "我不吃药！"
-
-
-def test_resolve_trigger_message_detects_reply_to_bot(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    handler = _build_handler()
-    _patch_config(monkeypatch)
-    reply = _build_reply(
-        sender_user_id=669293859,
-        message=Message("机器人上一条回复"),
-    )
-
-    at_trigger, message_content = handler._resolve_trigger_message(
-        _FakeEvent("接着说", reply=reply)
-    )
-
-    assert at_trigger is True
-    assert message_content == "接着说"
-
-
-def test_resolve_trigger_message_detects_plain_text_at_alias(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    handler = _build_handler()
-    _patch_config(monkeypatch)
-
-    at_trigger, message_content = handler._resolve_trigger_message(
-        _FakeEvent("@小鞠知花 我不吃药！")
-    )
-
-    assert at_trigger is True
-    assert message_content == "我不吃药！"
-
-
-def test_resolve_trigger_message_keeps_regular_text_unchanged(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    handler = _build_handler()
-    _patch_config(monkeypatch)
-
-    at_trigger, message_content = handler._resolve_trigger_message(
-        _FakeEvent("我觉得小鞠知花今天会装傻。")
-    )
-
-    assert at_trigger is False
-    assert message_content == "我觉得小鞠知花今天会装傻。"
+    真实平台召唤与文本称呼的区分由判定入站投影拥有（见
+    ``tests/komari_decision/test_jev_ingress.py``）；聊天处理器不得再自行
+    剥离称呼、也不得把 ``to_me`` 当成召唤事实。
+    """
+    for removed in (
+        "_resolve_trigger_message",
+        "_is_at_trigger",
+        "_is_reply_to_bot",
+        "_strip_text_at_alias_prefix",
+    ):
+        assert not hasattr(message_handler_module.MessageHandler, removed), (
+            f"聊天处理器不应再自行解析触发事实: {removed}"
+        )
 
 
 class _FakeRedis:
@@ -559,8 +517,7 @@ def test_attempt_reply_only_rewrites_current_message(
             reply_context_requested=False,
             reply_context_refetched=False,
             force_reply=True,
-            reason="at",
-            reply_score=0.9,
+            reason="platform_summon",
             store_current=True,
         )
     )
@@ -767,8 +724,7 @@ def _run_reaction_sent_attempt(handler: Any, message: MessageSchema) -> Any:
             reply_context_requested=False,
             reply_context_refetched=False,
             force_reply=True,
-            reason="at",
-            reply_score=1.0,
+            reason="platform_summon",
             store_current=True,
             on_reply_triggered=_dummy_reaction,
         )
@@ -821,7 +777,7 @@ def test_resolve_reply_context_builds_user_side_text_context() -> None:
         handler._resolve_reply_context(
             bot=_FakeBot(),
             event=event,
-            at_trigger=True,
+            platform_summoned=True,
         )
     )
 
@@ -854,7 +810,7 @@ def test_resolve_reply_context_builds_assistant_side_text_context() -> None:
         handler._resolve_reply_context(
             bot=_FakeBot(),
             event=event,
-            at_trigger=True,
+            platform_summoned=True,
         )
     )
 
@@ -887,7 +843,7 @@ def test_resolve_reply_context_extracts_image_sources_from_url_and_file() -> Non
         handler._resolve_reply_context(
             bot=_FakeBot(),
             event=event,
-            at_trigger=True,
+            platform_summoned=True,
         )
     )
 
@@ -935,7 +891,7 @@ def test_resolve_reply_context_refetches_when_image_source_is_missing() -> None:
         handler._resolve_reply_context(
             bot=bot,
             event=event,
-            at_trigger=True,
+            platform_summoned=True,
         )
     )
 
@@ -976,7 +932,7 @@ def test_resolve_reply_context_skips_when_message_is_not_to_bot() -> None:
         handler._resolve_reply_context(
             bot=bot,
             event=event,
-            at_trigger=False,
+            platform_summoned=False,
         )
     )
 
@@ -1668,8 +1624,7 @@ def test_normal_attempt_reply_defers_side_effects_until_delivery(
             reply_context_requested=False,
             reply_context_refetched=False,
             force_reply=True,
-            reason="at",
-            reply_score=0.9,
+            reason="platform_summon",
             store_current=True,
         )
     )
@@ -1749,7 +1704,6 @@ def test_proactive_attempt_returns_pending_reply_carrying_handoff(
             reply_context_refetched=False,
             force_reply=False,
             reason="score",
-            reply_score=0.95,
             store_current=True,
         )
     )
@@ -1824,7 +1778,6 @@ def test_proactive_generation_failure_returns_failure_and_lease_exit_releases(
             reply_context_refetched=False,
             force_reply=False,
             reason="score",
-            reply_score=0.95,
             store_current=True,
         )
     )
@@ -1886,8 +1839,7 @@ def test_normal_attempt_reply_gracefully_handles_favorability_read_failure(
             reply_context_requested=False,
             reply_context_refetched=False,
             force_reply=True,
-            reason="at",
-            reply_score=1.0,
+            reason="platform_summon",
             store_current=True,
         )
     )
@@ -2071,8 +2023,7 @@ def test_reaction_scheduled_before_generate_core(
             reply_context_requested=False,
             reply_context_refetched=False,
             force_reply=True,
-            reason="at",
-            reply_score=1.0,
+            reason="platform_summon",
             store_current=True,
             on_reply_triggered=_fake_reaction,
         )
@@ -2173,8 +2124,7 @@ def test_reaction_not_scheduled_when_disabled(
             reply_context_requested=False,
             reply_context_refetched=False,
             force_reply=True,
-            reason="at",
-            reply_score=1.0,
+            reason="platform_summon",
             store_current=True,
             on_reply_triggered=_fake_reaction,
         )
@@ -2273,8 +2223,7 @@ def test_reaction_sent_then_empty_reply_returns_failure_with_reaction_sent_true(
             reply_context_requested=False,
             reply_context_refetched=False,
             force_reply=True,
-            reason="at",
-            reply_score=1.0,
+            reason="platform_summon",
             store_current=True,
             on_reply_triggered=_dummy_reaction_empty,
         )
@@ -2372,8 +2321,7 @@ def test_reaction_sent_then_delta_missing_returns_failure_with_reaction_sent_tru
             reply_context_requested=False,
             reply_context_refetched=False,
             force_reply=True,
-            reason="at",
-            reply_score=1.0,
+            reason="platform_summon",
             store_current=True,
             on_reply_triggered=_dummy_reaction_delta,
         )
@@ -2445,7 +2393,6 @@ def test_reserve_failure_returns_failure_with_reaction_sent_false(
             reply_context_refetched=False,
             force_reply=False,
             reason="score",
-            reply_score=0.95,
             store_current=True,
             on_reply_triggered=_fake_reaction,
         )
@@ -2531,7 +2478,6 @@ def test_proactive_denied_reason_records_branch_telemetry_and_returns_no_reply(
             reply_context_refetched=False,
             force_reply=False,
             reason="score",
-            reply_score=0.95,
             store_current=True,
         )
     )
@@ -2619,7 +2565,6 @@ def test_proactive_handoff_lost_returns_generate_failure_with_reaction_sent_true
             reply_context_refetched=False,
             force_reply=False,
             reason="score",
-            reply_score=0.95,
             store_current=True,
             on_reply_triggered=_fake_reaction,
         )
@@ -2720,8 +2665,7 @@ def test_pending_reply_does_not_retain_reaction_callback(
             reply_context_requested=False,
             reply_context_refetched=False,
             force_reply=True,
-            reason="at",
-            reply_score=1.0,
+            reason="platform_summon",
             store_current=True,
         )
     )
@@ -2783,8 +2727,7 @@ def test_read_buffers_failure_returns_failure_with_reaction_sent_false(
             reply_context_requested=False,
             reply_context_refetched=False,
             force_reply=True,
-            reason="at",
-            reply_score=1.0,
+            reason="platform_summon",
             store_current=True,
         )
     )

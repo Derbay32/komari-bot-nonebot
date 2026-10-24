@@ -287,19 +287,29 @@ def test_matcher_census_source_paths_match_ast_scan() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 3. event_preprocessor AST scan (expected 1 entry from event_gate.py)
+# 3. event_preprocessor AST scan（恰好两个已知前置处理器）
+#
+# - 群聊准入门禁：``event_gate.py: _admission_event_gate``；
+# - TSK-187 判定入站分发持有对象：``jev_dispatch.py: prepare_decision_dispatch``
+#   （只写本地 state + 随机分发标识，不调用模型/存储/平台 API）。
+# 集合仍是精确相等：任何第三个前置处理器仍会被本 census 拒绝。
 # ---------------------------------------------------------------------------
 
 
 def test_event_preprocessor_census() -> None:
     actual = _scan_preprocessors()
-    expected = {"komari_bot/plugins/group_admission/event_gate.py": "_admission_event_gate"}
+    expected = {
+        "komari_bot/plugins/group_admission/event_gate.py": "_admission_event_gate",
+        "komari_bot/plugins/komari_decision/services/jev_dispatch.py": (
+            "prepare_decision_dispatch"
+        ),
+    }
     assert actual == expected, f"preprocessors={actual}"
 
 
 def test_no_other_event_preprocessors() -> None:
     actual = _scan_preprocessors()
-    assert len(actual) == 1, f"expected 1, got {len(actual)}: {actual}"
+    assert len(actual) == 2, f"expected 2, got {len(actual)}: {actual}"
 
 
 # ---------------------------------------------------------------------------

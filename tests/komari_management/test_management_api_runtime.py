@@ -201,10 +201,23 @@ async def test_register_management_api_for_fastapi_driver(app: App) -> None:
         client = ctx.get_client()
         docs = await client.get("/api/docs")
         schema_response = await client.get("/api/openapi.json")
+        retired_scene_list = await client.get(
+            "/api/v2/komari-decision-scenes/scenes"
+        )
+        retired_scene_sync = await client.post(
+            "/api/v2/komari-decision-scenes/sync"
+        )
 
     assert docs.status_code == 200
     assert schema_response.status_code == 200
     schema = schema_response.json()
+    assert not [
+        path
+        for path in schema["paths"]
+        if path.startswith("/api/v2/komari-decision-scenes")
+    ]
+    assert retired_scene_list.status_code == 404
+    assert retired_scene_sync.status_code == 404
     assert "/api/v2/komari-knowledge/knowledge" in schema["paths"]
     assert "/api/v2/komari-help/help" in schema["paths"]
     assert "/api/v2/komari-memory/conversations" in schema["paths"]
@@ -214,19 +227,8 @@ async def test_register_management_api_for_fastapi_driver(app: App) -> None:
     assert "/api/v2/komari-management-prompt/resources" in schema["paths"]
     assert "/api/v2/komari-announce/groups" in schema["paths"]
     assert "/api/v2/komari-announce/maintenance" in schema["paths"]
-    assert "/api/v2/komari-decision-scenes/scenes" in schema["paths"]
-    assert "/api/v2/komari-decision-scenes/sync" in schema["paths"]
-    sync_response_schema = schema["components"]["schemas"]["SceneSyncResponse"]
-    assert set(sync_response_schema.get("required", [])) == {
-        "set_id",
-        "created",
-        "reused_existing_set",
-        "inserted_count",
-        "ready_count",
-        "pending_count",
-        "detail",
-    }
-    assert "triggered" not in sync_response_schema.get("properties", {})
+    assert "/api/v2/komari-decision/health" in schema["paths"]
+    assert "/api/v2/komari-decision/decisions" in schema["paths"]
     assert "/api/v2/komari-user-bans/bans" in schema["paths"]
     assert "/api/v2/reply-fulfillments/fulfillments" in schema["paths"]
     assert (
@@ -245,7 +247,7 @@ async def test_register_management_api_for_fastapi_driver(app: App) -> None:
         "/api/v2/komari-knowledge, /api/v2/komari-help, /api/v2/komari-memory, "
         "/api/v2/agent-run-logs, /api/v2/komari-search, "
         "/api/v2/komari-management-config, /api/v2/komari-management-prompt, "
-        "/api/v2/komari-announce, /api/v2/komari-decision-scenes, "
+        "/api/v2/komari-announce, "
         "/api/v2/komari-user-bans, /api/v2/group-admission, /api/v2/reply-fulfillments"
     )
     assert logger.info_messages[-1] == (
@@ -319,7 +321,6 @@ async def test_read_only_credential_cannot_mutate_any_management_resource(
                     "config:read",
                     "prompt:read",
                     "announce:read",
-                    "scene:read",
                     "user_ban:read",
                     "reply_fulfillment:read",
                 ],
@@ -380,15 +381,6 @@ async def test_read_only_credential_cannot_mutate_any_management_resource(
                     "scheduled_time": "2026-07-17 03:00",
                     "group_ids": [1],
                 },
-            ),
-            await client.put(
-                "/api/v2/komari-decision-scenes/scenes/TEST",
-                headers=headers,
-                json={"scene_type": "general", "content_text": "测试"},
-            ),
-            await client.post(
-                "/api/v2/komari-decision-scenes/sync",
-                headers=headers,
             ),
             await client.post(
                 "/api/v2/komari-user-bans/bans",

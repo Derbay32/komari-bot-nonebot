@@ -735,11 +735,21 @@ def test_0013_succeeds_with_held_states_and_cleans_migration_only_tables(
         try:
             _authenticate_via_finalize(capsys, params, database_url)
 
-            # 基线缺陷修正（已获验收方追认）：alembic upgrade 精确停在
-            # 目标 revision，版本到当前 head 0024 必须走 head。
+            # 在 0013 边界验证既有不可逆契约，避免后续 0025 先拒绝回退。
+            historical = run_bootstrap(database_url, "upgrade", "0013")
+            assert historical.returncode == 0, historical.stderr
+            assert asyncio.run(_fetch_version(params)) == "0013"
+            downgrade = run_bootstrap(database_url, "downgrade", "0009")
+            assert downgrade.returncode != 0
+            assert "0013_TSK232_IS_IRREVERSIBLE" in (
+                f"{downgrade.stdout}\n{downgrade.stderr}"
+            )
+            assert asyncio.run(_fetch_version(params)) == "0013"
+
+            # 完成当前 head 升级后，继续验证全部业务存量断言。
             result = run_bootstrap(database_url, "upgrade", "head")
             assert result.returncode == 0, result.stderr
-            assert asyncio.run(_fetch_version(params)) == "0024"
+            assert asyncio.run(_fetch_version(params)) == "0025"
         finally:
             asyncio.run(_cleanup_test_redis_keys())
 
@@ -823,14 +833,6 @@ def test_0013_succeeds_with_held_states_and_cleans_migration_only_tables(
         assert pending_parent["reply_content"] == "held-canary-body-keep"
         assert int(delivered_open_children or 0) >= 1
 
-        # 基线缺陷修正（已获验收方追认）：downgrade 目标须低于 0013 才会
-        # 调用 0013.downgrade() 触发 forward-only 拒绝；停在 0013 属
-        # no-op，永远出不了 IRREVERSIBLE 标记。
-        downgrade = run_bootstrap(database_url, "downgrade", "0009")
-        assert downgrade.returncode != 0
-        assert "0013_TSK232_IS_IRREVERSIBLE" in (
-            f"{downgrade.stdout}\n{downgrade.stderr}"
-        )
 
 
 async def _fetch_single(params: dict[str, Any], column: str, sql: str) -> Any:
@@ -846,7 +848,7 @@ def test_0013_fresh_empty_database_passes_head_without_redis() -> None:
     """空库 fresh 豁免：单次 upgrade head 不经 Redis 认证直通（纯 PG 成功路径）。
 
     与生产/prestart 同构：全新空库在同一次 upgrade 调用内走完
-    0001→0024（fresh 标记、缺省策略播种、零数据自动推进与 fresh 豁免
+    0001→0025（fresh 标记、缺省策略播种、零数据自动推进与 fresh 豁免
     全部生效），绝不要求 operator 先跑 Redis 认证。
     """
     params = asyncio.run(recreate_scratch_database("_tsk232b1c13fe"))
@@ -856,6 +858,6 @@ def test_0013_fresh_empty_database_passes_head_without_redis() -> None:
         assert result.returncode == 0, (
             f"{result.stdout}\n{result.stderr}"
         )
-        assert asyncio.run(_fetch_version(params)) == "0024"
+        assert asyncio.run(_fetch_version(params)) == "0025"
     finally:
         asyncio.run(drop_scratch_database(str(params["database"])))

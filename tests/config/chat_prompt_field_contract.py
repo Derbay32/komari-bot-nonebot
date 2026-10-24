@@ -1,7 +1,6 @@
 """TSK-190 聊天 Prompt 字段契约 test oracle。
 
-本文件是聊天 Prompt 新字段集的测试侧单一事实来源（对齐
-``tests/komari_decision/required_fixed_scene_keys.py`` 的 oracle 惯例）：
+本文件是聊天 Prompt 新字段集的测试侧单一事实来源：
 
 - 字段名集合直接派生自强类型 Schema（``KomariChatPromptSchema``），
   不复制生产默认正文；

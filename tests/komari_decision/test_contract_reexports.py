@@ -1,42 +1,49 @@
-"""判定插件顶层 re-export 面验收测试（ticket #28 / #30 / #33 / KOMARIBOT-27）。
+"""判定插件顶层暴露面验收：只保留当前 Jev 运行时的四个支持名称。
 
-契约类型搬迁到 komari_bot.decision 共享包后，判定插件顶层导出契约符号与
-共享包中的对象为同一身份；ticket #33 起 get_runtime_state 从顶层导出退役；
-KOMARIBOT-27 起聊天宽重排候选/结果/服务从顶层与 services 暴露面退役。
+旧场景管理、旧运行时状态、旧总结归类 operation 与旧插件管理器均已随
+TSK-189 物理退役；本文件断言顶层 ``__all__`` 与属性面不再提供任何兼容
+别名，且新引擎 getter 仍由插件拥有。
 """
 
 from __future__ import annotations
 
 import komari_bot.plugins.komari_decision as decision_plugin
-from komari_bot import decision as contracts
 
 EXPECTED_PLUGIN_ALL = {
+    "get_decision_dispatch",
+    "get_decision_engine",
+    "observe_delivered_reply",
+    "register_decision_api",
+}
+
+RETIRED_NAMES = (
     "DecisionRuntimeState",
     "DecisionRuntimeStatus",
     "PluginManager",
+    "_get_runtime_state",
     "classify_summary_request",
-    "get_decision_engine",
     "get_plugin_manager",
     "get_scene_admin_service",
-    "register_decision_api",
-}
+    "get_runtime_state",
+)
 
 
 def test_plugin_all_matches_supported_surface() -> None:
     assert set(decision_plugin.__all__) == EXPECTED_PLUGIN_ALL
 
 
-def test_get_runtime_state_retired_from_top_level() -> None:
-    """get_runtime_state 已从顶层导出退役（唯一外部消费方已迁走）。"""
-    assert "get_runtime_state" not in decision_plugin.__all__
-    assert not hasattr(decision_plugin, "get_runtime_state")
+def test_retired_top_level_aliases_are_absent() -> None:
+    for name in RETIRED_NAMES:
+        assert name not in decision_plugin.__all__
+        assert not hasattr(decision_plugin, name), f"顶层仍暴露旧别名 {name}"
 
 
-def test_contract_symbols_are_shared_package_identities() -> None:
-    assert decision_plugin.DecisionRuntimeState is contracts.DecisionRuntimeState
-    assert decision_plugin.DecisionRuntimeStatus is contracts.DecisionRuntimeStatus
+def test_decision_engine_getter_remains_plugin_owned() -> None:
+    assert decision_plugin.get_decision_engine.__module__ == (
+        "komari_bot.plugins.komari_decision"
+    )
 
 
-def test_summary_classification_operation_stays_plugin_owned() -> None:
-    operation = decision_plugin.classify_summary_request
-    assert operation.__module__ == "komari_bot.plugins.komari_decision"
+def test_internal_runtime_getter_is_not_public_surface() -> None:
+    """当前运行时 getter 供包内/测试使用，不是第二个公共引擎 getter。"""
+    assert "get_decision_runtime" not in decision_plugin.__all__

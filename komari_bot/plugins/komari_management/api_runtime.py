@@ -12,7 +12,6 @@ from .config_api import register_config_api
 from .config_schema import DEFAULT_ANNOUNCE_STATUS_PAGE_URL
 from .prompt_api import register_prompt_api
 from .reply_fulfillment_api import register_reply_fulfillment_api
-from .scene_api import register_scene_api
 
 KNOWLEDGE_API_PREFIX = "/api/v2/komari-knowledge"
 HELP_API_PREFIX = "/api/v2/komari-help"
@@ -22,7 +21,6 @@ SEARCH_API_PREFIX = "/api/v2/komari-search"
 ANNOUNCE_API_PREFIX = "/api/v2/komari-announce"
 MANAGEMENT_CONFIG_API_PREFIX = "/api/v2/komari-management-config"
 MANAGEMENT_PROMPT_API_PREFIX = "/api/v2/komari-management-prompt"
-DECISION_SCENE_API_PREFIX = "/api/v2/komari-decision-scenes"
 USER_BAN_API_PREFIX = "/api/v2/komari-user-bans"
 REPLY_FULFILLMENT_API_PREFIX = "/api/v2/reply-fulfillments"
 GROUP_ADMISSION_API_PREFIX = "/api/v2/group-admission"
@@ -192,11 +190,6 @@ def register_management_api_for_driver(
             30.0,
         ),
     )
-    register_scene_api(
-        server_app,
-        api_token=token_source,
-        allowed_origins=settings.allowed_origins,
-    )
     docs_url = getattr(server_app, "docs_url", None) or "未启用"
     openapi_url = getattr(server_app, "openapi_url", None) or "未启用"
     logger.info(
@@ -204,7 +197,7 @@ def register_management_api_for_driver(
         f"{KNOWLEDGE_API_PREFIX}, {HELP_API_PREFIX}, {MEMORY_API_PREFIX}, "
         f"{AGENT_RUN_LOG_API_PREFIX}, {SEARCH_API_PREFIX}, "
         f"{MANAGEMENT_CONFIG_API_PREFIX}, {MANAGEMENT_PROMPT_API_PREFIX}, {ANNOUNCE_API_PREFIX}, "
-        f"{DECISION_SCENE_API_PREFIX}, {USER_BAN_API_PREFIX}, "
+        f"{USER_BAN_API_PREFIX}, "
         f"{GROUP_ADMISSION_API_PREFIX}, "
         f"{REPLY_FULFILLMENT_API_PREFIX}"
     )

@@ -1,8 +1,6 @@
-"""生产 driver 生命周期与判定调度装配（TSK-182 standby）。
+"""生产 driver 生命周期与判定调度装配（TSK-182）。
 
-本模块在 ``komari_decision`` 包导入时按 Driver 就绪情况条件装配；它注册在既有
-legacy 生命周期钩子**之后**，因此 NoneBot 的反向 shutdown 会先停 Jev，再轮到
-共享配置/Prompt 存储关闭：
+本模块在 ``komari_decision`` 包导入时按 Driver 就绪情况条件装配：
 
 - 一个 ``driver.on_startup`` 钩子：执行**一次**判定运行时初始化尝试，然后**无论
   初始化是否成功**都安装两个周期 job，使配置/Prompt 修正在不重启进程的情况下被
@@ -149,7 +147,7 @@ def _install_lifecycle(driver: Driver) -> None:
     """Driver 就绪时恰好装配一次生产生命周期（私有，无公开 API）。"""
     driver.on_startup(_startup)
     driver.on_shutdown(_shutdown)
-    logger.info("[KomariDecision] Jev 判定生产生命周期已装配（standby，不接收流量）")
+    logger.info("[KomariDecision] Jev 判定生产生命周期已装配")
 
 
 try:

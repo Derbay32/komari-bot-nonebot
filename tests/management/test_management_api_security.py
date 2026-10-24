@@ -204,6 +204,14 @@ def test_permission_implication_uses_explicit_table_only() -> None:
         permissions=frozenset({"reply_fulfillment:manage"}),
     ).has_permission("reply_fulfillment:read")
     assert not ManagementPrincipal(
+        operator_id="scene-writer",
+        permissions=frozenset({"scene:write"}),
+    ).has_permission("scene:read")
+    assert ManagementPrincipal(
+        operator_id="wildcard-operator",
+        permissions=frozenset({"*"}),
+    ).has_permission("scene:read")
+    assert not ManagementPrincipal(
         operator_id="config-deleter",
         permissions=frozenset({"config:delete"}),
     ).has_permission("config:read")

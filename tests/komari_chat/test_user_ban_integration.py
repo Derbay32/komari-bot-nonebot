@@ -10,7 +10,7 @@ import pytest
 from nonebot.adapters.onebot.v11 import Message
 from nonebot.adapters.onebot.v11.event import Sender
 
-from komari_bot.decision import DecisionOutcome, DecisionRuntimeStatus
+from komari_bot.decision.jev import DecisionResult
 from komari_bot.plugins.komari_chat.handlers.message_handler import MessageHandler
 
 message_handler_module = import_module(
@@ -18,38 +18,49 @@ message_handler_module = import_module(
 )
 
 
+_BAN_HANDOFF_FORBIDDEN_MESSAGE = "封禁时不得领取回复交接"
+
+
 class _Redis:
     def __init__(self) -> None:
-        self.pushed_messages: list[object] = []
+        self.pushed_messages: list[Any] = []
 
     async def push_message(self, _group_id: str, message: object) -> None:
         self.pushed_messages.append(message)
 
 
-class _DecisionEngine:
-    async def evaluate(self, **_kwargs: object) -> DecisionOutcome:
-        return DecisionOutcome(
-            memory_action="store",
-            should_reply=True,
-            force_reply=True,
-            reply_reason="at",
-            forced_reply_reason="at",
-            reply_score=None,
-            alias_hit=None,
-            call_intent="none",
-            call_margin=None,
-            best_scene_id=None,
-            scene_score=None,
-            timing_score=None,
-            noise_score=None,
-            meaningful_score=None,
-            call_direct_score=None,
-            call_mention_score=None,
-            filter_reason=None,
-            timing_breakdown=None,
-            runtime_status=DecisionRuntimeStatus.READY,
-            runtime_reason="测试运行时已就绪",
+class _Dispatch:
+    """本次分发的共享载体替身：required 聊天路由，交接必须不被调用。"""
+
+    def __init__(self) -> None:
+        self.request = SimpleNamespace(
+            target=SimpleNamespace(text="@小鞠 你好"),
+            platform_summoned=True,
         )
+        self.result = DecisionResult(
+            decision_id="decision-ban",
+            status="success",
+            reason_code="classified",
+            route="chat",
+            force_reply=True,
+            effective_reply="required",
+            retain_recent=True,
+            memory_candidate=True,
+        )
+        self.claim_routes: list[str] = []
+
+    async def evaluate(
+        self,
+        _engine: object,
+        *,
+        summary_candidate: bool,
+    ) -> DecisionResult:
+        assert summary_candidate is False
+        return self.result
+
+    async def claim_handoff(self, route: str) -> bool:
+        del route
+        raise AssertionError(_BAN_HANDOFF_FORBIDDEN_MESSAGE)
 
 
 class _Event:
@@ -74,7 +85,7 @@ async def test_chat_ban_stores_message_without_attempting_reply(
     redis = _Redis()
     handler.redis = redis  # type: ignore[assignment]
     handler.memory = SimpleNamespace()  # type: ignore[assignment]
-    handler.decision_engine = _DecisionEngine()  # type: ignore[assignment]
+    handler.decision_engine = SimpleNamespace()  # type: ignore[assignment]
     decisions: list[dict[str, object]] = []
 
     async def fail_attempt_reply(**_kwargs: object) -> Any:
@@ -91,13 +102,19 @@ async def test_chat_ban_stores_message_without_attempting_reply(
     monkeypatch.setattr(handler, "_attempt_reply", fail_attempt_reply)
     monkeypatch.setattr(handler, "_log_decision", decisions.append)
 
+    dispatch = _Dispatch()
     result = await handler.process_message(
-        SimpleNamespace(),  # type: ignore[arg-type]
+        SimpleNamespace(self_id="669293859", type="OneBot V11"),  # type: ignore[arg-type]
         _Event(),  # type: ignore[arg-type]
         on_reply_triggered=fail_reaction,
+        decision_dispatch=dispatch,  # type: ignore[arg-type]
         reply_allowed=False,
     )
 
     assert result is None
     assert len(redis.pushed_messages) == 1
+    # 分类与合格原文保存继续；原始正文（未剥离称呼）进入既有存储路径。
+    assert redis.pushed_messages[0].content == "@小鞠 你好"
     assert decisions[0]["reply_action"] == "blocked_by_user_ban"
+    assert decisions[0]["status"] == "success"
+    assert decisions[0]["route"] == "chat"

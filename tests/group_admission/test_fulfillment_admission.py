@@ -46,7 +46,7 @@ def _pending(fid: str) -> tuple[Any, fas.ReservationHandoff]:
             interaction_history={"event": "发言", "result": "回复", "emotion": "平静"},
             favorability_delta=1, favorability_reason="互动"),
         force_reply=False, bot_nickname="小鞠", bot_self_id="bot1",
-        adapter_name="OneBot V11", reason="s", reply_score=0.9,
+        adapter_name="OneBot V11", reason="optional",
         fulfillment_id=fid, request_trace_id="t", reply_timestamp=2.0,
         proactive_reservation_id="r1", proactive_handoff=off,
     )

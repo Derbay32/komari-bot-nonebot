@@ -38,7 +38,6 @@ _READ_PERMISSION_IMPLICATIONS: Mapping[str, frozenset[str]] = {
     "prompt:read": frozenset({"prompt:write"}),
     "reply_fulfillment:read": frozenset({"reply_fulfillment:manage"}),
     "roulette:read": frozenset({"roulette:manage"}),
-    "scene:read": frozenset({"scene:write"}),
     "user_ban:read": frozenset({"user_ban:write"}),
 }
 MIN_MANAGEMENT_TOKEN_LENGTH = 16

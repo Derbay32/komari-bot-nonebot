@@ -146,7 +146,7 @@ async def test_optional_failure_does_not_block_later_required_manager(
     storage = _FaultStorage(
         {
             "komari_decision": _stored(
-                "komari_decision", {"reply_threshold": 7.5}, 4
+                "komari_decision", {"optional_reply_probability": 7.5}, 4
             ),
             "komari_help": _stored(
                 "komari_help", _valid_data(required_schema, total_limit=7), 2
@@ -212,7 +212,11 @@ async def test_repaired_source_publishes_real_snapshot_on_explicit_retry(
     """修复外部数据源后，显式重试必须真实初始化并发布实际快照。"""
     decision_schema = _schema("komari_decision")
     storage = _FaultStorage(
-        {"komari_decision": _stored("komari_decision", {"reply_threshold": 7.5}, 4)}
+        {
+            "komari_decision": _stored(
+                "komari_decision", {"optional_reply_probability": 7.5}, 4
+            )
+        }
     )
     _install_storage(monkeypatch, storage)
     manager = get_config_manager("komari_decision", decision_schema)
@@ -224,7 +228,9 @@ async def test_repaired_source_publishes_real_snapshot_on_explicit_retry(
     observed: list[Any] = []
     manager.register_snapshot_listener(observed.append)
     storage.entries["komari_decision"] = _stored(
-        "komari_decision", _valid_data(decision_schema, reply_threshold=0.65), 9
+        "komari_decision",
+        _valid_data(decision_schema, optional_reply_probability=0.65),
+        9,
     )
 
     config = await manager.get_async()
@@ -233,7 +239,7 @@ async def test_repaired_source_publishes_real_snapshot_on_explicit_retry(
     assert snapshot.revision == 9
     assert snapshot.updated_at == _UPDATED_AT
     assert snapshot.value is config
-    assert cast("Any", config).reply_threshold == 0.65
+    assert cast("Any", config).optional_reply_probability == 0.65
     assert observed == [snapshot]
 
 
@@ -379,7 +385,7 @@ async def test_real_lifespan_runs_later_startup_hooks_after_isolated_failure(
     storage = _FaultStorage(
         {
             "komari_decision": _stored(
-                "komari_decision", {"reply_threshold": 7.5}, 4
+                "komari_decision", {"optional_reply_probability": 7.5}, 4
             ),
             "komari_help": _stored(
                 "komari_help", _valid_data(required_schema, total_limit=9), 5

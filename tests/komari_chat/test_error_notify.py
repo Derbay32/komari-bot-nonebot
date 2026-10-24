@@ -190,7 +190,7 @@ async def test_report_reply_failure_uses_shared_observable_contract(
         bot=bot,
         event=_FakeEvent(),
         failure=_failure(summary=summary),
-        reason="at",
+        reason="platform_summon",
     )
 
     _assert_group_reply(bot)
@@ -239,7 +239,7 @@ async def test_notification_switch_is_read_at_each_failure(
         bot=disabled_bot,
         event=_FakeEvent(),
         failure=_failure(reason_code="DisabledError"),
-        reason="at",
+        reason="platform_summon",
     )
 
     _assert_group_reply(disabled_bot)
@@ -251,7 +251,7 @@ async def test_notification_switch_is_read_at_each_failure(
         bot=enabled_bot,
         event=_FakeEvent(),
         failure=_failure(reason_code="EnabledError"),
-        reason="at",
+        reason="platform_summon",
     )
 
     _assert_group_reply(enabled_bot)
@@ -279,7 +279,7 @@ async def test_config_read_failure_only_mutes_private_notification(
         bot=bot,
         event=_FakeEvent(),
         failure=_failure(),
-        reason="at",
+        reason="platform_summon",
     )
 
     _assert_group_reply(bot)
@@ -300,7 +300,7 @@ async def test_shared_cooldown_deduplicates_same_reason_only(
             bot=bot,
             event=_FakeEvent(),
             failure=_failure(reason_code=reason_code),
-            reason="at",
+            reason="platform_summon",
         )
 
     assert len(bot.call_api_calls) == 3
@@ -323,7 +323,7 @@ async def test_redis_failure_keeps_private_notification_fail_open(
         bot=bot,
         event=_FakeEvent(),
         failure=_failure(),
-        reason="at",
+        reason="platform_summon",
     )
 
     _assert_group_reply(bot)
@@ -345,7 +345,7 @@ async def test_delivery_failures_do_not_escape_or_stop_other_private_delivery(
         bot=bot,
         event=_FakeEvent(),
         failure=_failure(),
-        reason="at",
+        reason="platform_summon",
     )
 
     assert [call["user_id"] for call in bot.send_private_msg_calls] == [10001, 10002]
@@ -364,7 +364,7 @@ async def test_cancelled_error_from_delivery_propagates(
             bot=bot,
             event=_FakeEvent(),
             failure=_failure(),
-            reason="at",
+            reason="platform_summon",
         )
 
 
@@ -388,7 +388,7 @@ async def test_image_failure_summary_reuses_shared_notifier_with_no_group_text(
             summary="图片理解失败（mode=delegated）",
             image_failure_summary=summary,
         ),
-        reason="at",
+        reason="platform_summon",
     )
 
     assert bot.call_api_calls == []
@@ -429,7 +429,7 @@ async def test_image_failure_with_reaction_sends_group_apology_and_one_card(
             summary="图片理解失败（mode=delegated）",
             image_failure_summary=_image_summary(),
         ),
-        reason="at",
+        reason="platform_summon",
     )
 
     _assert_group_reply(bot)
@@ -470,7 +470,7 @@ async def test_invalid_image_summary_mapping_failure_keeps_group_apology(
             summary="图片理解失败（mode=delegated）",
             image_failure_summary=invalid_summary,
         ),
-        reason="at",
+        reason="platform_summon",
     )
 
     # 群道歉恰一次，SU 私聊 0，不抛
@@ -504,7 +504,7 @@ async def test_invalid_image_summary_mapping_failure_without_reaction_sends_noth
             reaction_sent=False,
             image_failure_summary=invalid_summary,
         ),
-        reason="at",
+        reason="platform_summon",
     )
 
     assert bot.call_api_calls == []
@@ -526,7 +526,7 @@ async def test_image_failure_switch_off_mutes_private_only(
             reaction_sent=True,
             image_failure_summary=_image_summary(),
         ),
-        reason="at",
+        reason="platform_summon",
     )
 
     _assert_group_reply(bot)
@@ -551,7 +551,7 @@ async def test_image_failure_cooldown_dedupes_same_group_and_reason_across_tasks
                 reaction_sent=False,
                 image_failure_summary=diagnostic,
             ),
-            reason="at",
+            reason="platform_summon",
         )
 
     assert len(bot.send_private_msg_calls) == 1
@@ -572,7 +572,7 @@ async def test_image_failure_cooldown_dedupes_same_group_and_reason_across_tasks
             reaction_sent=False,
             image_failure_summary=other,
         ),
-        reason="at",
+        reason="platform_summon",
     )
     assert len(bot.send_private_msg_calls) == 2
 
@@ -594,7 +594,7 @@ async def test_image_failure_redis_fail_open_keeps_private_card(
             reaction_sent=False,
             image_failure_summary=_image_summary(),
         ),
-        reason="at",
+        reason="platform_summon",
     )
 
     assert bot.call_api_calls == []
@@ -612,9 +612,7 @@ async def test_process_message_success_with_image_failures_notifies_once(
     _configure_runtime(monkeypatch)
     handler = _build_handler()
     handler.memory = SimpleNamespace()
-    handler.decision_engine = SimpleNamespace(
-        evaluate=_evaluate_should_reply,
-    )
+    handler.decision_engine = SimpleNamespace()
     handler.reply_fulfillment = SimpleNamespace(
         is_duplicate_event=_is_duplicate_event
     )
@@ -665,8 +663,7 @@ async def test_process_message_success_with_image_failures_notifies_once(
         bot_nickname="小鞠",
         bot_self_id="bot-1",
         adapter_name="OneBot V11",
-        reason="at",
-        reply_score=None,
+        reason="platform_summon",
         fulfillment_id="fid-1",
         request_trace_id="trace-img",
         reply_timestamp=1.0,
@@ -683,6 +680,7 @@ async def test_process_message_success_with_image_failures_notifies_once(
     result = await handler.process_message(
         bot=bot,
         event=event,
+        decision_dispatch=_forced_dispatch().dispatch,
         reply_allowed=True,
     )
 
@@ -721,31 +719,42 @@ class _ProcessEvent:
         return "看图"
 
 
-async def _evaluate_should_reply(**_kwargs: object) -> object:
-    from komari_bot.decision import DecisionOutcome, DecisionRuntimeStatus
+def _forced_dispatch() -> SimpleNamespace:
+    """本次分发的共享载体替身：强制回复、已领取一次聊天交接。"""
+    from komari_bot.decision.jev import DecisionResult
 
-    return DecisionOutcome(
-        memory_action="store",
-        should_reply=True,
-        force_reply=True,
-        reply_reason="at",
-        forced_reply_reason="at",
-        reply_score=None,
-        alias_hit=None,
-        call_intent="none",
-        call_margin=None,
-        best_scene_id=None,
-        scene_score=None,
-        timing_score=None,
-        noise_score=None,
-        meaningful_score=None,
-        call_direct_score=None,
-        call_mention_score=None,
-        filter_reason=None,
-        timing_breakdown=None,
-        runtime_status=DecisionRuntimeStatus.READY,
-        runtime_reason="测试运行时已就绪",
-    )
+    class _Dispatch:
+        def __init__(self) -> None:
+            self.request = SimpleNamespace(
+                target=SimpleNamespace(text="看图"),
+                platform_summoned=False,
+            )
+            self.result = DecisionResult(
+                decision_id="decision-img",
+                status="success",
+                reason_code="classified",
+                route="chat",
+                force_reply=True,
+                effective_reply="required",
+                retain_recent=True,
+                memory_candidate=True,
+            )
+            self.claim_routes: list[str] = []
+
+        async def evaluate(
+            self,
+            _engine: object,
+            *,
+            summary_candidate: bool,
+        ) -> object:
+            assert summary_candidate is False
+            return self.result
+
+        async def claim_handoff(self, route: str) -> bool:
+            self.claim_routes.append(route)
+            return True
+
+    return SimpleNamespace(dispatch=_Dispatch())
 
 
 async def _is_duplicate_event(_fulfillment_id: str) -> bool:
@@ -808,7 +817,6 @@ def test_normal_reservation_control_flow_is_not_a_failure(
             reply_context_refetched=False,
             force_reply=False,
             reason="score",
-            reply_score=0.5,
             store_current=False,
         )
     )

@@ -1,6 +1,6 @@
 # Komari Memory
 
-小鞠记忆与对话插件，负责群聊消息缓冲、对话总结、记忆检索、忘却策略，以及 scene 持久化依赖的底层存储。
+小鞠记忆与对话插件，负责群聊消息缓冲、对话总结、记忆检索、忘却策略。
 
 ## 当前状态
 
@@ -126,22 +126,6 @@ v2.0.0 删除，不再需要单独执行。
 - `forgetting_fuzzify_concurrency`：首次归零模糊化时的并发上限
 - `forgetting_min_age_days`：未达到最小保留天数的记忆不会被删除或模糊化
 
-### scene 持久化依赖
-
-`scene` 运行时位于 `komari_decision`，其四张表（`komari_decision_scenes` /
-`komari_memory_scene_set` / `komari_memory_scene_item` /
-`komari_memory_scene_runtime`）为 SQLModel ORM 模型，经
-nonebot-plugin-orm `get_session` 访问；embedding 生成仍依赖
-`komari_memory` 提供的服务。
-
-相关配置：
-
-| 配置项 | 默认值 | 说明 |
-| --- | --- | --- |
-| `scene_persist_enabled` | `false` | 是否启用 scene 持久化 |
-| `scene_sync_poll_seconds` | `30` | scene 同步/刷新轮询间隔 |
-| `scene_keep_versions` | `3` | 保留的 READY 版本数量 |
-
 ## 主要配置
 
 完整定义见：
@@ -233,7 +217,8 @@ PNG、GIF 和 WebP。
 - `manager.pg_pool`（`SharedEngineConnectionPool`：nonebot-plugin-orm 共享引擎的 asyncpg 兼容连接租约，`acquire()` 借出底层连接）
 - `manager.redis`
 
-`komari_decision` 的 scene 子系统通过 `get_session()` 访问自己的 ORM 表，不共用记忆插件的连接池。
+旧场景存储已由迁移 `0025` 删除。
+本次退役不改变四层记忆的存储与召回。
 
 ## 排障
 
@@ -258,14 +243,6 @@ poetry run python scripts/migrate_embeddings.py --target memory
 ```bash
 poetry run python scripts/migrate_embeddings.py --apply --target memory
 ```
-
-### scene 开启后没有 active set
-
-检查：
-
-1. `scene_persist_enabled=true`
-2. 确认 PostgreSQL `komari_decision_scenes` 表中是否有数据（首次需运行 `poetry run python scripts/migrate_komari_decision_scenes_to_pg.py` 或通过管理 API 初始化）
-3. `komari_memory_scene_set` / `komari_memory_scene_item` 是否存在 FAILED 记录
 
 ### 忘却策略看起来没生效
 

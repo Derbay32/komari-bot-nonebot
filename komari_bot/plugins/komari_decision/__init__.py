@@ -1,423 +1,46 @@
-"""Komari Decision - 回复/记忆判定与 scene 运行时插件。"""
+"""Komari Decision - Jev 类型化判定插件入口。"""
 
 from __future__ import annotations
 
-import sys
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING
 
-from nonebot import logger
 from nonebot.plugin import PluginMetadata, require
 
-from komari_bot.decision import (
-    DecisionRuntimeState,
-    DecisionRuntimeStatus,
-    SummaryRequestClassificationResult,
-)
-
-from .management_api import register_decision_api
-from .services.config_interface import get_config, get_config_async
-from .services.decision_engine import DecisionEngine
-
-if TYPE_CHECKING:
-    from collections.abc import Callable
-
-    from asyncpg import Pool
-
-    from komari_bot.plugins.komari_memory.services.redis_manager import RedisManager
-
-    from .config_schema import KomariDecisionConfigSchema
-    from .repositories.scene_repository import SceneRepository
-    from .services.scene_admin_service import SceneAdminService
-    from .services.scene_embedding_worker import SceneEmbeddingWorker
-    from .services.scene_runtime_service import SceneRuntimeService
-    from .services.scene_sync_service import SceneSyncService
-
-
-class MemoryPluginManagerProtocol(Protocol):
-    """Komari Memory 插件管理器协议。"""
-
-    pg_pool: Pool | None
-    redis: RedisManager | None
-
-
-def _get_ready_memory_pool(memory_plugin: object) -> Pool:
-    """读取已就绪的 Memory PostgreSQL 连接池。"""
-    get_memory_plugin_manager = getattr(memory_plugin, "get_plugin_manager", None)
-    if not callable(get_memory_plugin_manager):
-        msg = "KomariMemory 未导出 get_plugin_manager"
-        raise TypeError(msg)
-
-    memory_manager = cast(
-        "MemoryPluginManagerProtocol | None",
-        get_memory_plugin_manager(),
-    )
-    memory_pool = None if memory_manager is None else memory_manager.pg_pool
-    if memory_pool is None:
-        msg = "KomariMemory PostgreSQL 未就绪"
-        raise RuntimeError(msg)
-    return memory_pool
-
-
-# 先加载 embedding 与 memory（保留到 TSK-183 交接完成）
-require("embedding_provider")
-require("komari_memory")
-# TSK-182：引用补取准入裁决与判定调度都是硬依赖，必须在 import 对应模块前声明。
+# 判定运行时、诊断路由与生命周期装配的硬依赖必须在 import 对应模块前声明。
+require("config_manager")
 require("group_admission")
 require("nonebot_plugin_apscheduler")
 
+from .management_api import register_decision_api
+from .services.jev_dispatch import get_decision_dispatch, observe_delivered_reply
+from .services.jev_runtime import get_decision_runtime
+
+if TYPE_CHECKING:
+    from .services.jev_engine import JevDecisionEngine
+
 __plugin_meta__ = PluginMetadata(
     name="小鞠判定",
-    description="向量检索重排判定与 scene 运行时子系统",
+    description="Jev 类型化判定、单次业务交接与判定诊断",
     usage="被其他插件通过服务接口调用",
 )
 
 __all__ = [
-    "DecisionRuntimeState",
-    "DecisionRuntimeStatus",
-    "PluginManager",
-    "classify_summary_request",
+    "get_decision_dispatch",
     "get_decision_engine",
-    "get_plugin_manager",
-    "get_scene_admin_service",
+    "observe_delivered_reply",
     "register_decision_api",
 ]
 
-_CONFIG_UNAVAILABLE_REASON = "判定配置暂不可用"
-"""配置读取失败时的固定安全文案（启动失败态与公共健康态共用）。"""
 
+def get_decision_engine() -> JevDecisionEngine | None:
+    """返回常驻判定运行时当前持有的真实引擎（唯一公共引擎 getter）。
 
-class PluginManager:
-    """判定插件管理器，负责 scene 子系统生命周期。"""
-
-    def __init__(self) -> None:
-        self.scene_repository: SceneRepository | None = None
-        self.scene_admin: SceneAdminService | None = None
-        self.scene_runtime: SceneRuntimeService | None = None
-        self.scene_sync: SceneSyncService | None = None
-        self.scene_embedding_worker: SceneEmbeddingWorker | None = None
-        self._runtime_state = DecisionRuntimeState.failed("插件尚未初始化")
-
-    @property
-    def runtime_state(self) -> DecisionRuntimeState:
-        """返回与动态开关及 scene 快照一致的当前状态。
-
-        配置读取失败时如实投影 ``failed``：不把更早的 ready 状态当作当前状态
-        返回，也不在这里缓存或伪造默认配置（``get_config`` 仍会拒绝非法输入）。
-        健康读可能被高频轮询，因此该分支不写日志。
-        """
-        try:
-            config = get_config()
-        except Exception:
-            return DecisionRuntimeState.failed(_CONFIG_UNAVAILABLE_REASON)
-        return self._resolve_runtime_state(config)
-
-    def _resolve_runtime_state(
-        self,
-        config: KomariDecisionConfigSchema,
-    ) -> DecisionRuntimeState:
-        """基于给定配置解析运行时三态（供 property 与归类 operation 复用）。
-
-        显式接收已冻结的配置，避免调用方（如 classify_summary_request）
-        在单次用途内二次读取配置。
-        """
-        if not config.plugin_enable:
-            return DecisionRuntimeState.disabled("komari_decision 已关闭")
-        if not config.scene_persist_enabled:
-            return DecisionRuntimeState.disabled("scene 持久化已关闭")
-        if self.scene_runtime is None:
-            if self._runtime_state.status is DecisionRuntimeStatus.DISABLED:
-                return DecisionRuntimeState.failed(
-                    "配置已启用但运行时尚未初始化，需要重启服务"
-                )
-            return self._runtime_state
-        if self.scene_runtime.get_scene_candidates() is None:
-            return DecisionRuntimeState.failed("scene runtime snapshot 暂不可用")
-        return DecisionRuntimeState.ready()
-
-    def _clear_services(self) -> None:
-        self.scene_repository = None
-        self.scene_admin = None
-        self.scene_runtime = None
-        self.scene_sync = None
-        self.scene_embedding_worker = None
-
-    async def initialize(self) -> None:
-        """初始化 scene 运行时与同步任务。
-
-        首次配置读取失败只让主动回复判定进入 failed，不中断进程启动
-        （TSK-180 §7 / §10）：scene 子系统完全不启动，也不缓存或透传任何
-        默认配置；修复配置后再次显式调用即可走正常初始化路径。
-        """
-        try:
-            config = await get_config_async()
-        except Exception as exc:
-            self._runtime_state = DecisionRuntimeState.failed(
-                _CONFIG_UNAVAILABLE_REASON
-            )
-            logger.error(
-                "[KomariDecision] 判定配置读取失败，主动回复判定进入 failed 状态: "
-                "error_type={}",
-                type(exc).__name__,
-            )
-            return
-        if not config.plugin_enable:
-            self._runtime_state = DecisionRuntimeState.disabled(
-                "komari_decision 已关闭"
-            )
-            logger.info(
-                "[KomariDecision] 插件未启用；主动回复判定关闭，显式触发聊天保留"
-            )
-            return
-        if not config.scene_persist_enabled:
-            self._runtime_state = DecisionRuntimeState.disabled("scene 持久化已关闭")
-            logger.info(
-                "[KomariDecision] scene 持久化未启用；主动回复判定关闭，显式触发聊天保留"
-            )
-            return
-        unregister_task: Callable[[], None] | None = None
-        task_registered = False
-        try:
-            from nonebot.plugin import require as runtime_require
-
-            from .handlers.scene_sync_worker import (
-                bootstrap_scene_sync_task,
-                register_scene_sync_task,
-                unregister_scene_sync_task,
-            )
-            from .repositories.scene_repository import SceneRepository
-            from .services.scene_admin_service import SceneAdminService
-            from .services.scene_embedding_worker import SceneEmbeddingWorker
-            from .services.scene_runtime_service import SceneRuntimeService
-            from .services.scene_sync_service import SceneSyncService
-
-            unregister_task = unregister_scene_sync_task
-            runtime_require("nonebot_plugin_apscheduler")
-            from komari_bot.plugins import komari_memory as memory_plugin
-
-            memory_pool = _get_ready_memory_pool(memory_plugin)
-
-            scene_repository = SceneRepository(memory_pool)
-            scene_runtime = SceneRuntimeService(scene_repository)
-            scene_sync = SceneSyncService(scene_repository)
-            scene_embedding_worker = SceneEmbeddingWorker(
-                scene_repository,
-                batch_size=16,
-            )
-            scene_admin = SceneAdminService(scene_repository, scene_sync)
-
-            # scene 表结构由 Alembic 迁移统一管理，此处不再执行 DDL。
-            if not await scene_repository.has_any_scene():
-                logger.warning(
-                    "[KomariDecision] komari_decision_scenes 为空；"
-                    "请运行 python -m komari_bot.db.seed_bootstrap 播种初始场景，"
-                    "或通过管理 API 初始化 scenes"
-                )
-            try:
-                loaded = await scene_runtime.load_active_set_cache()
-            except RuntimeError as exc:
-                logger.warning(
-                    "[KomariDecision] 旧 active scene set 不可用，将进入 bootstrap 重建: {}",
-                    exc,
-                )
-            else:
-                if loaded:
-                    logger.info("[KomariDecision] scene runtime cache 初始化成功")
-                else:
-                    logger.warning(
-                        "[KomariDecision] 当前无 active scene set，runtime cache 为空"
-                    )
-
-            self.scene_repository = scene_repository
-            self.scene_admin = scene_admin
-            self.scene_runtime = scene_runtime
-            self.scene_sync = scene_sync
-            self.scene_embedding_worker = scene_embedding_worker
-            task_registered = True
-            register_scene_sync_task(
-                scene_repository,
-                scene_admin,
-                scene_sync,
-                scene_embedding_worker,
-                scene_runtime,
-            )
-            await bootstrap_scene_sync_task()
-        except Exception as exc:
-            if task_registered and unregister_task is not None:
-                unregister_task()
-            self._clear_services()
-            self._runtime_state = DecisionRuntimeState.failed(
-                f"scene 子系统初始化失败：{type(exc).__name__}"
-            )
-            logger.exception(
-                "[KomariDecision] scene 子系统初始化失败，主动回复判定进入 failed 状态"
-            )
-            return
-
-        self._runtime_state = self.runtime_state
-        if not self._runtime_state.is_ready:
-            logger.error(
-                "[KomariDecision] scene 子系统初始化未就绪：{}；主动回复判定进入 failed 状态",
-                self._runtime_state.reason,
-            )
-            return
-
-        logger.info("[KomariDecision] scene 子系统初始化完成，运行时状态 ready")
-
-    async def shutdown(self) -> None:
-        """关闭 scene 同步任务。"""
-        from .handlers.scene_sync_worker import unregister_scene_sync_task
-
-        unregister_scene_sync_task()
-        self._clear_services()
-        self._runtime_state = DecisionRuntimeState.disabled("进程正在关闭")
-        logger.info("[KomariDecision] 已关闭")
-
-
-_plugin_manager: PluginManager | None = None
-
-
-def get_plugin_manager() -> PluginManager | None:
-    """获取插件管理器实例。"""
-    return _plugin_manager
-
-
-def _get_runtime_state() -> DecisionRuntimeState:
-    """获取判定运行时三态快照。"""
-    manager = get_plugin_manager()
-    if manager is not None:
-        return manager.runtime_state
-
-    config = get_config()
-    if not config.plugin_enable:
-        return DecisionRuntimeState.disabled("komari_decision 已关闭")
-    if not config.scene_persist_enabled:
-        return DecisionRuntimeState.disabled("scene 持久化已关闭")
-    return DecisionRuntimeState.failed("插件管理器尚未初始化")
-
-
-def get_scene_admin_service() -> SceneAdminService | None:
-    """获取 scene 运维服务。"""
-    manager = get_plugin_manager()
-    if manager is None:
-        return None
-    return manager.scene_admin
-
-
-async def classify_summary_request(
-    message_text: str,
-) -> SummaryRequestClassificationResult:
-    """群总结请求场景归类窄 operation（KOMARIBOT-23）。
-
-    每次调用动态解析当前 PluginManager 与 scene runtime，并在开始时只读取一次
-    配置冻结本次用途；调用方只能得到命中 / 未命中 / 不可用（带稳定原因码）。
-
-    输入先标准化（折叠空白并 trim），快速路径、embedding 与 rerank 使用同一文本。
+    运行时在读取可能非法的模型配置**之前**就已经构建引擎，因此本地存储健康
+    但配置暂不可用时调用方仍能取得真实引擎；真正没有引擎（运行时尚未初始化、
+    已关闭或初始化失败）时返回 None，由调用方按既有故障关闭语义安全停止。
+    没有第二条引擎构建/缓存路径，也不把缺失引擎当作可绕过持久身份保护。
     """
-    from .services.scene_classification import (
-        classify_summary_request as _classify_summary_request,
-    )
-
-    config = get_config()
-    # 标准化：移除全部空白（含换行）并 trim，快速路径/embedding/rerank 共用同一文本
-    normalized_text = "".join(message_text.split())
-    manager = get_plugin_manager()
-    if manager is None:
-        runtime_state = DecisionRuntimeState.failed("插件管理器尚未初始化")
-        scene_runtime = None
-    else:
-        runtime_state = _resolve_manager_runtime_state(manager, config)
-        scene_runtime = manager.scene_runtime
-    return await _classify_summary_request(
-        message_text=normalized_text,
-        config=config,
-        runtime_state=runtime_state,
-        scene_runtime=scene_runtime,
-    )
-
-
-def _resolve_manager_runtime_state(
-    manager: Any,
-    config: KomariDecisionConfigSchema,
-) -> DecisionRuntimeState:
-    """解析插件管理器的运行时三态，显式使用冻结配置。
-
-    真实 PluginManager 走内部解析方法（不二次读取配置）；
-    无该方法的测试替身回退到 runtime_state 属性。
-    """
-    resolver: Any = getattr(manager, "_resolve_runtime_state", None)
-    if resolver is not None:
-        return resolver(config)
-    return manager.runtime_state
-
-
-_cached_decision_engine: DecisionEngine | None = None
-_cached_engine_redis: RedisManager | None = None
-_cached_engine_scene_runtime: SceneRuntimeService | None = None
-
-
-def _get_ready_memory_redis() -> RedisManager | None:
-    """逐调用惰性解析 Memory 插件管理器，返回已就绪的 Redis 客户端。"""
-    memory_plugin = sys.modules.get("komari_bot.plugins.komari_memory")
-    if memory_plugin is None:
-        return None
-    get_memory_plugin_manager = getattr(memory_plugin, "get_plugin_manager", None)
-    if not callable(get_memory_plugin_manager):
-        return None
-    memory_manager = cast(
-        "MemoryPluginManagerProtocol | None",
-        get_memory_plugin_manager(),
-    )
-    if memory_manager is None:
-        return None
-    return memory_manager.redis
-
-
-def get_decision_engine() -> DecisionEngine | None:
-    """获取惰性构建并缓存的决策引擎；Redis 未就绪时返回 None。
-
-    Redis 短暂未就绪只让当次调用返回 None，不清缓存；
-    同身份恢复后仍返回原缓存引擎（与聊天插件懒构建语义一致）。
-    """
-    global _cached_decision_engine  # noqa: PLW0603
-    global _cached_engine_redis  # noqa: PLW0603
-    global _cached_engine_scene_runtime  # noqa: PLW0603
-
-    redis = _get_ready_memory_redis()
-    if redis is None:
-        return None
-
-    decision_manager = get_plugin_manager()
-    scene_runtime = (
-        None if decision_manager is None else decision_manager.scene_runtime
-    )
-
-    if (
-        _cached_decision_engine is not None
-        and _cached_engine_redis is redis
-        and _cached_engine_scene_runtime is scene_runtime
-    ):
-        return _cached_decision_engine
-
-    engine = DecisionEngine(
-        redis,
-        scene_runtime,
-        runtime_state_provider=_get_runtime_state,
-    )
-    _cached_decision_engine = engine
-    _cached_engine_redis = redis
-    _cached_engine_scene_runtime = scene_runtime
-    return engine
-
-
-def _clear_decision_engine_cache() -> None:
-    """清空决策引擎缓存（进程关闭语义）。"""
-    global _cached_decision_engine  # noqa: PLW0603
-    global _cached_engine_redis  # noqa: PLW0603
-    global _cached_engine_scene_runtime  # noqa: PLW0603
-
-    _cached_decision_engine = None
-    _cached_engine_redis = None
-    _cached_engine_scene_runtime = None
+    return get_decision_runtime().engine
 
 
 try:
@@ -428,26 +51,5 @@ except ValueError:
     driver = None
 
 if driver is not None:
-
-    @driver.on_startup
-    async def startup() -> None:
-        """启动时初始化。"""
-        global _plugin_manager  # noqa: PLW0603
-
-        manager = PluginManager()
-        _plugin_manager = manager
-        await manager.initialize()
-
-    @driver.on_shutdown
-    async def shutdown() -> None:
-        """关闭时清理。"""
-        global _plugin_manager  # noqa: PLW0603
-        manager = get_plugin_manager()
-        if manager:
-            await manager.shutdown()
-        _plugin_manager = None
-        _clear_decision_engine_cache()
-
-    # TSK-182：判定常驻运行时生命周期注册在既有 legacy 钩子**之后**，因此
-    # NoneBot 的反向 shutdown 会先停 Jev，再轮到共享配置/Prompt 存储关闭。
+    # 生产生命周期与调度装配只在 Driver 就绪时加载；本插件不再注册旧场景钩子。
     from .services import jev_lifecycle  # noqa: F401 — 生产生命周期与调度装配

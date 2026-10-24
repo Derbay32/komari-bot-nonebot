@@ -22,6 +22,9 @@ from komari_bot.plugins.komari_management.config_api import (
     register_config_api,
 )
 from komari_bot.plugins.komari_management.managed_resources import ManagedConfigResource
+from tests.db.tsk190_legacy_config_support import (
+    RETIRED_DECISION_CONFIG_FIELDS,
+)
 
 if TYPE_CHECKING:
     from nonebug import App
@@ -390,7 +393,7 @@ async def test_config_routes_keep_legacy_resources_unsectioned(app: App) -> None
 
 @pytest.mark.asyncio
 async def test_config_routes_expose_komari_decision_sections(app: App) -> None:
-    """真实判定配置的分区与字段归属进入资源摘要和详情。"""
+    """真实判定配置只暴露 Jev 两个分区，退役字段不再进入投影。"""
     schema = ensure_typed_config_model("komari_decision")
     assert schema is not None
     manager = _StaticConfigManager(schema())
@@ -405,36 +408,39 @@ async def test_config_routes_expose_komari_decision_sections(app: App) -> None:
         )
 
     expected_sections = [
-        {"section_id": "chat_scene", "display_name": "聊天场景", "order": 10},
-        {
-            "section_id": "summary_classification",
-            "display_name": "群总结归类",
-            "order": 20,
-        },
         {"section_id": "jev_request", "display_name": "Jev 请求", "order": 30},
         {"section_id": "jev_execution", "display_name": "Jev 执行", "order": 40},
     ]
     assert listed.status_code == 200
     assert listed.json()["items"][0]["sections"] == expected_sections
     assert detail.status_code == 200
-    assert detail.json()["sections"] == expected_sections
-    assert detail.json()["field_metadata"]["scene_top_k"]["section_id"] == (
-        "chat_scene"
-    )
-    assert detail.json()["field_metadata"]["summary_rerank_threshold"] == {
+    payload = detail.json()
+    assert payload["sections"] == expected_sections
+    assert payload["field_metadata"]["jev_base_url"]["section_id"] == "jev_request"
+    assert payload["field_metadata"]["decision_log_retention_days"] == {
         "secret": False,
         "apply_mode": "immediate",
-        "section_id": "summary_classification",
+        "section_id": "jev_execution",
     }
-    assert detail.json()["field_states"]["summary_similarity_threshold"] == {
+    # 保留字段的字段态投影不变（未被分区移除影响）
+    assert payload["field_states"]["decision_log_retention_days"] == {
         "secret": False,
         "apply_mode": "immediate",
-        "configured_value": None,
-        "effective_value": None,
+        "configured_value": 7,
+        "effective_value": 7,
         "source": manager.config_source,
         "effective_source": "dynamic_config",
         "restart_required": False,
     }
+    # 38 个退役字段与其分区不再出现在读取投影中
+    for retired in RETIRED_DECISION_CONFIG_FIELDS:
+        assert retired not in payload["values"], retired
+        assert retired not in payload["field_metadata"], retired
+        assert retired not in payload["field_states"], retired
+    for retired_section in ("chat_scene", "summary_classification"):
+        assert retired_section not in {
+            section["section_id"] for section in payload["sections"]
+        }
 
 
 @pytest.mark.asyncio

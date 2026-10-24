@@ -1,37 +1,19 @@
 """Komari Decision 判定契约共享包。
 
-延续 ADR-0005 的共享桶体系（参照 komari_bot/llm/ 的既有手法），承载判定领域的
-全部契约纯件：运行时状态、判定输出、时机评分分解与消息过滤结果，并提供
-DecisionEngineProtocol 供消费方注解引擎实例。
+承载当前 Jev 运行时需要跨插件共享的三个纯契约：判定引擎协议、一次分发的
+共享载体与分发不可用错误。
 
-聊天宽重排候选/结果/异常契约已随 KOMARIBOT-27 退役：聊天专用类型只保留在
-komari_decision 深 implementation 内部，本包不承载。
+类型化请求/结果/诊断数据契约保留在 ``komari_bot.decision.jev``，由消费方直接
+import；本包不再提供旧场景 DTO 或宽重排兼容导出。
 
 本包零依赖 nonebot / redis / 插件内部类型，可被任意消费方安全 import。
 """
 
-from .decision_engine import CallIntent, DecisionOutcome, MemoryAction, ReplyReason
+from .dispatch import DecisionDispatch, DecisionDispatchUnavailableError
 from .engine_protocol import DecisionEngineProtocol
-from .message_filter import FilterResult
-from .runtime_state import DecisionRuntimeState, DecisionRuntimeStatus
-from .social_timing_service import TimingScoreBreakdown
-from .summary_request_classification import (
-    SummaryRequestClassificationResult,
-    SummaryRequestClassificationStatus,
-    SummaryRequestUnavailableReason,
-)
 
 __all__ = [
-    "CallIntent",
+    "DecisionDispatch",
+    "DecisionDispatchUnavailableError",
     "DecisionEngineProtocol",
-    "DecisionOutcome",
-    "DecisionRuntimeState",
-    "DecisionRuntimeStatus",
-    "FilterResult",
-    "MemoryAction",
-    "ReplyReason",
-    "SummaryRequestClassificationResult",
-    "SummaryRequestClassificationStatus",
-    "SummaryRequestUnavailableReason",
-    "TimingScoreBreakdown",
 ]

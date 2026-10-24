@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from typing import cast
 
@@ -10,16 +11,20 @@ from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, MessageSegment
 from nonebot.exception import FinishedException
 from nonebot.matcher import current_matcher
 from nonebot.plugin import PluginMetadata, require
+from nonebot.typing import T_State  # noqa: TC002 - handler 注解在运行期解析
 
-from komari_bot.decision import (
-    SummaryRequestClassificationResult,
-    SummaryRequestClassificationStatus,
-    SummaryRequestUnavailableReason,
+from komari_bot.decision.dispatch import (
+    DecisionDispatch,
+    DecisionDispatchUnavailableError,
 )
+from komari_bot.decision.jev import DecisionResult  # noqa: TC001 - 同上
 from komari_bot.onebot import GroupTaskFailureNotification, GroupTaskFailureNotifier
 from komari_bot.onebot.onebot_messages import plain_text_message
 from komari_bot.onebot.onebot_rules import group_message_to_me_rule
-from komari_bot.plugins.komari_decision import classify_summary_request
+from komari_bot.plugins.komari_decision import (
+    get_decision_dispatch,
+    get_decision_engine,
+)
 
 from .admission_gate import effect_business_admitted
 from .config_schema import DynamicConfigSchema
@@ -44,13 +49,21 @@ require("agent_run_logger")
 
 require("character_binding")
 require("komari_decision")
+
+require("komari_memory")
 from komari_bot.plugins.group_admission import (
     AdmissionQualification,
     adjudicate,
 )
+from komari_bot.plugins.komari_memory import KomariMemoryConfigSchema
 
 config_manager = config_manager_plugin.get_config_manager(
     "group_history_summary", DynamicConfigSchema
+)
+# 失败通知开关复用 config_manager 唯一注册表里的 komari_memory 资源（不建立
+# 平行缓存）；每次通知都读取当前值。
+_memory_config_manager = config_manager_plugin.get_config_manager(
+    "komari_memory", KomariMemoryConfigSchema
 )
 
 __plugin_meta__ = PluginMetadata(
@@ -65,16 +78,9 @@ OUT_OF_RANGE_MESSAGE = "我、我只能看10-200条……"
 # 场景归类阶段失败时发送的固定群提示；不得携带异常、场景键、分数、阈值或配置。
 CLASSIFICATION_FAILURE_MESSAGE = "群聊总结暂时不可用，稍后再试试吧……"
 
-# 静默私聊通知的安全原因码：仍发送固定群提示，但不向 SUPERUSER 发送诊断。
-_SILENT_NOTIFY_REASONS: frozenset[SummaryRequestUnavailableReason] = frozenset(
-    {
-        SummaryRequestUnavailableReason.DECISION_DISABLED,
-        SummaryRequestUnavailableReason.RERANK_UNAVAILABLE,
-    }
-)
-
 # 进程级持久失败通知器：跨调用复用同一实例，使 SUPERUSER 私聊的共享冷却
-# 在整个进程生命周期内生效；群内固定提示不受冷却影响，仍每次发送。
+# 在整个进程生命周期内生效；群内固定提示不受冷却影响，仍每次发送。失败通知
+# 由 TSK-188 在判定边界提交一次，不再经过旧的场景归类 operation。
 _classification_failure_notifier = GroupTaskFailureNotifier()
 
 summary_matcher = on_regex(
@@ -114,112 +120,126 @@ def _extract_requested_count(text: str) -> int | None:
         return None
 
 
-def _classification_notification(
-    *,
-    group_id: int,
-    message_id: int,
-    reason_code: str,
-    notify_superusers: bool,
-) -> GroupTaskFailureNotification:
-    """构造场景归类阶段失败通知（固定任务类型、阶段与群提示）。"""
-    return GroupTaskFailureNotification(
-        group_id=group_id,
-        message_id=message_id,
-        group_text=CLASSIFICATION_FAILURE_MESSAGE,
-        task_kind="group_history_summary",
-        stage="scene_classification",
-        reason_code=reason_code,
-        notify_superusers=notify_superusers,
-        request_trace_id=None,
-        summary=None,
-    )
+def _stop_both_paths() -> None:
+    """停止本次事件传播（总结命中/失败都不得落入普通聊天）。"""
+    current_matcher.get().stop_propagation()
 
 
-async def _notify_classification_failure(
+async def _evaluate_summary_candidate(  # noqa: PLR0911 - 每个停止分支都是独立安全停止
     bot: Bot,
     event: GroupMessageEvent,
-    *,
-    reason_code: str,
-    notify_superusers: bool,
-) -> None:
-    """投递场景归类失败通知；群内 reply 段由通知边界自身负责。
+    state: T_State,
+) -> tuple[DecisionDispatch, DecisionResult] | None:
+    """消费本次分发唯一的判定结果；不可用时停止两条业务路径。
 
-    复用模块级持久通知器实例，保证 SUPERUSER 私聊的共享冷却在进程内
-    持续生效；群内固定提示仍每次发送。
+    返回 ``(dispatch, result)`` 供调用方按路由交接；任何技术失败、取消或缺失
+    载体都在这里停止传播并返回 ``None``（绝不本地直通总结）。
     """
-    await _classification_failure_notifier.notify(
-        bot=bot,
-        notification=_classification_notification(
-            group_id=int(event.group_id),
-            message_id=int(event.message_id),
-            reason_code=reason_code,
-            notify_superusers=notify_superusers,
-        ),
-    )
-
-
-async def _classify_and_route(
-    bot: Bot,
-    event: GroupMessageEvent,
-    plain_text: str,
-) -> bool:
-    """调用判定插件顶层归类 operation 并按窄结果路由。
-
-    返回 True 表示命中（MATCHED）总结请求，调用方应继续执行总结；
-    未命中（NOT_MATCHED）放行：不停止传播、不通知、不执行总结；
-    不可用（UNAVAILABLE）记录日志、停止传播并发送固定群提示，按安全原因码
-    决定是否私聊 SUPERUSER；未预期异常记录异常、停止传播并通知 SUPERUSER。
-    """
+    engine = get_decision_engine()
+    if engine is None:
+        # 没有真实引擎就无法取得有效 Noul：停止两条业务路径。
+        logger.info("[GroupHistorySummary] 判定引擎不可用，停止总结与聊天路径")
+        _stop_both_paths()
+        return None
     try:
-        classification: SummaryRequestClassificationResult = (
-            await classify_summary_request(plain_text)
+        dispatch = get_decision_dispatch(bot, event, state)
+    except DecisionDispatchUnavailableError:
+        logger.debug("[GroupHistorySummary] 当前分发缺少可用判定载体，停止传播")
+        _stop_both_paths()
+        return None
+    try:
+        result = await dispatch.evaluate(engine, summary_candidate=True)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        # 只记录固定安全文本与异常类型，不记录正文/提示词/原始异常。
+        logger.warning(
+            "[GroupHistorySummary] 总结判定未预期失败: error={}",
+            type(exc).__name__,
         )
-    except Exception:
-        logger.exception("[GroupHistorySummary] 场景归类发生未预期异常，停止传播")
-        current_matcher.get().stop_propagation()
-        await _notify_classification_failure(
-            bot,
-            event,
-            reason_code="unexpected_error",
-            notify_superusers=True,
+        _stop_both_paths()
+        return None
+    if result.status == "failed":
+        logger.info(
+            "[GroupHistorySummary] 总结判定不可用: reason={}",
+            result.reason_code,
         )
-        return False
-
-    if classification.status is SummaryRequestClassificationStatus.NOT_MATCHED:
-        return False
-
-    if classification.status is SummaryRequestClassificationStatus.UNAVAILABLE:
-        reason = cast("SummaryRequestUnavailableReason", classification.reason)
-        if reason is SummaryRequestUnavailableReason.DECISION_DISABLED:
-            logger.info(
-                "[GroupHistorySummary] 场景归类不可用: reason={}",
-                reason.value,
+        # 先停止两条业务路径，再做任何通知 await。
+        _stop_both_paths()
+        # 失败通知资格与重复事实完全由判定引擎的持久行拥有：领不到资格
+        #（重复事件、停用、撤权、中断等既有静默终态）时什么都不发。
+        try:
+            claimed = await dispatch.claim_handoff("failure_notification")
+        except Exception:
+            claimed = False
+            logger.error("[GroupHistorySummary] 判定失败通知资格领取异常")
+        if not claimed:
+            logger.debug(
+                "[GroupHistorySummary] 失败通知未获准（重复/撤权/静默终态），保持静默: reason={}",
+                result.reason_code,
             )
-        else:
-            # RERANK_UNAVAILABLE 等未达失败预算的预期故障只记 warning，
-            # 日志仅含稳定原因码，不携带异常、场景键、分数、阈值或配置。
-            logger.warning(
-                "[GroupHistorySummary] 场景归类不可用: reason={}",
-                reason.value,
+            return None
+        # 通知开关复用既有 config_manager 的 komari_memory 资源；读取失败只
+        # 静默私聊诊断（固定群提示保留，不打印原始异常）。
+        notify_superusers = False
+        try:
+            memory_config = cast(
+                "KomariMemoryConfigSchema", _memory_config_manager.get()
             )
-        current_matcher.get().stop_propagation()
-        await _notify_classification_failure(
-            bot,
-            event,
-            reason_code=reason.value,
-            notify_superusers=reason not in _SILENT_NOTIFY_REASONS,
+            notify_superusers = bool(memory_config.error_notify_enabled)
+        except Exception:
+            logger.debug(
+                "[GroupHistorySummary] 失败通知开关读取失败，静默 SUPERUSER 私聊"
+            )
+        summary_enabled = False
+        try:
+            summary_config = cast("DynamicConfigSchema", config_manager.get())
+            summary_enabled = bool(summary_config.plugin_enable)
+        except Exception:
+            logger.debug("[GroupHistorySummary] 失败通知前总结开关读取失败，抑制通知")
+        # 通知前最后复检：总结插件开关与目标群 BUSINESS 准入（受限即抑制）。
+        if not summary_enabled or not effect_business_admitted(
+            group_id=int(event.group_id)
+        ):
+            logger.debug("[GroupHistorySummary] 失败通知复检未通过，抑制本次通知")
+            return None
+        try:
+            await _classification_failure_notifier.notify(
+                bot=bot,
+                notification=GroupTaskFailureNotification(
+                    group_id=int(event.group_id),
+                    message_id=int(event.message_id),
+                    group_text=CLASSIFICATION_FAILURE_MESSAGE,
+                    task_kind="group_history_summary",
+                    stage="decision",
+                    reason_code=result.reason_code,
+                    notify_superusers=notify_superusers,
+                    request_trace_id=result.decision_id,
+                    summary=None,
+                ),
+            )
+        except Exception:
+            # 通知边界的意外失败只记录安全诊断：不重试、不进入第二条业务路径。
+            logger.error("[GroupHistorySummary] 判定失败通知上报异常")
+        return None
+    if result.status == "cancelled":
+        # 取消/中断不是供应方技术失败：按既有静默终态停止，不提交通知。
+        logger.info(
+            "[GroupHistorySummary] 总结判定已取消: reason={}",
+            result.reason_code,
         )
-        return False
-
-    return True
+        _stop_both_paths()
+        return None
+    return dispatch, result
 
 
 @summary_matcher.handle()
-async def handle_group_history_summary(
+async def handle_group_history_summary(  # noqa: PLR0911 - 每个门禁都是独立安全停止
     bot: Bot,
     event: GroupMessageEvent,
+    state: T_State,
 ) -> None:
-    """处理群聊历史总结请求。"""
+    """处理群聊历史总结请求（消费本次分发唯一的判定结果）。"""
     config = cast("DynamicConfigSchema", config_manager.get())
     group_id = getattr(event, "group_id", None)
     if (
@@ -236,12 +256,31 @@ async def handle_group_history_summary(
         )
         return
 
-    plain_text = event.get_plaintext().strip()
-    if not await _classify_and_route(bot, event, plain_text):
+    evaluated = await _evaluate_summary_candidate(bot, event, state)
+    if evaluated is None:
+        return
+    dispatch, result = evaluated
+    if result.status != "success" or result.route != "summary":
+        # 正常未命中（含前置过滤/外部重投/平台召唤直通）：放行传播，
+        # 普通聊天入口复用同一份判定结果，绝不再次调用模型或抽签。
         return
 
-    current_matcher.get().stop_propagation()
+    # 总结命中即独占：先停止事件传播，再领取一次性总结交接资格；交接抛出或
+    # 被拒都绝不落入普通聊天。
+    _stop_both_paths()
+    try:
+        claimed = await dispatch.claim_handoff("summary")
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        # 交接边界的普通异常就地隔离：只记录固定安全文本，传播保持停止。
+        logger.error("[GroupHistorySummary] 总结交接边界异常，保持停止传播")
+        return
+    if not claimed:
+        logger.info("[GroupHistorySummary] 总结交接未获准（重复或撤权），停止传播")
+        return
 
+    plain_text = event.get_plaintext().strip()
     requested_count = _extract_requested_count(plain_text)
     if requested_count is not None and not (
         config.min_summary_count <= requested_count <= config.max_summary_count
@@ -255,7 +294,7 @@ async def handle_group_history_summary(
         await summary_matcher.finish(OUT_OF_RANGE_MESSAGE)
 
     try:
-        result = await execute_group_summary(
+        result_execution = await execute_group_summary(
             bot=bot,
             group_id=str(event.group_id),
             bot_self_id=str(bot.self_id),
@@ -278,7 +317,7 @@ async def handle_group_history_summary(
         logger.exception("[GroupHistorySummary] 处理总结请求失败")
         return
 
-    await _send_group_summary_outputs(bot, event, result)
+    await _send_group_summary_outputs(bot, event, result_execution)
 
 
 async def _send_group_summary_outputs(

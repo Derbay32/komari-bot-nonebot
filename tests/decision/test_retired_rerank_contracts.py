@@ -51,13 +51,36 @@ def test_retired_wide_modules_are_deleted() -> None:
     assert not [path for path in retired_modules if path.exists()]
 
 
-def test_decision_outcome_does_not_expose_internal_rank_result() -> None:
-    """聊天调用方只接收稳定标量，不得观察深 module 的内部结果。"""
-    field_names = {
-        field.name for field in dataclasses.fields(decision_contracts.DecisionOutcome)
+def test_decision_result_is_scalar_and_has_no_legacy_score_fields() -> None:
+    """聊天/总结调用方只接收当前标量事实，旧宽重排分数不得回归。"""
+    from komari_bot.decision.jev import DecisionResult
+
+    field_names = {field.name for field in dataclasses.fields(DecisionResult)}
+    legacy_fields = {
+        "alias_hit",
+        "best_scene_id",
+        "call_intent",
+        "call_margin",
+        "call_direct_score",
+        "call_mention_score",
+        "filter_reason",
+        "forced_reply_reason",
+        "meaningful_score",
+        "memory_action",
+        "noise_score",
+        "rank_result",
+        "reply_reason",
+        "reply_score",
+        "runtime_reason",
+        "runtime_status",
+        "scene_score",
+        "should_reply",
+        "timing_breakdown",
+        "timing_score",
     }
 
-    assert "rank_result" not in field_names
+    assert field_names.isdisjoint(legacy_fields)
+    assert {"decision_id", "status", "reason_code", "route"}.issubset(field_names)
 
 
 def test_production_code_has_no_retired_wide_contract_reference() -> None:

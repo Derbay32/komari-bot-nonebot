@@ -159,8 +159,9 @@ async def test_agent_tool_call_mode_column_preserves_rows_and_downgrades_cleanly
     语义，分步升级不播种缺省）→ upgrade 0013 过 backfill barrier 并完成
     cutover 改名（reply_commit→reply_fulfillment）→ 写入存量行（仅非预算列）
     → upgrade 0014（预算列 + agent_tool_call_mode 以默认值补齐存量行）
-    → upgrade head → downgrade 0013（0014 整体回退：列被删除且存量行仍在）
-    → upgrade head 后 ``orm_bootstrap check`` 零漂移。
+    → upgrade 0024（后续迁移完成后仍保留 0014 默认语义；钉在 0025 之前，
+    因为 0025 已不可逆）→ downgrade 0013（0014 整体回退：列被删除且
+    存量行仍在）→ upgrade head 后 ``orm_bootstrap check`` 零漂移。
     """
     if not _same_database(POSTGRES_URL, SQLALCHEMY_URL):
         pytest.skip("KOMARI_TEST_POSTGRES_URL 与 SQLALCHEMY_DATABASE_URL 不一致")
@@ -232,8 +233,9 @@ async def test_agent_tool_call_mode_column_preserves_rows_and_downgrades_cleanly
         finally:
             await conn.close()
 
-        # upgrade head：后续迁移（图片列等）完成后仍保留 0014 默认语义
-        result = _run_bootstrap(scratch_url, "upgrade", "head")
+        # upgrade 0024：后续迁移（图片列、Jev 存储等）完成后仍保留 0014
+        # 默认语义；不可逆的 0025 必须留在 downgrade 之后。
+        result = _run_bootstrap(scratch_url, "upgrade", "0024")
         assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
         conn = await asyncpg.connect(**scratch)
         try:

@@ -1,4 +1,4 @@
-"""TSK-189 版本化初始数据播种 —— 公开契约（无数据库）测试。
+"""TSK-189/TSK-190 版本化初始数据播种 —— 公开契约（无数据库）测试。
 
 本文件定义播种入口的公开契约（测试即规范）：
 
@@ -9,32 +9,31 @@
 - 容器 prestart 在 ``upgrade head`` 之后调用同一命令，``set -e`` 使任一步
   失败即中止容器启动（fail fast）。
 
-必需固定键不导入生产实现，统一使用测试 oracle
-``tests/komari_decision/required_fixed_scene_keys.py``。
+TSK-190 起场景初始化退役：默认资产只携带三个 Prompt 资源块，manifest 不再
+要求任何场景键（``fixed_candidates`` / ``general_scenes``）。旧场景键按无关
+顶层键忽略，校验层不新增拒绝规则；YAML 重复键拒绝仍是通用规则，覆盖根键与
+Prompt 映射键。
 
-AC7 的运行时侧（只从 PostgreSQL 构建模板、数据库短暂故障保留最后有效
-快照）属于既有行为，本文件以回归钉点覆盖，预期绿灯而非红灯。
+Prompt 字段名从 ``tests/config/prompt_field_contract.py`` oracle 派生，测试
+输入使用自有 marker，不复制生产默认正文。
 """
 
 from __future__ import annotations
 
-import asyncio
+import json
 import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, cast
 
 import pytest
 import yaml
 
-from komari_bot.plugins.komari_decision.services.scene_runtime_service import (
-    SceneRuntimeService,
+from tests.config.prompt_field_contract import (
+    PROMPT_RESOURCE_IDS,
+    find_prompt_mapping,
+    prompt_marker_values,
 )
-from komari_bot.plugins.komari_decision.services.scene_template_loader import (
-    PostgresSceneTemplateLoader,
-)
-from tests.komari_decision.required_fixed_scene_keys import REQUIRED_FIXED_SCENE_KEYS
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SEED_FILE = (
@@ -54,6 +53,13 @@ SEED_INVOCATION = f"-m {CLI_MODULE}"
 UNREACHABLE_DB_URL = (
     "postgresql+asyncpg://seed_test:seed_test@seed-unreachable.invalid:1/seed_test"
 )
+
+#: 三个 Prompt 资源块在 manifest 中的节名（只影响可读性，不参与定位）。
+_SECTION_BY_RESOURCE: dict[str, str] = {
+    "komari_chat": "chat_prompt",
+    "komari_memory_summary": "memory_summary_prompt",
+    "group_history_summary": "group_history_summary_prompt",
+}
 
 
 def _run_seed_cli(
@@ -130,154 +136,43 @@ def _run_prestart_with_fake_python(
     return result, log_path
 
 
-def _scene_seed_text(
-    *,
-    fixed_keys: tuple[str, ...] = REQUIRED_FIXED_SCENE_KEYS,
-    general_scenes: list[dict[str, str]] | None = None,
-) -> str:
-    """构造测试自有的 seed 文件内容（键来自 oracle，值为测试字面量）。"""
-    if general_scenes is None:
-        general_scenes = [{"id": "scene_test_general", "text": "测试一般场景内容"}]
-    lines = ['version: "1"', "fixed_candidates:"]
-    lines.extend(f'  {key}: "固定内容 {key}"' for key in fixed_keys)
-    lines.append("general_scenes:")
-    for scene in general_scenes:
-        lines.append(f'  - id: "{scene["id"]}"')
-        lines.append(f'    text: "{scene["text"]}"')
+def _prompt_manifest_text(*, duplicate_chat_field: str | None = None) -> str:
+    """构造测试自有的只带 Prompt 的 manifest 文本（可注入 chat 块重复键）。"""
+    lines: list[str] = ['version: "1"']
+    for resource_id in PROMPT_RESOURCE_IDS:
+        lines.append(f"{_SECTION_BY_RESOURCE[resource_id]}:")
+        values = prompt_marker_values(resource_id)
+        for field in sorted(values):
+            rendered = json.dumps(values[field], ensure_ascii=False)
+            lines.append(f"  {field}: {rendered}")
+            if duplicate_chat_field is not None and field == duplicate_chat_field:
+                duplicate = json.dumps(f"{values[field]}-dup", ensure_ascii=False)
+                lines.append(f"  {field}: {duplicate}")
     return "\n".join(lines) + "\n"
 
 
-class _RowsOnlyRepository:
-    """只实现 PostgresSceneTemplateLoader 依赖的两个接口。"""
-
-    def __init__(self, rows: list[dict[str, Any]]) -> None:
-        self.rows = rows
-
-    async def list_scenes(self, *, enabled_only: bool = False) -> list[dict[str, Any]]:
-        assert enabled_only is True
-        return [dict(row) for row in self.rows]
-
-    @staticmethod
-    def compute_scene_source_hash(rows: list[dict[str, Any]]) -> str:
-        del rows
-        return "row-derived-source-hash"
-
-
-def _runtime_rows() -> list[dict[str, Any]]:
-    rows = [
-        {
-            "id": index,
-            "scene_key": scene_key,
-            "scene_type": "fixed",
-            "content_text": f"内容 {scene_key}",
-            "enabled": True,
-            "order_index": index,
-            "content_hash": f"hash-{scene_key}",
-        }
-        for index, scene_key in enumerate(REQUIRED_FIXED_SCENE_KEYS, start=1)
-    ]
-    rows.append(
-        {
-            "id": 5,
-            "scene_key": "GREETING",
-            "scene_type": "general",
-            "content_text": "问候场景",
-            "enabled": True,
-            "order_index": 5,
-            "content_hash": "hash-GREETING",
-        }
-    )
-    return rows
-
-
-def _snapshot_items(tag: str) -> list[dict[str, Any]]:
-    items = [
-        {
-            "scene_key": scene_key,
-            "scene_type": "fixed",
-            "content_text": f"{tag} {scene_key}",
-            "embedding": [0.1 * (index + 1), 0.1 * (index + 1)],
-            "order_index": index,
-            "status": "READY",
-            "enabled": True,
-        }
-        for index, scene_key in enumerate(REQUIRED_FIXED_SCENE_KEYS)
-    ]
-    items.append(
-        {
-            "scene_key": f"SCENE_{tag.upper()}",
-            "scene_type": "general",
-            "content_text": f"{tag} general",
-            "embedding": [0.5, 0.5],
-            "order_index": 4,
-            "status": "READY",
-            "enabled": True,
-        }
-    )
-    return items
-
-
-class _FlakyRepository:
-    """先成功后故障的仓储桩：验证数据库短暂故障时最后有效快照语义。"""
-
-    def __init__(self, items: list[dict[str, Any]]) -> None:
-        self.items = items
-        self.fail = False
-        self.get_active_calls = 0
-
-    async def get_active_set(self) -> dict[str, Any] | None:
-        self.get_active_calls += 1
-        if self.fail:
-            raise RuntimeError("数据库暂不可用（测试模拟）")
-        return {
-            "id": 1,
-            "status": "READY",
-            "runtime_updated_at": f"ts-{self.get_active_calls}",
-        }
-
-    async def list_items_by_set(
-        self,
-        set_id: int,
-        status: str | None = None,
-        *,
-        enabled_only: bool = False,
-        limit: int | None = None,
-    ) -> list[dict[str, Any]]:
-        del set_id, status, enabled_only, limit
-        if self.fail:
-            raise RuntimeError("数据库暂不可用（测试模拟）")
-        return [dict(item) for item in self.items]
-
-
-def test_versioned_scene_seed_file_is_present_and_well_formed() -> None:
-    """AC1：版本化场景初始数据存在且形状合法。"""
+def test_versioned_seed_file_carries_prompt_blocks_without_scene_blocks() -> None:
+    """默认资产只带三个 Prompt 资源块，不再携带退役场景块。"""
     assert DEFAULT_SEED_FILE.is_file(), (
-        f"缺少版本化场景初始数据文件: {DEFAULT_SEED_FILE}"
+        f"缺少版本化初始数据文件: {DEFAULT_SEED_FILE}"
     )
     raw = yaml.safe_load(DEFAULT_SEED_FILE.read_text(encoding="utf-8")) or {}
     assert isinstance(raw, dict), "seed 文件根节点必须是对象"
     assert raw.get("version"), "版本化初始数据文件必须携带 version 标记"
 
-    fixed_candidates = raw.get("fixed_candidates")
-    assert isinstance(fixed_candidates, dict), "fixed_candidates 必须是对象"
-    missing = [
-        key for key in REQUIRED_FIXED_SCENE_KEYS if key not in fixed_candidates
-    ]
-    assert missing == [], f"seed 文件缺少必需 fixed 场景: {missing}"
-    assert all(str(value).strip() for value in fixed_candidates.values())
+    for resource_id in PROMPT_RESOURCE_IDS:
+        mapping = find_prompt_mapping(raw, resource_id)
+        assert mapping is not None, (
+            f"默认资产缺少 {resource_id} Prompt 初始数据块"
+        )
+        assert all(str(value).strip() for value in mapping.values())
 
-    general_scenes = raw.get("general_scenes")
-    assert isinstance(general_scenes, list) and general_scenes, (
-        "seed 文件必须包含至少一个 general scene"
-    )
-    for item in general_scenes:
-        assert isinstance(item, dict)
-        assert str(item.get("id", "")).strip(), "general scene 缺少 id"
-        assert str(item.get("text", "")).strip(), "general scene 缺少 text"
+    assert "fixed_candidates" not in raw, "默认资产不得再携带 fixed 场景块"
+    assert "general_scenes" not in raw, "默认资产不得再携带一般场景块"
 
 
 def test_seed_cli_exposes_documented_seed_file_option() -> None:
-    """AC1：公开 CLI 存在并暴露 --seed-file 选项。"""
+    """公开 CLI 存在并暴露 --seed-file 选项。"""
     result = _run_seed_cli("--help")
     output = f"{result.stdout}\n{result.stderr}"
     assert result.returncode == 0, output
@@ -285,7 +180,7 @@ def test_seed_cli_exposes_documented_seed_file_option() -> None:
 
 
 def test_seed_cli_validates_seed_file_before_database_access(tmp_path: Path) -> None:
-    """AC6：非法 seed 在触碰数据库之前即失败并指出出错文件。"""
+    """非法 seed 在触碰数据库之前即失败并指出出错文件。"""
     bad_file = tmp_path / "bad-root.yaml"
     bad_file.write_text("- just\n- a list\n", encoding="utf-8")
     result = _run_seed_cli(seed_file=bad_file)
@@ -297,95 +192,33 @@ def test_seed_cli_validates_seed_file_before_database_access(tmp_path: Path) -> 
     )
 
 
-@pytest.mark.parametrize("missing_key", REQUIRED_FIXED_SCENE_KEYS)
-def test_seed_cli_rejects_seed_missing_required_fixed_scene(
-    missing_key: str,
-    tmp_path: Path,
-) -> None:
-    """AC6：缺任一必需固定场景的 seed 文件明确失败。"""
-    fixed_keys = tuple(
-        key for key in REQUIRED_FIXED_SCENE_KEYS if key != missing_key
-    )
-    seed_file = tmp_path / "missing-fixed.yaml"
-    seed_file.write_text(_scene_seed_text(fixed_keys=fixed_keys), encoding="utf-8")
-    result = _run_seed_cli(seed_file=seed_file)
-    output = f"{result.stdout}\n{result.stderr}"
-    assert result.returncode != 0, output
-    assert missing_key in output, "失败信息必须点名缺失的固定场景键"
-    assert str(seed_file) in output
-
-
-def test_seed_cli_rejects_seed_without_general_scenes(tmp_path: Path) -> None:
-    """AC6：一般场景为空的 seed 文件明确失败。"""
-    seed_file = tmp_path / "no-general.yaml"
-    seed_file.write_text(_scene_seed_text(general_scenes=[]), encoding="utf-8")
-    result = _run_seed_cli(seed_file=seed_file)
-    output = f"{result.stdout}\n{result.stderr}"
-    assert result.returncode != 0, output
-    assert "general" in output.lower(), "失败信息必须指向一般场景缺失"
-    assert str(seed_file) in output
-
-
 @pytest.mark.parametrize(
-    ("general_scenes", "duplicated_key"),
-    [
-        (
-            [{"id": "NOISE", "text": "与 fixed 候选重复的 general key"}],
-            "NOISE",
-        ),
-        (
-            [
-                {"id": "scene_dup", "text": "第一个"},
-                {"id": "scene_dup", "text": "第二个"},
-            ],
-            "scene_dup",
-        ),
-    ],
-    ids=["fixed-general-duplicate", "within-general-duplicate"],
+    ("case", "duplicated_key"),
+    [("root-version", "version"), ("chat-prompt-field", "system_prompt")],
 )
-def test_seed_cli_rejects_duplicate_scene_keys(
-    general_scenes: list[dict[str, str]],
+def test_seed_cli_rejects_duplicate_yaml_keys(
+    case: str,
     duplicated_key: str,
     tmp_path: Path,
 ) -> None:
-    """AC6：seed 文件内重复 scene_key 明确失败。"""
-    seed_file = tmp_path / "duplicate-keys.yaml"
-    seed_file.write_text(
-        _scene_seed_text(general_scenes=general_scenes),
-        encoding="utf-8",
-    )
-    result = _run_seed_cli(seed_file=seed_file)
-    output = f"{result.stdout}\n{result.stderr}"
-    assert result.returncode != 0, output
-    assert duplicated_key in output, "失败信息必须点名重复的键"
-    assert str(seed_file) in output
-
-
-def test_seed_cli_rejects_duplicate_key_inside_fixed_candidates(
-    tmp_path: Path,
-) -> None:
-    """AC6：fixed_candidates（YAML mapping）内同一键重复出现明确失败。
+    """YAML 重复键（根键或 Prompt 映射键）明确失败，且不触碰数据库。
 
     YAML 对 mapping 重复键默认静默覆盖，校验层必须独立检出；否则重复键
     被折叠后会被漏过，命令会继续访问数据库而不是在校验阶段失败。
     """
-    seed_file = tmp_path / "duplicate-fixed-key.yaml"
-    seed_file.write_text(
-        _scene_seed_text(
-            fixed_keys=(
-                "NOISE",
-                "MEANINGFUL",
-                "CALL_DIRECT",
-                "CALL_MENTION",
-                "NOISE",
-            )
-        ),
-        encoding="utf-8",
+    body = (
+        _prompt_manifest_text() + '\nversion: "2"\n'
+        if case == "root-version"
+        else _prompt_manifest_text(duplicate_chat_field=duplicated_key)
     )
+    seed_file = tmp_path / f"duplicate-key-{case}.yaml"
+    seed_file.write_text(body, encoding="utf-8")
+
     result = _run_seed_cli(seed_file=seed_file)
     output = f"{result.stdout}\n{result.stderr}"
     assert result.returncode != 0, output
-    assert "NOISE" in output, "失败信息必须点名重复的固定场景键"
+    assert "YAML 解析失败" in output, output
+    assert duplicated_key in output, "失败信息必须点名重复的键"
     assert str(seed_file) in output, "报错必须指明出错的 seed 文件"
     assert "seed-unreachable.invalid" not in output, (
         "seed 校验失败前不得尝试连接数据库"
@@ -396,7 +229,7 @@ def test_seed_cli_rejects_duplicate_key_inside_fixed_candidates(
     "body",
     [
         "- just\n- a list\n",
-        "fixed_candidates: [unclosed\n",
+        "version: [unclosed\n",
     ],
     ids=["root-list", "malformed-yaml"],
 )
@@ -404,7 +237,7 @@ def test_seed_cli_rejects_invalid_seed_file_format(
     body: str,
     tmp_path: Path,
 ) -> None:
-    """AC6：非法格式（根节点非对象 / YAML 解析失败）明确失败。"""
+    """非法格式（根节点非对象 / YAML 解析失败）明确失败。"""
     seed_file = tmp_path / "invalid-format.yaml"
     seed_file.write_text(body, encoding="utf-8")
     result = _run_seed_cli(seed_file=seed_file)
@@ -416,7 +249,7 @@ def test_seed_cli_rejects_invalid_seed_file_format(
 def test_prestart_runs_upgrade_head_then_seed_bootstrap_with_fail_fast(
     tmp_path: Path,
 ) -> None:
-    """AC2 成功路径：prestart 先执行 upgrade head，再调用播种命令。"""
+    """成功路径：prestart 先执行 upgrade head，再调用播种命令。"""
     result, log_path = _run_prestart_with_fake_python(tmp_path)
     output = f"{result.stdout}\n{result.stderr}"
     assert result.returncode == 0, output
@@ -427,7 +260,7 @@ def test_prestart_runs_upgrade_head_then_seed_bootstrap_with_fail_fast(
 
 
 def test_prestart_fails_fast_when_migration_command_fails(tmp_path: Path) -> None:
-    """AC2：迁移命令失败时 prestart 非零退出，且不调用播种命令。"""
+    """迁移命令失败时 prestart 非零退出，且不调用播种命令。"""
     result, log_path = _run_prestart_with_fake_python(tmp_path, migrate_exit=1)
     output = f"{result.stdout}\n{result.stderr}"
     assert result.returncode != 0, output
@@ -438,7 +271,7 @@ def test_prestart_fails_fast_when_migration_command_fails(tmp_path: Path) -> Non
 
 
 def test_prestart_fails_fast_when_seed_command_fails(tmp_path: Path) -> None:
-    """AC2：播种失败时 prestart 非零退出；迁移与播种各只调用一次。"""
+    """播种失败时 prestart 非零退出；迁移与播种各只调用一次。"""
     result, log_path = _run_prestart_with_fake_python(tmp_path, seed_exit=1)
     output = f"{result.stdout}\n{result.stderr}"
     assert result.returncode != 0, output
@@ -446,33 +279,3 @@ def test_prestart_fails_fast_when_seed_command_fails(tmp_path: Path) -> None:
     assert invocations == [MIGRATE_INVOCATION, SEED_INVOCATION], (
         "播种失败前迁移与播种必须各执行恰好一次"
     )
-
-
-def test_runtime_scene_loader_derives_payload_from_postgresql_rows_only() -> None:
-    """AC7：运行时场景模板只从 PostgreSQL 行构建，不读取 seed 文件。"""
-    loader = PostgresSceneTemplateLoader(
-        cast("Any", _RowsOnlyRepository(_runtime_rows())),
-    )
-
-    payload = asyncio.run(loader.load_scene_template())
-
-    assert payload.source_path.endswith((".yaml", ".yml")) is False
-    assert payload.source_hash == "row-derived-source-hash"
-    assert set(payload.fixed_candidates) == set(REQUIRED_FIXED_SCENE_KEYS)
-    assert payload.general_scenes == [{"id": "GREETING", "text": "问候场景"}]
-
-
-def test_runtime_keeps_last_valid_snapshot_on_transient_db_failure() -> None:
-    """AC7：数据库短暂故障时继续使用最后确认有效的内存快照。"""
-    repository = _FlakyRepository(_snapshot_items("v1"))
-    service = SceneRuntimeService(cast("Any", repository))
-
-    assert asyncio.run(service.load_active_set_cache()) is True
-    snapshot = service.get_scene_candidates()
-    assert snapshot is not None
-
-    repository.fail = True
-    with pytest.raises(RuntimeError):
-        asyncio.run(service.refresh_if_runtime_updated())
-
-    assert service.get_scene_candidates() is snapshot

@@ -127,7 +127,6 @@ def _pending_reply(
         bot_self_id=bot_self_id,
         adapter_name=adapter_name,
         reason="score",
-        reply_score=0.9,
         fulfillment_id=fulfillment_id,
         request_trace_id=request_trace_id,
         reply_timestamp=reply_timestamp,

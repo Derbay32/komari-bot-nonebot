@@ -8,8 +8,8 @@ Schema + 配置管理器测试替身）验证新增 ``jev_execution`` 分区：
   ``optional_reply_probability`` / ``decision_log_retention_days``）以契约默认值
   出现在读取响应中，并归属新的 ``jev_execution`` 分区（位于 ``jev_request``
   之后）；
-- 既有字段（``plugin_enable=False``、``bot_aliases``、五个 Jev 请求字段）保持
-  原样，本票不切换任何运行时行为；
+- 保留字段（``plugin_enable=True``、``bot_aliases``、五个 Jev 请求字段）取值
+  不变；TSK-190 退庭的 38 个场景/总结字段不再出现在读取投影中；
 - 非法容量、非法截止（零/负/非有限）、越界概率与越界保留天数在写入边界被
   拒绝（422），配置保持原样。
 """
@@ -28,6 +28,9 @@ from komari_bot.plugins.komari_management.config_api import (
 )
 from komari_bot.plugins.komari_management.managed_resources import (
     ManagedConfigResource,
+)
+from tests.db.tsk190_legacy_config_support import (
+    RETIRED_DECISION_CONFIG_FIELDS,
 )
 from tests.komari_management.test_jev_config_api import (
     PersistingDecisionConfigManager,
@@ -137,10 +140,10 @@ async def test_jev_execution_defaults_are_exposed_through_management_get(
 
 
 @pytest.mark.asyncio
-async def test_jev_execution_defaults_keep_existing_decision_fields_unchanged(
+async def test_jev_execution_defaults_keep_surviving_decision_fields(
     app: App, manager: PersistingDecisionConfigManager
 ) -> None:
-    """AC：既有字段默认值与业务开关保持原样，本票不提前切换运行时行为。"""
+    """AC：保留字段取值不变，退役字段不再出现在读取投影中。"""
     async with app.test_server(asgi=cast("Any", _build_app(manager))) as ctx:
         client = ctx.get_client()
         detail = await client.get(
@@ -149,14 +152,15 @@ async def test_jev_execution_defaults_keep_existing_decision_fields_unchanged(
 
     assert detail.status_code == 200
     values = detail.json()["values"]
-    assert values["plugin_enable"] is False
+    # TSK-190：新初始化配置默认启用（运行时仍需 Jev 请求配置才能就绪）
+    assert values["plugin_enable"] is True
     assert values["bot_aliases"] == ["小鞠", "小鞠知花", "komari"]
     assert values["jev_model"] == "jev-1.14.0"
     assert values["jev_http_timeout_seconds"] == 3.0
     assert values["jev_request_timeout_seconds"] == 3.0
     assert values["jev_api_key"] == "******"
-    assert values["scene_top_k"] == 4
-    assert values["reply_threshold"] == 0.72
+    for retired in RETIRED_DECISION_CONFIG_FIELDS:
+        assert retired not in values, retired
 
 
 @pytest.mark.asyncio
@@ -191,8 +195,8 @@ async def test_jev_execution_field_writes_persist_through_management_patch(
     assert detail.status_code == 200
     for field_name, value in written_values.items():
         assert detail.json()["values"][field_name] == value, field_name
-    # 写入只影响被改字段，其他默认值原样保留
-    assert detail.json()["values"]["plugin_enable"] is False
+    # 写入只影响被改字段，其他保留字段默认值原样保留
+    assert detail.json()["values"]["plugin_enable"] is True
     assert detail.json()["values"]["jev_request_timeout_seconds"] == 3.0
 
 

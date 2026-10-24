@@ -135,8 +135,12 @@ Schema、管理 API 与数据库中一并消失。
 
 0012–0015 只做结构迁移，不写入 Prompt 或场景正文：新增/删除列并搬运旧配置值
 （0012 删除旧输出协议列，0015 把旧图片配置值迁入 chat 并删除 memory 旧列）。
-Prompt 与场景正文由统一版本化播种（`seed_bootstrap`）写入；升级后未播种的应用
-无法通过冷启动校验（fail fast）。
+当前 `seed_bootstrap` 只初始化 Prompt。
+聊天、记忆总结、群总结的 Prompt 缺失会阻止冷启动。
+判定 Prompt 使用独立的可选初始化步骤。
+迁移 `0025` 删除旧场景四表与 38 个判定专用字段。
+这项删除不可逆，不提供旧场景恢复入口。
+Prompt 初始化规则见 ADR-0011。
 
 ### 升级步骤（全新库与旧库通用）
 
@@ -151,12 +155,15 @@ Prompt 与场景正文由统一版本化播种（`seed_bootstrap`）写入；升
 2. 升级到 `head`：运行
    `poetry run python -m komari_bot.db.orm_bootstrap upgrade head`。
    检查：运行 `poetry run python -m komari_bot.db.orm_bootstrap current`，
-   输出 `0015 (head)`。
+   输出 `0025 (head)`。
    回退：失败时该迁移事务已回滚、版本停留原样，修复后重跑本步骤。
 3. 播种初始数据：运行 `poetry run python -m komari_bot.db.seed_bootstrap`。
-   检查：命令退出码为 `0`，stdout 报告包含场景新增/总计与 Prompt 新建行/补齐字段
-   计数且无错误。播种只新建缺失场景与三个 Prompt 资源单行、只补齐空字段，绝不覆盖
-   非空自定义值、不删除管理员场景；旧 `output_instruction` 自定义内容不并入任何字段。
+   检查：命令退出码为 `0`。
+   stdout 报告 Prompt 新建行数与补齐字段数。
+   播种只新建缺失的 Prompt 单行或补齐空字段。
+   播种保留非空自定义值。
+   播种不访问已退役的场景表。
+   旧 `output_instruction` 自定义内容不并入任何字段。
    回退：失败时数据库未满足冷启动校验，恢复备份或修复后重跑本步骤。
 4. 校验模型元数据零漂移：运行
    `poetry run python -m komari_bot.db.orm_bootstrap check`。

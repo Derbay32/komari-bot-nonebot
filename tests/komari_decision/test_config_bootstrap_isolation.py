@@ -1,13 +1,13 @@
-"""TSK-182：判定插件配置读取失败的启动隔离与公共健康态投影。
+"""TSK-182/189：判定配置读取失败的启动隔离与公共健康态投影。
 
-全部用例使用真实 ``ConfigManager`` 与真实 ``KomariDecisionConfigSchema``，只
-替换外部存储边界；scene 子系统构造点全部 fail-if-called，确保配置失败时不会
-启动任何场景初始化，也不会触发 SDK / embedding / 网络调用。
+全部用例使用真实 ``DecisionRuntime``、真实 ``ConfigManager`` 与真实
+``KomariDecisionConfigSchema``，只替换外部存储、共享 ORM 会话、自有 Redis 与
+Prompt 加载器边界。配置失败时不得构造任何旧场景子系统，也不得写入默认配置；
+公共健康态只投影稳定的原因码。
 """
 
 from __future__ import annotations
 
-import asyncio
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
@@ -16,32 +16,30 @@ import pytest
 from loguru import logger as loguru_logger
 from pydantic import ValidationError
 
-import komari_bot.plugins.komari_decision as decision_plugin
+from komari_bot.config.prompt_storage import PromptTemplateLoader
 from komari_bot.plugins.config_manager import manager as manager_module
 from komari_bot.plugins.config_manager.manager import ConfigManager
 from komari_bot.plugins.config_manager.storage import StoredConfig
 from komari_bot.plugins.komari_decision.config_schema import (
     KomariDecisionConfigSchema,
 )
+from komari_bot.plugins.komari_decision.prompt_schema import (
+    DISPLAY_NAME as DECISION_PROMPT_DISPLAY_NAME,
+)
+from komari_bot.plugins.komari_decision.prompt_schema import (
+    RESOURCE_ID as DECISION_PROMPT_RESOURCE_ID,
+)
 from komari_bot.plugins.komari_decision.services import config_interface
+from komari_bot.plugins.komari_decision.services.jev_runtime import DecisionRuntime
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-_UPDATED_AT = datetime(2026, 10, 24, 11, 0, 0, tzinfo=UTC)
-_SENTINEL = "SENTINEL-TSK182-c0ffee"
-_EXPECTED_FAILED_REASON = "判定配置暂不可用"
+    from sqlalchemy.ext.asyncio import AsyncSession
 
-_SCENE_SEAMS = (
-    "komari_bot.plugins.komari_decision.repositories.scene_repository.SceneRepository",
-    "komari_bot.plugins.komari_decision.services.scene_runtime_service.SceneRuntimeService",
-    "komari_bot.plugins.komari_decision.services.scene_sync_service.SceneSyncService",
-    "komari_bot.plugins.komari_decision.services.scene_embedding_worker.SceneEmbeddingWorker",
-    "komari_bot.plugins.komari_decision.services.scene_admin_service.SceneAdminService",
-    "komari_bot.plugins.komari_decision.handlers.scene_sync_worker.register_scene_sync_task",
-    "komari_bot.plugins.komari_decision.handlers.scene_sync_worker.bootstrap_scene_sync_task",
-)
-"""scene 子系统构造 / 启动入口：配置读取失败后一律不得被调用。"""
+_UPDATED_AT = datetime(2026, 10, 24, 11, 0, 0, tzinfo=UTC)
+_SENTINEL = "SENTINEL-TSK189-c0ffee"
+_EXPECTED_FAILED_REASON = "configuration_invalid"
 
 
 def _valid_data(**overrides: Any) -> dict[str, Any]:
@@ -114,159 +112,155 @@ def _capture_logs() -> Iterator[list[str]]:
         loguru_logger.remove(handler_id)
 
 
-def _fail_if_called(name: str) -> Any:
-    """构造一个只要被调用就失败的替身（场景初始化必须完全不发生）。"""
-    message = f"配置读取失败后不得构造 {name}"
+class _FakeRedis:
+    """自有 Redis 边界替身：只实现运行时会调用的 ping / aclose。"""
 
-    def _factory(*_args: Any, **_kwargs: Any) -> Any:
-        raise AssertionError(message)
+    def __init__(self) -> None:
+        self.closed = False
 
-    return _factory
+    async def ping(self) -> bool:
+        return True
 
-
-@pytest.fixture
-def scene_seams(monkeypatch: pytest.MonkeyPatch) -> None:
-    """把 scene 子系统全部入口替换为 fail-if-called。"""
-    for path in _SCENE_SEAMS:
-        monkeypatch.setattr(path, _fail_if_called(path))
+    async def aclose(self) -> None:
+        self.closed = True
 
 
-@pytest.fixture
-def decision_config_manager(monkeypatch: pytest.MonkeyPatch) -> ConfigManager:
-    """用真实 ConfigManager + 真实 Schema 提供插件内的配置读取 seam。"""
-    manager = ConfigManager("komari_decision", KomariDecisionConfigSchema)
-    monkeypatch.setattr(config_interface, "_config_manager", manager)
-    return manager
+def _broken_session() -> AsyncSession:
+    """共享 ORM 会话边界：本文件不提供真实数据库，初始化必须安全失败。"""
+    msg = "synthetic database outage"
+    raise ConnectionError(msg)
 
 
 def _install_storage(
     monkeypatch: pytest.MonkeyPatch,
     storage: _FaultStorage,
-) -> None:
+) -> ConfigManager:
+    manager = ConfigManager("komari_decision", KomariDecisionConfigSchema)
+    monkeypatch.setattr(config_interface, "_config_manager", manager)
     monkeypatch.setattr(manager_module, "get_config_storage", lambda: storage)
+    return manager
 
 
-@pytest.mark.usefixtures("scene_seams", "decision_config_manager")
-def test_initial_read_failure_is_isolated_and_projected_failed(
+def _runtime(
+    monkeypatch: pytest.MonkeyPatch, storage: _FaultStorage
+) -> DecisionRuntime:
+    manager = _install_storage(monkeypatch, storage)
+    return DecisionRuntime(
+        config_manager=manager,
+        session_factory=_broken_session,
+        redis_factory=lambda: cast("Any", _FakeRedis()),
+        prompt_loader=PromptTemplateLoader(
+            resource_id=DECISION_PROMPT_RESOURCE_ID,
+            display_name=DECISION_PROMPT_DISPLAY_NAME,
+            log_prefix="[test]",
+        ),
+        bot_resolver=lambda _account_id: None,
+    )
+
+
+async def test_initial_read_failure_is_isolated_and_projected_failed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """初始配置读取失败被隔离：不启动 scene，公共健康态如实投影 failed。"""
+    """初始配置读取失败被隔离：不启动场景，公共健康态只投影稳定原因码。"""
     storage = _FaultStorage(OSError(f"config source unavailable {_SENTINEL}"))
-    _install_storage(monkeypatch, storage)
-    manager = decision_plugin.PluginManager()
+    runtime = _runtime(monkeypatch, storage)
 
-    with _capture_logs() as messages:
-        asyncio.run(manager.initialize())
-        logged_after_initialize = len(messages)
-        first = manager.runtime_state
-        second = manager.runtime_state
-        assert len(messages) == logged_after_initialize
+    try:
+        with _capture_logs() as messages:
+            await runtime.startup()
+            logged_after_initialize = len(messages)
+            first = runtime.get_health()
+            second = runtime.get_health()
+            assert len(messages) == logged_after_initialize
 
-    assert first.status is decision_plugin.DecisionRuntimeStatus.FAILED
-    assert second == first
-    assert first.reason == _EXPECTED_FAILED_REASON
-    assert _SENTINEL not in first.reason
-    assert manager.scene_repository is None
-    assert manager.scene_admin is None
-    assert manager.scene_runtime is None
-    assert manager.scene_sync is None
-    assert manager.scene_embedding_worker is None
-    joined = "".join(messages)
-    assert _SENTINEL not in joined
-    assert "OSError" in joined
+        assert first.runtime_status == "failed"
+        assert first.reason_code == _EXPECTED_FAILED_REASON
+        assert second == first
+        assert _SENTINEL not in first.reason_code
+        joined = "".join(messages)
+        assert _SENTINEL not in joined
+        assert "OSError" in joined
+    finally:
+        await runtime.close()
 
 
-@pytest.mark.usefixtures("scene_seams", "decision_config_manager")
-def test_invalid_persisted_config_fails_health_without_default_fallback(
+async def test_invalid_persisted_config_fails_health_without_default_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """真实 Schema 校验失败同样被隔离，且配置读取接口仍拒绝非法输入。"""
-    storage = _FaultStorage(_stored({"reply_threshold": 7.5}, 4))
-    _install_storage(monkeypatch, storage)
-    manager = decision_plugin.PluginManager()
+    storage = _FaultStorage(_stored({"jev_request_timeout_seconds": 0}, 4))
+    runtime = _runtime(monkeypatch, storage)
 
-    with _capture_logs() as messages:
-        asyncio.run(manager.initialize())
-        state = manager.runtime_state
+    try:
+        with _capture_logs() as messages:
+            await runtime.startup()
+            state = runtime.get_health()
 
-    assert state.status is decision_plugin.DecisionRuntimeStatus.FAILED
-    assert state.reason == _EXPECTED_FAILED_REASON
-    assert manager.scene_runtime is None
-    assert "ValidationError" in "".join(messages)
+        assert state.runtime_status == "failed"
+        assert state.reason_code == _EXPECTED_FAILED_REASON
+        assert "ValidationError" in "".join(messages)
 
-    # 失败态只是投影，绝不缓存默认值：真实配置接口仍然抛出校验错误。
-    with pytest.raises(ValidationError):
-        asyncio.run(config_interface.get_config_async())
-
-
-@pytest.mark.parametrize(
-    ("plugin_enable", "scene_persist_enabled"),
-    [(False, True), (True, False)],
-)
-@pytest.mark.usefixtures("scene_seams", "decision_config_manager")
-def test_disabled_path_is_unchanged(
-    monkeypatch: pytest.MonkeyPatch,
-    *,
-    plugin_enable: bool,
-    scene_persist_enabled: bool,
-) -> None:
-    """既有 disabled 判定路径行为不变。"""
-    storage = _FaultStorage(
-        _stored(
-            _valid_data(
-                plugin_enable=plugin_enable,
-                scene_persist_enabled=scene_persist_enabled,
-            ),
-            2,
-        )
-    )
-    _install_storage(monkeypatch, storage)
-    manager = decision_plugin.PluginManager()
-
-    asyncio.run(manager.initialize())
-
-    state = manager.runtime_state
-    assert state.status is decision_plugin.DecisionRuntimeStatus.DISABLED
-    assert manager.scene_runtime is None
+        # 失败态只是投影，绝不缓存默认值：真实配置接口仍然抛出校验错误。
+        with pytest.raises(ValidationError):
+            await config_interface.get_config_async()
+    finally:
+        await runtime.close()
 
 
-@pytest.mark.usefixtures("scene_seams", "decision_config_manager")
-def test_repaired_source_reaches_normal_path_on_later_initialize(
+async def test_disabled_path_is_unchanged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """修复外部数据源后，后续显式初始化重新走正常判定路径。"""
-    storage = _FaultStorage(_stored({"reply_threshold": 7.5}, 4))
-    _install_storage(monkeypatch, storage)
-    manager = decision_plugin.PluginManager()
+    """显式关闭仍投影 disabled；不因读取失败或默认值被重新启用。"""
+    storage = _FaultStorage(_stored(_valid_data(plugin_enable=False), 2))
+    runtime = _runtime(monkeypatch, storage)
 
-    asyncio.run(manager.initialize())
-    assert (
-        manager.runtime_state.status is decision_plugin.DecisionRuntimeStatus.FAILED
-    )
+    try:
+        await runtime.startup()
 
-    storage.entry = _stored(_valid_data(plugin_enable=False), 5)
-    reads_before_retry = storage.fetch_calls
-    asyncio.run(manager.initialize())
-
-    assert manager.runtime_state.status is decision_plugin.DecisionRuntimeStatus.DISABLED
-    assert storage.fetch_calls == reads_before_retry + 1
+        state = runtime.get_health()
+        assert state.runtime_status == "disabled"
+        assert state.reason_code == "disabled"
+    finally:
+        await runtime.close()
 
 
-@pytest.mark.usefixtures("scene_seams", "decision_config_manager")
-def test_config_failure_reason_is_fixed_and_shared_by_both_observations(
+async def test_repaired_source_reaches_normal_path_on_later_refresh(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """启动失败写入的运行态与健康观测返回的是同一条固定安全文案。"""
+    """修复外部数据源后，后续刷新重新走正常判定路径，无需重建运行时。"""
+    storage = _FaultStorage(_stored({"jev_request_timeout_seconds": 0}, 4))
+    runtime = _runtime(monkeypatch, storage)
+
+    try:
+        await runtime.startup()
+        assert runtime.get_health().runtime_status == "failed"
+
+        storage.entry = _stored(_valid_data(plugin_enable=False), 5)
+        reads_before_retry = storage.fetch_calls
+        await runtime.refresh()
+
+        state = runtime.get_health()
+        assert state.runtime_status == "disabled"
+        assert state.reason_code == "disabled"
+        assert storage.fetch_calls == reads_before_retry + 1
+    finally:
+        await runtime.close()
+
+
+async def test_config_failure_reason_is_fixed_and_shared_by_both_observations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """启动失败写入的运行态与健康观测返回同一条稳定安全原因码。"""
     storage = _FaultStorage(OSError(f"boom {_SENTINEL}"))
-    _install_storage(monkeypatch, storage)
-    manager = decision_plugin.PluginManager()
+    runtime = _runtime(monkeypatch, storage)
 
-    asyncio.run(manager.initialize())
-    projected = manager.runtime_state
+    try:
+        await runtime.startup()
+        projected = runtime.get_health()
 
-    assert projected.reason == _EXPECTED_FAILED_REASON
-    assert manager._runtime_state.reason == projected.reason
-    assert _SENTINEL not in projected.reason
-    assert cast("Any", manager._runtime_state).status is (
-        decision_plugin.DecisionRuntimeStatus.FAILED
-    )
+        assert projected.runtime_status == "failed"
+        assert projected.reason_code == _EXPECTED_FAILED_REASON
+        assert runtime._failure_reason == projected.reason_code
+        assert _SENTINEL not in projected.reason_code
+    finally:
+        await runtime.close()

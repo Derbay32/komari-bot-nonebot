@@ -205,9 +205,7 @@ def test_helper_ignores_same_named_symbol_from_other_plugins() -> None:
 
 
 def test_helper_ignores_other_symbols_from_decision() -> None:
-    source = (
-        "from komari_bot.plugins.komari_decision import DecisionRuntimeState\n"
-    )
+    source = "from komari_bot.plugins.komari_decision import get_decision_engine\n"
     assert find_retired_decision_symbol_offenders(source) == []
 
 

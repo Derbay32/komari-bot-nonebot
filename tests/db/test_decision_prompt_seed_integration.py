@@ -9,8 +9,9 @@
 数据不受影响。用例之间各自重建唯一的隔离库，重复运行与并行安全。
 
 覆盖清单（对应 TSK-182 可选资源切片）：
-- 全新数据库 upgrade head（0024）后运行真实播种命令：三个必需 Prompt
-  资源与场景齐全，另加可选判定 Prompt 单行（值等于打包资产）；
+- 全新数据库 upgrade head（0025）后运行真实播种命令：三个必需 Prompt
+  资源齐全，另加可选判定 Prompt 单行（值等于打包资产）；场景初始化已
+  退役，4 张退役场景表不得存在；
 - 重复初始化：判定 Prompt 正文/revision/updated_at 不变；
 - 部分已有：非空自定义字段保留，只按共享 helper 补齐空白字段；
 - 可选资产缺失/畸形：既有自定义判定行原样保留，必需资源照常初始化；
@@ -72,11 +73,16 @@ SENTINEL = "TSK182-DECISION-BODY-SENTINEL-91a4"
 #: 合成“连接归还失败”异常里的哨兵：失败路径不得将它回显给用户。
 RELEASE_SENTINEL = "TSK182-RELEASE-SENTINEL-4c1d"
 
-#: TSK-182 交付时的迁移 head（迁移链显式新增判定存储后为 0024）。
-TSK182_HEAD_REVISION = "0024"
+#: 当前迁移 head（TSK-190 的 0025 退役场景存储后为 0025）。
+TSK182_HEAD_REVISION = "0025"
 
-#: 必需 fixed 场景键（测试自有字面量，不导入生产私有常量）。
-REQUIRED_FIXED_SCENE_KEYS = ("NOISE", "MEANINGFUL", "CALL_DIRECT", "CALL_MENTION")
+#: 已退役的 4 张场景表（test-owned 字面量，来自 TSK-190 manifest）。
+RETIRED_SCENE_TABLES: tuple[str, ...] = (
+    "komari_memory_scene_item",
+    "komari_memory_scene_runtime",
+    "komari_decision_scenes",
+    "komari_memory_scene_set",
+)
 
 #: 预置判定行的历史时间戳（验证未被改写）。
 LEGACY_UPDATED_AT = datetime(2024, 1, 1, tzinfo=UTC)
@@ -297,32 +303,18 @@ async def _insert_decision_row(
     )
 
 
-async def _scene_keys(connection: asyncpg.Connection) -> dict[str, dict[str, Any]]:
+async def _public_tables(connection: asyncpg.Connection) -> set[str]:
     rows = await connection.fetch(
-        "SELECT scene_key, scene_type, enabled, content_text"
-        " FROM komari_decision_scenes"
+        "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
     )
-    return {str(row["scene_key"]): dict(row) for row in rows}
+    return {str(row["tablename"]) for row in rows}
 
 
-def _assert_mandatory_scene_state(
-    scene_rows: dict[str, dict[str, Any]],
-) -> None:
-    """必需场景（fixed + 至少一个启用一般场景）齐全（测试自有 oracle）。"""
-    for key in REQUIRED_FIXED_SCENE_KEYS:
-        row = scene_rows.get(key)
-        assert row is not None, f"必需固定场景 {key} 缺失"
-        assert str(row["scene_type"]) == "fixed"
-        assert bool(row["enabled"])
-        assert str(row["content_text"]).strip()
-    general = [
-        row
-        for row in scene_rows.values()
-        if str(row["scene_type"]) == "general"
-        and bool(row["enabled"])
-        and str(row["content_text"]).strip()
-    ]
-    assert general, "至少需要一个启用的一般场景"
+async def _assert_retired_tables_absent(connection: asyncpg.Connection) -> None:
+    """场景初始化已退役：4 张退役场景表在播种前后都不得存在。"""
+    present = await _public_tables(connection)
+    retired = set(RETIRED_SCENE_TABLES) & present
+    assert not retired, f"播种不得重建已退役的场景表: {sorted(retired)}"
 
 
 async def _assert_required_prompt_rows_complete(
@@ -390,7 +382,7 @@ async def test_fresh_database_seeds_required_and_decision_prompt() -> None:
                 "SELECT version_num FROM alembic_version"
             )
             assert version == TSK182_HEAD_REVISION, (
-                f"隔离库必须位于 TSK-182 head {TSK182_HEAD_REVISION}，实际 {version}"
+                f"隔离库必须位于迁移 head {TSK182_HEAD_REVISION}，实际 {version}"
             )
 
             await _assert_required_prompt_rows_complete(connection)
@@ -409,7 +401,7 @@ async def test_fresh_database_seeds_required_and_decision_prompt() -> None:
                 )
             assert row["revision"] == 1
 
-            _assert_mandatory_scene_state(await _scene_keys(connection))
+            await _assert_retired_tables_absent(connection)
         finally:
             await connection.close()
     finally:
@@ -567,7 +559,7 @@ async def test_missing_decision_file_on_fresh_database_still_seeds_required(
         connection = await asyncpg.connect(**scratch)
         try:
             await _assert_required_prompt_rows_complete(connection)
-            _assert_mandatory_scene_state(await _scene_keys(connection))
+            await _assert_retired_tables_absent(connection)
             assert await _fetch_decision_row(connection) is None, (
                 "可选资产缺失时不得写入判定 Prompt 行"
             )
@@ -630,7 +622,7 @@ async def test_optional_write_failure_rolls_back_only_optional_work(
             )
 
             await _assert_required_prompt_rows_complete(connection)
-            _assert_mandatory_scene_state(await _scene_keys(connection))
+            await _assert_retired_tables_absent(connection)
             assert await _fetch_decision_row(connection) is None, (
                 "可选独立事务必须回滚：失败后不得留下部分写入的判定行"
             )
@@ -674,7 +666,7 @@ async def test_optional_lease_release_failure_after_mandatory_commit_is_isolated
         try:
             try:
                 await _assert_required_prompt_rows_complete(connection)
-                _assert_mandatory_scene_state(await _scene_keys(connection))
+                await _assert_retired_tables_absent(connection)
             except AssertionError as exc:
                 pytest.fail(f"{exc}\n--- CLI 输出 ---\n{output}")
             # 提交后发生的归还失败不证明可选写入被撤销：不据此断言判定行
@@ -732,9 +724,7 @@ async def test_missing_required_prompt_block_still_fails_without_writes(
             assert await _fetch_decision_row(connection) is None, (
                 "必需门禁失败时不得写入可选判定 Prompt 行"
             )
-            assert await _scene_keys(connection) == {}, (
-                "必需门禁失败时不得写入任何场景行"
-            )
+            await _assert_retired_tables_absent(connection)
         finally:
             await connection.close()
     finally:
