@@ -11,8 +11,9 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
 
+from komari_bot.llm.diagnostic_sanitizer import build_preview
+
 from .repository import AgentRunIndexEntry, IndexUnavailableError, repository
-from .sanitizer import build_preview
 from .storage import (
     LOG_DIR,
     read_indexed_record_sync,

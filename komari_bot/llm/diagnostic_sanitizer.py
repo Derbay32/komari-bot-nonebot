@@ -1,4 +1,4 @@
-"""Agent Run 日志的凭据与二进制边界。"""
+"""诊断日志的凭据与二进制边界（不依赖机器人框架与插件）。"""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import re
 from dataclasses import asdict, is_dataclass
 from datetime import date, datetime
 from enum import Enum
-from typing import Any
+from typing import Any, Final
 from urllib.parse import urlsplit
 
 _SECRET_KEYS = frozenset(
@@ -43,6 +43,16 @@ _DATA_URL_PATTERN = re.compile(
     r"^data:(?P<mime>[-\w.+/]+)?;base64,(?P<payload>[A-Za-z0-9+/=\s]+)$",
     re.IGNORECASE,
 )
+_INLINE_DATA_URL_PATTERN = re.compile(
+    r"data:(?P<mime>[-\w.+/]+)?;base64,(?P<payload>[A-Za-z0-9+/=]+)",
+    re.IGNORECASE,
+)
+"""正文里**内联**的 data URI 片段；只认显式 ``;base64,`` 前缀。"""
+_HTTP_URL_SEGMENT_PATTERN = re.compile(
+    r"https?://[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+",
+    re.IGNORECASE,
+)
+"""按 RFC3986 字符集切出的 HTTP(S) URL 片段；碰到空白与 CJK 标点即停。"""
 _CREDENTIAL_TEXT_PATTERN = re.compile(
     r"(?i)\b(?:api[_-]?(?:key|token)|password|密码|client[_-]?secret|"
     r"access[_-]?token|refresh[_-]?token)\s*[:=]\s*"
@@ -56,6 +66,10 @@ _COOKIE_TEXT_PATTERN = re.compile(
     r"(?im)\b(?:set-cookie|cookie)\s*:\s*[^\r\n]+"
 )
 _MAX_DEPTH = 64
+_REDACTED = "[已移除凭据]"
+
+MEDIA_REDACTED_MARKER: Final = "[已移除媒体内容]"
+"""媒体载荷的固定占位符（媒体片段、必须保持文本的字段、生成摘要以外的场合）。"""
 
 
 def _sha256_bytes(value: bytes) -> str:
@@ -134,6 +148,19 @@ def _sanitize_string_credentials(value: str) -> str:
     return _COOKIE_TEXT_PATTERN.sub("[已移除凭据]", sanitized)
 
 
+def _redact_inline_media(value: str, *, image_keyed: bool) -> str:
+    """把正文里内联的媒体片段换成固定占位符，保留周围普通文字。
+
+    只处理两类显式信号：``data:<mime>;base64,<payload>`` 形式的内联载荷，
+    以及**显式图片字段**（键名含 ``image``）里的 HTTP(S) URL 片段。不为普通
+    正文里的任意 URL 或任意 base64 样词新增分类器。
+    """
+    redacted = value
+    if image_keyed:
+        redacted = _HTTP_URL_SEGMENT_PATTERN.sub(MEDIA_REDACTED_MARKER, redacted)
+    return _INLINE_DATA_URL_PATTERN.sub(MEDIA_REDACTED_MARKER, redacted)
+
+
 def _normalize_object(value: object) -> object:
     if isinstance(value, Enum):
         return value.value
@@ -147,7 +174,37 @@ def _normalize_object(value: object) -> object:
     return value
 
 
-def sanitize_log_value(  # noqa: PLR0911
+def sanitize_log_value(
+    value: object,
+    *,
+    key: str = "",
+    depth: int = 0,
+    known_secrets: tuple[str, ...] = (),
+) -> Any:
+    """生成安全投影，再移除全部已知凭据，包括媒体摘要中的字符串。"""
+    projected = _sanitize_log_value(value, key=key, depth=depth)
+    secrets = sorted({secret for secret in known_secrets if secret}, key=len, reverse=True)
+    if not secrets:
+        return projected
+    pattern = re.compile("|".join(re.escape(secret) for secret in secrets))
+    return _redact_known_projection(projected, pattern)
+
+
+def _redact_known_projection(value: Any, pattern: re.Pattern[str]) -> Any:
+    """只替换原始投影中的字面量，不对生成的掩码再次替换。"""
+    if isinstance(value, str):
+        return pattern.sub(_REDACTED, value)
+    if isinstance(value, dict):
+        return {
+            pattern.sub(_REDACTED, key): _redact_known_projection(item, pattern)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_known_projection(item, pattern) for item in value]
+    return value
+
+
+def _sanitize_log_value(  # noqa: PLR0911
     value: object,
     *,
     key: str = "",
@@ -176,7 +233,9 @@ def sanitize_log_value(  # noqa: PLR0911
             return data_summary
         if "image" in normalized_key and value.startswith(("http://", "https://")):
             return _summarize_image_url(value)
-        return _sanitize_string_credentials(value)
+        return _sanitize_string_credentials(
+            _redact_inline_media(value, image_keyed="image" in normalized_key)
+        )
     if value is None or isinstance(value, (bool, int, float)):
         return value
     if isinstance(value, dict):
@@ -192,7 +251,7 @@ def sanitize_log_value(  # noqa: PLR0911
                 if isinstance(raw_value, dict) and "url" in raw_value:
                     sanitized[child_key] = {
                         **{
-                            str(k): sanitize_log_value(
+                            str(k): _sanitize_log_value(
                                 v,
                                 key=str(k),
                                 depth=depth + 1,
@@ -205,7 +264,7 @@ def sanitize_log_value(  # noqa: PLR0911
                 else:
                     sanitized[child_key] = _summarize_image_url(str(raw_value))
                 continue
-            sanitized[child_key] = sanitize_log_value(
+            sanitized[child_key] = _sanitize_log_value(
                 raw_value,
                 key=child_key,
                 depth=depth + 1,
@@ -213,13 +272,30 @@ def sanitize_log_value(  # noqa: PLR0911
         return sanitized
     if isinstance(value, (list, tuple, set, frozenset)):
         return [
-            sanitize_log_value(item, key=key, depth=depth + 1) for item in value
+            _sanitize_log_value(item, key=key, depth=depth + 1) for item in value
         ]
     try:
         json.dumps(value)
     except (TypeError, ValueError, RecursionError):
         return repr(value)
     return value
+
+
+def sanitize_text_field(
+    value: str,
+    *,
+    key: str = "",
+    known_secrets: tuple[str, ...] = (),
+) -> str:
+    """把一段必须保持为文本的字段脱敏；整段媒体载荷换成固定占位符。
+
+    调用方（判定输入与 Prompt 文本）要求字段类型仍是 ``str``：媒体载荷的具体
+    字节不能转发，但整段通用摘要字典会改变字段形状并连带丢掉该字段承载的固定
+    问题定义。因此这里只把「整值是媒体」的情况换成 :data:`MEDIA_REDACTED_MARKER`，
+    普通文字与片段级处理仍走 :func:`sanitize_log_value`。
+    """
+    sanitized = sanitize_log_value(value, key=key, known_secrets=known_secrets)
+    return sanitized if isinstance(sanitized, str) else MEDIA_REDACTED_MARKER
 
 
 def build_content_summary(value: object) -> dict[str, int | str]:

@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
+from komari_bot.llm.diagnostic_sanitizer import sanitize_log_value
 from komari_bot.plugins.agent_run_logger.config_schema import (
     AgentRunLoggerConfigSchema,
     AgentRunLoggerEnvConfigSchema,
@@ -18,7 +19,6 @@ from komari_bot.plugins.agent_run_logger.diagnostic import (
     ToolExecutionTrace,
     record_completion_call,
 )
-from komari_bot.plugins.agent_run_logger.sanitizer import sanitize_log_value
 from komari_bot.plugins.llm_provider.base_client import UnifiedUsageSchema
 
 
