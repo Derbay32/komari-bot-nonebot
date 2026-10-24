@@ -1122,3 +1122,40 @@ async def test_ping_cancellation_survives_external_release_failure() -> None:
         with suppress(RuntimeError):
             await runtime.close()
         await asyncio.gather(startup, return_exceptions=True)
+
+
+async def test_transferred_redis_close_failure_remains_observable(
+    runtime_env: _RuntimeEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Keep the failed owner and expose the same failure to every close caller."""
+    runtime = runtime_env.runtime
+    await runtime.startup()
+    engine = runtime.engine
+    assert engine is not None
+    attempts = 0
+
+    async def fail_release() -> None:
+        nonlocal attempts
+        attempts += 1
+        message = "synthetic transferred Redis close failure"
+        raise ConnectionError(message)
+
+    monkeypatch.setattr(runtime_env.redis_observed, "aclose", fail_release)
+    with pytest.raises(ConnectionError, match="synthetic transferred"):
+        await runtime.close()
+    assert runtime.engine is None
+    assert runtime._engine is engine  # pyright: ignore[reportPrivateUsage]
+    assert runtime.get_health().runtime_status == "failed"
+    assert runtime.get_health().reason_code == "interrupted"
+    outcomes = await asyncio.gather(
+        runtime.close(), runtime.close(), engine.close(), return_exceptions=True
+    )
+    assert all(isinstance(outcome, ConnectionError) for outcome in outcomes)
+    assert attempts == 1, "Repeated callers observe one failed shutdown attempt."
+    assert runtime.engine is None
+    assert runtime._engine is engine  # pyright: ignore[reportPrivateUsage]
+    await runtime.startup()
+    await runtime.refresh()
+    assert attempts == 1
+    assert runtime_env.transport.requests == []
+    # Fixture teardown releases the actual external client, not a retry in production.

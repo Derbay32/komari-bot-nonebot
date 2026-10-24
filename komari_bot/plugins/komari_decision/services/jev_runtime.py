@@ -508,6 +508,7 @@ class DecisionRuntime:
         """停新工作 → 取消并等待自有任务 → 关引擎 → 释放未转移资源。"""
         self._closed = True
         engine = self._engine
+        engine_closed = engine is None
         try:
             workers: list[asyncio.Task[Any]] = [
                 task
@@ -521,6 +522,7 @@ class DecisionRuntime:
                 await asyncio.gather(*workers, return_exceptions=True)
             if engine is not None:
                 await engine.close()
+                engine_closed = True
         finally:
             try:
                 if self._redis is not None:
@@ -533,8 +535,9 @@ class DecisionRuntime:
                 base = None if engine is None else engine.get_health()
                 self._observed_at = datetime.now(UTC)
                 self._final_snapshot = _stopped_snapshot(base, self._observed_at)
-                self._engine = None
-                self._engine_redis = None
+                if engine_closed:
+                    self._engine = None
+                    self._engine_redis = None
 
     # ------------------------------ 内部投影 ------------------------------
 

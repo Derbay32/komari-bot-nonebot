@@ -397,6 +397,7 @@ class JevDecisionEngine:
         self._ownership_attempted = False
         self._closed = False
         self._watch_task: asyncio.Task[None] | None = None
+        self._close_task: asyncio.Task[None] | None = None
 
     # ------------------------------ 生命周期 ------------------------------
 
@@ -410,9 +411,15 @@ class JevDecisionEngine:
 
     async def close(self) -> None:
         """取消并等待自有任务、定案输入、撤销未交接资格、释放自有资源。"""
-        if self._closed:
-            return
-        self._closed = True
+        task = self._close_task
+        if task is None:
+            self._closed = True
+            task = asyncio.create_task(self._close_owned(), name="jev-engine-close")
+            self._close_task = task
+        await _await_owned_close(task)
+
+    async def _close_owned(self) -> None:
+        """Drain owned work once and retain the actual cleanup outcome."""
         watch_task = self._watch_task
         self._watch_task = None
         if watch_task is not None:
@@ -440,8 +447,7 @@ class JevDecisionEngine:
         self._leased = False
         self._pseudonymizer = None
         self._set_runtime("failed", "interrupted")
-        with suppress(Exception):
-            await self._redis.aclose()
+        await self._redis.aclose()
 
     def get_health(self) -> DecisionHealthSnapshot:
         """返回被动健康快照（只读内存状态，不产生 I/O）。"""
@@ -2200,6 +2206,25 @@ async def _complete_owned(task: asyncio.Task[Any]) -> None:
             break
     with suppress(BaseException):
         task.result()
+
+
+async def _await_owned_close(task: asyncio.Task[None]) -> None:
+    """Drain shutdown before propagating caller cancellation or cleanup failure."""
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as error:
+            cancellation = cancellation or error
+        except BaseException:
+            break
+    try:
+        task.result()
+    except BaseException:
+        if cancellation is None:
+            raise
+    if cancellation is not None:
+        raise cancellation
 
 
 async def _await_owned_log(task: asyncio.Task[None]) -> None:
