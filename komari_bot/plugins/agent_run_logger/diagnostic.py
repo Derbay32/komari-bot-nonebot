@@ -8,7 +8,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-from .sanitizer import sanitize_log_value
+from komari_bot.llm.diagnostic_sanitizer import sanitize_log_value
 
 AgentRunType = Literal["chat_reply", "scheduled_summary", "group_history_summary"]
 AgentRunOrigin = Literal["normal", "debug"]

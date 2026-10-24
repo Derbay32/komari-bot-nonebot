@@ -1,7 +1,7 @@
 """TSK-232 —— 迁移链重排的结构面静态守卫（无需真实数据库）。
 
 本轮（结构面）红基线刷新 ``migrations/versions`` 版本链的验收契约。目标链
-（单主干、head=0022）按 ADR-0012 「破坏性迁移后果」重排为：
+（单主干、head=0024）按 ADR-0012 「破坏性迁移后果」重排为：
 
 - ``0001`` ``0001_fresh_marker``　fresh marker，不再是一次性全量基线
   （仅空库身份，不含任何 legacy 大表/扩展）；
@@ -32,11 +32,13 @@
 - ``0019``　轮盘 PostgreSQL 根/玩家/结果/排行榜关系及约束（TSK-275）；
 - ``0020``　轮盘命令收据与履约关系及约束（TSK-276）；
 - ``0021``　轮盘强类型配置表（TSK-279）。
-- ``0022``　Jev 请求配置列（TSK-181，head）。
+- ``0022``　Jev 请求配置列（TSK-181）。
+- ``0023``　Jev 判定存储与执行配置（TSK-182）。
+- ``0024``　Jev 近期输入结算事实（TSK-182，head）。
 
 编号映射理由（每行附于映射常量）：先按 ADR 把四个准入/履约锚点固定到
 0010-0013，再向上/向下保持原内容相对次序折叠填充，0018 保留为绑定迁移，
-0019 追加为轮盘存储，0020 追加为命令事务，0021 追加为轮盘强类型配置，0022 追加为 Jev 请求配置 head；
+0019 追加为轮盘存储，0020 追加为命令事务，0021 追加为轮盘强类型配置，0022 追加为 Jev 请求配置，0023/0024 追加为判定存储与近期输入结算；
 禁止复用旧 revision 字符串、禁止 branch/merge revision，故链内无 alias，也不为
 数字命名做兼容别名。本文件只解析版本目录与迁移源文本，不要求真实数据库。
 """
@@ -102,9 +104,11 @@ NEW_CHAIN = (
     ("0021", "roulette_config", "komari_roulette_config"),
     # 0022 TSK-181 Jev 请求配置
     ("0022", "jev_request_config", "jev_base_url"),
+    ("0023", "jev_decision_storage", "komari_decision_dispatches"),
+    ("0024", "jev_recent_settlement", "recent_retained"),
 )
 
-assert len(NEW_CHAIN) == 22
+assert len(NEW_CHAIN) == 24
 
 #: 标注 forward-only / IRREVERSIBLE 的 revision（实现源文本必须含该标记）。
 FORWARD_ONLY_REVISIONS = ("0012", "0013")
@@ -125,13 +129,13 @@ def _migration_file(revision: str) -> Path:
     return match[0]
 
 
-def test_chain_is_single_trunk_head_0022() -> None:
-    """新链单主干、无 alias、head=0022。"""
+def test_chain_is_single_trunk_head_0024() -> None:
+    """新链单主干、无 alias、head=0024。"""
     script = _load_script_directory()
     revisions = list(script.walk_revisions())
     heads = script.get_heads()
     assert len(heads) == 1
-    assert heads[0] == "0022"
+    assert heads[0] == "0024"
 
     baselines = [rev for rev in revisions if rev.down_revision is None]
     assert len(baselines) == 1

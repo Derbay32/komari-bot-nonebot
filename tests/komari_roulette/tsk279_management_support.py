@@ -666,6 +666,7 @@ def build_management_components() -> Any:
         register_character_binding_repair_api,
     )
     from komari_bot.plugins.group_admission import register_group_admission_api
+    from komari_bot.plugins.komari_decision import register_decision_api
     from komari_bot.plugins.komari_help.api import register_help_api
     from komari_bot.plugins.komari_knowledge.api import register_knowledge_api
     from komari_bot.plugins.komari_management.api_runtime import (
@@ -680,8 +681,8 @@ def build_management_components() -> Any:
 
     parameters = inspect.signature(ManagementApiComponents).parameters
     missing = [name for name in ROULETTE_COMPONENT_FIELDS if name not in parameters]
-    assert not missing, (
-        "ManagementApiComponents 缺少 TSK-279 C2 字段: " + ", ".join(missing)
+    assert not missing, "ManagementApiComponents 缺少 TSK-279 C2 字段: " + ", ".join(
+        missing
     )
     roulette = importlib.import_module(ROULETTE_PACKAGE)
     return ManagementApiComponents(
@@ -712,7 +713,7 @@ def build_management_components() -> Any:
         register_roulette_management_api=required_attr(
             roulette, "register_roulette_management_api"
         ),
-        roulette_observation_getter=required_attr(
-            roulette, "get_roulette_observation"
-        ),
+        roulette_observation_getter=required_attr(roulette, "get_roulette_observation"),
+        # TSK-182：真实顶层 decision 注册入口（必填组件，无 noop 默认）。
+        register_decision_api=register_decision_api,
     )

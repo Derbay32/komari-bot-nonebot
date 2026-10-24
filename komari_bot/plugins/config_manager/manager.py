@@ -115,6 +115,17 @@ class ConfigManager:
         """兼容旧管理 API 的配置来源属性。"""
         return self.config_source
 
+    @property
+    def startup_required(self) -> bool:
+        """该配置资源是否为启动必需项。
+
+        读取 Schema 的静态 ``startup_required`` 声明。未声明该政策的 Schema
+        仍按启动必需处理，并且只有字面量 ``False`` 表示显式可选——其他假值
+        （``0`` / ``None`` / ``""`` / ``"false"``）不构成 opt-out。
+        """
+        declaration = getattr(self._config_schema, "startup_required", True)
+        return declaration is not False
+
     def _get_env_config(self) -> Any:
         """获取环境配置（延迟加载）。"""
         if self._env_config is None:
@@ -733,7 +744,16 @@ def get_registered_config_managers() -> dict[str, ConfigManager]:
 
 
 async def initialize_registered_config_managers_async() -> None:
-    """在业务插件启动前异步预热全部已注册配置管理器。"""
+    """在业务插件启动前异步预热全部已注册配置管理器。
+
+    必需资源（未显式声明 ``startup_required = False``）仍按原语义传播初始化
+    失败，让启动如实失败。显式可选的资源失败只记录安全诊断（已注册的资源名
+    与异常类型，不含异常正文、凭据或栈）后继续预热其余资源；隔离不等于成功：
+    不写默认配置、不发布快照，后续显式初始化仍会重试真实存储。
+
+    这里只隔离 ``Exception``：``CancelledError`` 与其他 ``BaseException``
+    表示取消或进程级故障，必须原样传播。
+    """
     initialized_names: set[str] = set()
     while True:
         with _config_managers_lock:
@@ -749,11 +769,23 @@ async def initialize_registered_config_managers_async() -> None:
             break
 
         for plugin_name, manager in pending:
-            await manager.initialize_async()
+            if manager.startup_required:
+                await manager.initialize_async()
+            else:
+                try:
+                    await manager.initialize_async()
+                except Exception as exc:
+                    logger.error(
+                        "可选配置资源启动预热失败，已隔离并继续: "
+                        "resource={}, error_type={}",
+                        plugin_name,
+                        type(exc).__name__,
+                    )
+            # 已尝试过的资源不再重试，失败的可选资源也不会在预热内无限重试。
             initialized_names.add(plugin_name)
 
     logger.info(
-        "配置管理器启动预热完成，共初始化 {} 个配置资源",
+        "配置管理器启动预热结束，共尝试 {} 个配置资源",
         len(initialized_names),
     )
 

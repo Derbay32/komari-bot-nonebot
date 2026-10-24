@@ -34,7 +34,8 @@ JEV_DEFAULTS = {
 @pytest.mark.parametrize("existing_row", [False, True])
 @pytest.mark.asyncio
 async def test_upgrade_and_downgrade_preserve_existing_config(
-    *, existing_row: bool,
+    *,
+    existing_row: bool,
 ) -> None:
     """升级补齐默认值；降级只删除新列；已有配置、修订号与时间保持不变。"""
     if not same_database(POSTGRES_URL, SQLALCHEMY_URL):
@@ -82,7 +83,7 @@ async def test_upgrade_and_downgrade_preserve_existing_config(
         finally:
             await connection.close()
 
-        result = run_bootstrap(database_url, "upgrade", "head")
+        result = run_bootstrap(database_url, "upgrade", "0022")
         assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
         connection = await asyncpg.connect(**scratch)
         try:
@@ -115,8 +116,7 @@ async def test_upgrade_and_downgrade_preserve_existing_config(
         finally:
             await connection.close()
 
-        result = run_bootstrap(database_url, "check")
-        assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+        # 此处只验证历史 0022；完整模型零漂移在最后升级到当前 head 后检查。
         result = run_bootstrap(database_url, "downgrade", "0021")
         assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
         connection = await asyncpg.connect(**scratch)

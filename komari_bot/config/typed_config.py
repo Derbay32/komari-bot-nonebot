@@ -237,6 +237,13 @@ class TypedConfigModel(SQLModel, metaclass=_TypedConfigMetaclass):
     #: 配置资源所属插件名；table 子类必须覆写。
     plugin_name: ClassVar[str] = ""
 
+    #: 启动预热策略（静态开发者政策，不是配置项）：``True`` 表示该资源属于
+    #: 启动必需项，注册表预热失败时必须让启动如实失败；``False`` 表示允许在
+    #: 预热失败时被隔离——只记录安全诊断并继续预热其余资源，后续显式初始化
+    #: 仍会重试真实存储。它是 ``ClassVar`` 而非 Pydantic / SQL 字段：不进入
+    #: ``model_fields``、不建数据库列、管理接口不可写，也不参与 Schema 校验。
+    startup_required: ClassVar[bool] = True
+
     # SQLModel 把 ``__tablename__`` 声明为 declared_attr，导致子类直接赋值
     # 字符串时 Pyright 报类型冲突；``__table__`` 则完全没有类型声明。这里在
     # 公共基类重新声明一次（只写注解、不写值，不改变任何运行时行为），

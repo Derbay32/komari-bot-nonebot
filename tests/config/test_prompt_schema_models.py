@@ -31,6 +31,7 @@ from komari_bot.plugins.group_history_summary.prompt_schema import (
 from komari_bot.plugins.komari_chat.prompt_schema import (
     KomariChatPromptSchema,
 )
+from komari_bot.plugins.komari_decision.prompt_schema import KomariDecisionPromptSchema
 from komari_bot.plugins.komari_memory.prompt_schema import (
     KomariMemorySummaryPromptSchema,
 )
@@ -40,6 +41,7 @@ RESOURCE_MODELS: tuple[
     tuple[str, str, type[TypedConfigModel]],
     ...,
 ] = (
+    ("komari_decision", "komari_prompt_komari_decision", KomariDecisionPromptSchema),
     (
         "komari_chat",
         "komari_prompt_komari_chat",
@@ -59,6 +61,7 @@ RESOURCE_MODELS: tuple[
 
 #: Prompt Schema 所在模块（TSK-191 断言 `DEFAULTS` 不再存在）。
 PROMPT_SCHEMA_MODULE_NAMES: tuple[str, ...] = (
+    "komari_bot.plugins.komari_decision.prompt_schema",
     "komari_bot.plugins.komari_chat.prompt_schema",
     "komari_bot.plugins.komari_memory.prompt_schema",
     "komari_bot.plugins.group_history_summary.prompt_schema",
@@ -93,12 +96,10 @@ def test_prompt_models_register_in_prompt_registry_by_resource_id() -> None:
 def test_load_all_typed_models_covers_config_and_prompt_schemas() -> None:
     total = load_all_typed_config_models()
 
-    assert total == len(TYPED_CONFIG_MODEL_REGISTRY) + len(
-        TYPED_PROMPT_MODEL_REGISTRY
-    )
+    assert total == len(TYPED_CONFIG_MODEL_REGISTRY) + len(TYPED_PROMPT_MODEL_REGISTRY)
     # TSK-279 新增 komari_roulette 强类型配置资源（迁移 0021）。
     assert len(TYPED_CONFIG_MODEL_REGISTRY) == 17
-    assert len(TYPED_PROMPT_MODEL_REGISTRY) == 3
+    assert len(TYPED_PROMPT_MODEL_REGISTRY) == 4
 
 
 def test_every_prompt_resource_is_a_distinct_typed_table() -> None:
@@ -107,6 +108,7 @@ def test_every_prompt_resource_is_a_distinct_typed_table() -> None:
         for _resource_id, _table_name, model_cls in RESOURCE_MODELS
     }
     assert table_names == {
+        "komari_prompt_komari_decision",
         "komari_prompt_komari_chat",
         "komari_prompt_memory_summary",
         "komari_prompt_group_history_summary",
@@ -168,11 +170,11 @@ def test_prompt_model_keeps_strict_constructor_validation() -> None:
 
 
 def test_each_prompt_resource_schema_defines_distinct_public_fields() -> None:
-    """三个资源字段集互不雷同，Schema 是各资源白名单的唯一来源。"""
+    """各资源字段集互不雷同，Schema 是各资源白名单的唯一来源。"""
     field_sets: list[set[str]] = [
         _public_fields(model_cls) for _rid, _tbl, model_cls in RESOURCE_MODELS
     ]
-    assert len({frozenset(fields) for fields in field_sets}) == 3
+    assert len({frozenset(fields) for fields in field_sets}) == len(RESOURCE_MODELS)
 
 
 def test_komari_chat_schema_replaces_output_instruction_with_behavior_fields() -> None:

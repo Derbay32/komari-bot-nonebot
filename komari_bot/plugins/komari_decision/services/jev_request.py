@@ -43,7 +43,10 @@ __all__ = [
 ]
 
 _SDK_LOGGER_NAME = "typesafe_sdk"
-"""SDK 在 debug 级别记录请求与响应正文的 logger 名字（官方文档约定）。"""
+"""SDK 使用的 logger 名字（官方文档约定的运维配置入口）。"""
+
+_SDK_LOG_LEVEL_OFF = logging.CRITICAL + 1
+"""SDK 文档约定的「off」阈值（``TYPESAFE_LOG_LEVEL=off``）。"""
 
 
 class JevRequestError(RuntimeError):
@@ -106,17 +109,25 @@ class _JevRequestOptions:
             raise JevRequestConfigurationError(msg)
 
 
-def _disable_sdk_body_logging() -> None:
-    """把 SDK logger 的最低级别抬到 INFO，关闭请求/响应正文输出。
+def _disable_sdk_logging() -> None:
+    """把 SDK logger 设到文档约定的 off 阈值；已有更高等级保持不变。
 
-    SDK 只在 debug 级别记录完整正文（``TYPESAFE_LOG_LEVEL=debug`` 或根 logger
-    的 debug 设置都会打开它），而凭据只按 header 名字脱敏，正文并不脱敏。
-    因此每次进入请求上下文都把 ``typesafe_sdk`` 的有效级别抬到 INFO：状态码
-    与阶段行保留，正文不再产生。运维主动调到更高等级（WARNING 等）时不动。
+    仅压到 INFO 不够：
+
+    - 正文确实只在 debug 级别输出（``TYPESAFE_LOG_LEVEL=debug`` 或根 logger
+      的 debug 设置都会打开它），而凭据只按 header 名脱敏，正文并不脱敏；
+    - 但 SDK 0.7.5 的响应解码在 ``_core/response_types.py`` 用一个 **WARNING**
+      记录被丢弃的未知 answer 名字与类型，名字与类型都直接来自上游响应体；
+    - INFO 级的状态行也带请求 URL。
+
+    所以判定请求一律把 ``typesafe_sdk`` 抬到 off：这部分诊断只能经由受权、
+    脱敏后的判定正文日志提供，普通运行日志不再产出任何 SDK 内容。运维已经
+    明确调到更高等级（不可能高于 off）时不动；绝不改根 logger、SDK 源码或
+    SDK 协议。
     """
     sdk_logger = logging.getLogger(_SDK_LOGGER_NAME)
-    if sdk_logger.getEffectiveLevel() < logging.INFO:
-        sdk_logger.setLevel(logging.INFO)
+    if sdk_logger.getEffectiveLevel() < _SDK_LOG_LEVEL_OFF:
+        sdk_logger.setLevel(_SDK_LOG_LEVEL_OFF)
 
 
 def _deadline_message(options: _JevRequestOptions) -> str:
@@ -150,7 +161,7 @@ async def configured_jev_request(
         JevRequestTimeoutError: 请求在总截止之后才结束，结果不可使用。
     """
     options = _JevRequestOptions.from_config(config)
-    _disable_sdk_body_logging()
+    _disable_sdk_logging()
     loop = asyncio.get_running_loop()
     deadline = loop.time() + options.request_timeout_seconds
     timeout_scope = asyncio.timeout_at(deadline)

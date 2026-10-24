@@ -1,4 +1,4 @@
-"""判定场景四张表的 SQLModel 强类型模型。
+"""旧场景与 Jev 判定存储的 SQLModel 强类型模型。
 
 本模块是**无副作用**的纯模型模块：只导入 SQLModel/SQLAlchemy，不导入
 NoneBot 与任何业务插件，因此 Alembic 迁移环境可以直接以源文件方式加载
@@ -22,7 +22,7 @@ NoneBot 与任何业务插件，因此 Alembic 迁移环境可以直接以源文
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from sqlalchemy import (
     ARRAY,
@@ -35,11 +35,14 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     Table,
     Text,
     UniqueConstraint,
+    Uuid,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlmodel import Field, SQLModel
 
 
@@ -48,7 +51,7 @@ def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
-class _SceneModelBase(SQLModel):
+class _DecisionModelBase(SQLModel):
     """非表基类：只为 ``__tablename__`` 提供 Pyright 友好的类型声明。
 
     SQLModel 把 ``__tablename__`` 声明为 ``declared_attr``，子类直接赋值
@@ -61,7 +64,7 @@ class _SceneModelBase(SQLModel):
     __table__: ClassVar[Table]
 
 
-class DecisionSceneRow(_SceneModelBase, table=True):
+class DecisionSceneRow(_DecisionModelBase, table=True):
     """判定场景主表：当前生效的场景内容定义。"""
 
     __tablename__ = "komari_decision_scenes"
@@ -125,7 +128,7 @@ class DecisionSceneRow(_SceneModelBase, table=True):
     )
 
 
-class MemorySceneSetRow(_SceneModelBase, table=True):
+class MemorySceneSetRow(_DecisionModelBase, table=True):
     """场景构建集：同一来源指纹的唯一构建批次。"""
 
     __tablename__ = "komari_memory_scene_set"
@@ -213,7 +216,7 @@ class MemorySceneSetRow(_SceneModelBase, table=True):
     )
 
 
-class MemorySceneItemRow(_SceneModelBase, table=True):
+class MemorySceneItemRow(_DecisionModelBase, table=True):
     """场景条目快照：保存构建时刻的场景内容，外键级联删除。"""
 
     __tablename__ = "komari_memory_scene_item"
@@ -322,7 +325,7 @@ class MemorySceneItemRow(_SceneModelBase, table=True):
     )
 
 
-class MemorySceneRuntimeRow(_SceneModelBase, table=True):
+class MemorySceneRuntimeRow(_DecisionModelBase, table=True):
     """运行时单例行：指向当前 active scene set 的指针（id 恒为 1）。"""
 
     __tablename__ = "komari_memory_scene_runtime"
@@ -369,3 +372,205 @@ __all__ = [
     "MemorySceneRuntimeRow",
     "MemorySceneSetRow",
 ]
+
+class DecisionProcessRow(_DecisionModelBase, table=True):
+    """判定进程实例；存活由该实例持有的 PostgreSQL 会话锁证明。"""
+
+    __tablename__ = "komari_decision_processes"
+
+    id: int | None = Field(default=None, sa_column=Column(Integer, primary_key=True))
+    started_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            DateTime(timezone=True), nullable=False, server_default=text("now()")
+        ),
+    )
+    stopped_at: datetime | None = Field(
+        default=None, sa_column=Column(DateTime(timezone=True), nullable=True)
+    )
+    __table_args__ = (
+        CheckConstraint("id > 0", name="ck_decision_process_id_positive"),
+        Index("idx_decision_processes_active", "stopped_at"),
+    )
+
+
+class DecisionSchedulerRow(_DecisionModelBase, table=True):
+    """部署共享的调度序号、停用代数与私有代号密钥。"""
+
+    __tablename__ = "komari_decision_scheduler"
+
+    id: int = Field(default=1, sa_column=Column(Integer, primary_key=True))
+    pseudonym_salt: bytes = Field(sa_column=Column(LargeBinary, nullable=False))
+    next_grant_sequence: int = Field(
+        default=0,
+        sa_column=Column(BigInteger, nullable=False, server_default=text("0")),
+    )
+    generation: int = Field(
+        default=0,
+        sa_column=Column(BigInteger, nullable=False, server_default=text("0")),
+    )
+    __table_args__ = (
+        CheckConstraint("id = 1", name="ck_decision_scheduler_singleton"),
+        CheckConstraint(
+            "octet_length(pseudonym_salt) = 32", name="ck_decision_salt_length"
+        ),
+        CheckConstraint("next_grant_sequence >= 0", name="ck_decision_grant_sequence"),
+        CheckConstraint("generation >= 0", name="ck_decision_generation"),
+    )
+
+
+class DecisionGroupRow(_DecisionModelBase, table=True):
+    """群在共享轮转中的位置；不保存群消息正文。"""
+
+    __tablename__ = "komari_decision_groups"
+
+    protocol: str = Field(sa_column=Column(Text, primary_key=True))
+    account_id: str = Field(sa_column=Column(Text, primary_key=True))
+    group_id: str = Field(sa_column=Column(Text, primary_key=True))
+    last_grant_sequence: int = Field(
+        default=0,
+        sa_column=Column(BigInteger, nullable=False, server_default=text("0")),
+    )
+    __table_args__ = (
+        CheckConstraint("last_grant_sequence >= 0", name="ck_decision_group_sequence"),
+    )
+
+
+class DecisionDispatchRow(_DecisionModelBase, table=True):
+    """持久事件占位与单次交接资格；日志清理不能删除本表记录。"""
+
+    __tablename__ = "komari_decision_dispatches"
+
+    id: int | None = Field(default=None, sa_column=Column(BigInteger, primary_key=True))
+    decision_id: str = Field(sa_column=Column(Uuid(as_uuid=False), nullable=False))
+    protocol: str = Field(sa_column=Column(Text, nullable=False))
+    account_id: str = Field(sa_column=Column(Text, nullable=False))
+    group_id: str = Field(sa_column=Column(Text, nullable=False))
+    message_id: str = Field(sa_column=Column(Text, nullable=False))
+    owner_process_id: int = Field(
+        sa_column=Column(
+            Integer, ForeignKey("komari_decision_processes.id"), nullable=False
+        )
+    )
+    dispatch_id: str = Field(sa_column=Column(Uuid(as_uuid=False), nullable=False))
+    generation: int = Field(sa_column=Column(BigInteger, nullable=False))
+    state: str = Field(sa_column=Column(Text, nullable=False))
+    reason_code: str = Field(sa_column=Column(Text, nullable=False))
+    enqueued_at: datetime = Field(
+        sa_column=Column(DateTime(timezone=True), nullable=False)
+    )
+    queue_deadline: datetime = Field(
+        sa_column=Column(DateTime(timezone=True), nullable=False)
+    )
+    granted_at: datetime | None = Field(
+        default=None, sa_column=Column(DateTime(timezone=True), nullable=True)
+    )
+    finished_at: datetime | None = Field(
+        default=None, sa_column=Column(DateTime(timezone=True), nullable=True)
+    )
+    slot_held: bool = Field(
+        default=False,
+        sa_column=Column(Boolean, nullable=False, server_default=text("false")),
+    )
+    business_route: str = Field(
+        default="none",
+        sa_column=Column(Text, nullable=False, server_default=text("'none'")),
+    )
+    handed_off_at: datetime | None = Field(
+        default=None, sa_column=Column(DateTime(timezone=True), nullable=True)
+    )
+    notification_eligible: bool = Field(
+        default=False,
+        sa_column=Column(Boolean, nullable=False, server_default=text("false")),
+    )
+    notified_at: datetime | None = Field(
+        default=None, sa_column=Column(DateTime(timezone=True), nullable=True)
+    )
+    recent_retained: bool | None = Field(
+        default=None, sa_column=Column(Boolean, nullable=True)
+    )
+    """成功判定的输入缓存处置事实；不保存分类或正文。"""
+
+    __table_args__ = (
+        UniqueConstraint(
+            "protocol",
+            "account_id",
+            "group_id",
+            "message_id",
+            name="uq_decision_event_identity",
+        ),
+        UniqueConstraint("decision_id", name="uq_decision_dispatch_id"),
+        CheckConstraint("generation >= 0", name="ck_decision_dispatch_generation"),
+        CheckConstraint(
+            "state IN ('queued','running','success','filtered','bypass','failed','cancelled')",
+            name="ck_decision_dispatch_state",
+        ),
+        CheckConstraint(
+            "business_route IN ('none','chat','summary')",
+            name="ck_decision_business_route",
+        ),
+        CheckConstraint(
+            "NOT slot_held OR state IN ('running','cancelled')",
+            name="ck_decision_slot_state",
+        ),
+        Index("idx_decision_dispatch_owner", "owner_process_id", "state"),
+        Index("idx_decision_dispatch_queue", "state", "queue_deadline"),
+        Index(
+            "idx_decision_dispatch_group", "protocol", "account_id", "group_id", "id"
+        ),
+    )
+
+
+class DecisionLogRow(_DecisionModelBase, table=True):
+    """可清理的判定诊断；正文列只用于独立受权读取。"""
+
+    __tablename__ = "komari_decision_logs"
+
+    id: str = Field(sa_column=Column(Uuid(as_uuid=False), primary_key=True))
+    dispatch_row_id: int | None = Field(
+        default=None,
+        sa_column=Column(
+            BigInteger, ForeignKey("komari_decision_dispatches.id"), nullable=True
+        ),
+    )
+    protocol: str = Field(sa_column=Column(Text, nullable=False))
+    account_id: str = Field(sa_column=Column(Text, nullable=False))
+    group_id: str = Field(sa_column=Column(Text, nullable=False))
+    message_id: str = Field(sa_column=Column(Text, nullable=False))
+    created_at: datetime = Field(
+        sa_column=Column(DateTime(timezone=True), nullable=False)
+    )
+    finished_at: datetime = Field(
+        sa_column=Column(DateTime(timezone=True), nullable=False)
+    )
+    status: str = Field(sa_column=Column(Text, nullable=False))
+    reason_code: str = Field(sa_column=Column(Text, nullable=False))
+    config_revision: int | None = Field(
+        default=None, sa_column=Column(BigInteger, nullable=True)
+    )
+    prompt_revision: int | None = Field(
+        default=None, sa_column=Column(BigInteger, nullable=True)
+    )
+    requested_model: str | None = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+    actual_model: str | None = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+    details: dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'::jsonb")),
+    )
+    body: dict[str, Any] | None = Field(
+        default=None, sa_column=Column(JSONB(none_as_null=True), nullable=True)
+    )
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('success','filtered','bypass','failed','cancelled','duplicate')",
+            name="ck_decision_log_status",
+        ),
+        Index("idx_decision_logs_created", "created_at"),
+        Index("idx_decision_logs_status", "status", "created_at"),
+        Index("idx_decision_logs_requested_model", "requested_model", "created_at"),
+        Index("idx_decision_logs_actual_model", "actual_model", "created_at"),
+    )

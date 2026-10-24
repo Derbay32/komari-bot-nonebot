@@ -412,6 +412,7 @@ async def test_config_routes_expose_komari_decision_sections(app: App) -> None:
             "order": 20,
         },
         {"section_id": "jev_request", "display_name": "Jev 请求", "order": 30},
+        {"section_id": "jev_execution", "display_name": "Jev 执行", "order": 40},
     ]
     assert listed.status_code == 200
     assert listed.json()["items"][0]["sections"] == expected_sections

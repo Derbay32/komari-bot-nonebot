@@ -18,10 +18,11 @@ EXPECTED_PLUGIN_ALL = {
     "get_decision_engine",
     "get_plugin_manager",
     "get_scene_admin_service",
+    "register_decision_api",
 }
 
 
-def test_plugin_all_set_unchanged() -> None:
+def test_plugin_all_matches_supported_surface() -> None:
     assert set(decision_plugin.__all__) == EXPECTED_PLUGIN_ALL
 
 

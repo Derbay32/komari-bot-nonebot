@@ -15,6 +15,7 @@ from komari_bot.plugins.character_binding.management_api import (
     register_character_binding_repair_api,
 )
 from komari_bot.plugins.group_admission import register_group_admission_api
+from komari_bot.plugins.komari_decision import register_decision_api
 from komari_bot.plugins.komari_help.api import register_help_api
 from komari_bot.plugins.komari_knowledge.api import register_knowledge_api
 from komari_bot.plugins.komari_management.api_runtime import (
@@ -138,6 +139,7 @@ def _build_components() -> ManagementApiComponents:
         character_binding_repair_service_getter=lambda: None,
         register_roulette_management_api=_noop_roulette_registrar,
         roulette_observation_getter=_noop_roulette_observation_getter,
+        register_decision_api=register_decision_api,
         config_resources=(
             ManagedConfigResource(
                 resource_id="komari_management",
