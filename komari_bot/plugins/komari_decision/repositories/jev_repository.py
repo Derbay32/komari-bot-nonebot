@@ -160,6 +160,8 @@ class GrantOutcome:
     reason_code: str | None = None
     queue_ms: float | None = None
     """从持久 enqueued_at 到 granted_at（或终结时刻）的真实排队毫秒数。"""
+    granted_monotonic: float | None = None
+    """数据库授予时刻在本进程单调时钟上的保守下界。"""
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -502,6 +504,30 @@ class JevDecisionRepository:
         finally:
             await session.close()
 
+    async def _read_grant_observation(
+        self, row_id: int
+    ) -> tuple[DecisionDispatchRow | None, float | None]:
+        """用同一次查询的数据库时钟计算已占用名额的时长。"""
+        query_started = monotonic()
+        session = self._session_factory()
+        try:
+            result = await session.execute(
+                select(DecisionDispatchRow, func.clock_timestamp()).where(
+                    col(DecisionDispatchRow.id) == row_id
+                )
+            )
+            observed = result.one_or_none()
+            if observed is None:
+                return None, None
+            row, database_now = observed
+            if row.granted_at is None:
+                return row, None
+            elapsed = (database_now - row.granted_at).total_seconds()
+            # Anchor before I/O: database/network latency must never renew the budget.
+            return row, query_started - max(0.0, elapsed)
+        finally:
+            await session.close()
+
     async def wait_for_grant(
         self,
         *,
@@ -521,7 +547,7 @@ class JevDecisionRepository:
                 next_pass = monotonic() + 0.1
                 with suppress(Exception):
                     await self._grant_pass(None)
-            row = await self.read_row(row_id)
+            row, granted_monotonic = await self._read_grant_observation(row_id)
             if row is None:
                 return GrantOutcome(
                     granted=False, state=STATE_FAILED, reason_code="interrupted"
@@ -535,7 +561,10 @@ class JevDecisionRepository:
                 )
             if row.state == STATE_RUNNING and row.granted_at is not None:
                 return GrantOutcome(
-                    granted=True, state=row.state, queue_ms=_queue_ms(row)
+                    granted=True,
+                    state=row.state,
+                    queue_ms=_queue_ms(row),
+                    granted_monotonic=granted_monotonic,
                 )
             if row.state in {STATE_CANCELLED, STATE_FAILED, STATE_SUCCESS,
                              STATE_BYPASS, STATE_FILTERED}:

@@ -12,11 +12,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from tests.komari_decision.jev_test_support import (
     DecisionHarness,
+    HarnessOptions,
     create_scratch_database,
     drop_scratch_database,
     make_identity,
     make_message,
     make_request,
+    read_dispatch,
     skip_without_services,
     write_prompt,
 )
@@ -24,6 +26,8 @@ from tests.pg_support import reset_shared_orm_engine
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
+
+    from komari_bot.decision.jev import DecisionMessage, EventIdentity
 
 
 pytestmark = pytest.mark.asyncio
@@ -233,3 +237,114 @@ async def test_window_prunes_by_reception_with_stable_equal_time_ties(
         assert [
             conversation["messages"][key]["text"] for key in conversation["timeline"]
         ] == [*(f"Prior {index}" for index in range(2, 12)), "Current target"]
+
+
+@pytest.mark.parametrize(
+    ("delay_boundary", "delay_seconds", "expected_calls", "timed_out"),
+    [
+        ("prompt", 0.0, 1, False),
+        ("prompt", 1.6, 1, True),
+        ("prompt", 3.2, 0, True),
+        ("grant", 3.2, 0, True),
+    ],
+)
+async def test_prompt_wait_consumes_granted_reference_budget(
+    decision_database: str,
+    monkeypatch: pytest.MonkeyPatch,
+    delay_boundary: str,
+    delay_seconds: float,
+    expected_calls: int,
+    *,
+    timed_out: bool,
+) -> None:
+    import nonebot_plugin_orm
+
+    original_factory = nonebot_plugin_orm.get_session
+    delayed = False
+
+    class SessionProbe:
+        def __init__(self, inner: AsyncSession) -> None:
+            self.inner = inner
+
+        async def get(self, entity: Any, *args: Any, **kwargs: Any) -> Any:
+            nonlocal delayed
+            value = await self.inner.get(entity, *args, **kwargs)
+            if (
+                delay_boundary == "prompt"
+                and getattr(entity, "__tablename__", "")
+                == "komari_prompt_komari_decision"
+                and not delayed
+            ):
+                delayed = True
+                assert harness.engine is not None
+                row = await read_dispatch(harness.engine, identity)
+                assert (
+                    row is not None and row["state"] == "running" and row["slot_held"]
+                )
+                await asyncio.sleep(delay_seconds)
+            return value
+
+        async def execute(self, statement: Any, *args: Any, **kwargs: Any) -> Any:
+            nonlocal delayed
+            result = await self.inner.execute(statement, *args, **kwargs)
+            sql = str(statement)
+            if (
+                delay_boundary == "grant"
+                and not delayed
+                and sql.startswith("SELECT komari_decision_dispatches.")
+                and "clock_timestamp() AS" in sql
+            ):
+                delayed = True
+                await asyncio.sleep(delay_seconds)
+            return result
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.inner, name)
+
+    async def reader(event: EventIdentity, message_id: str) -> DecisionMessage:
+        reference = make_message(
+            identity=event,
+            message_id=message_id,
+            text="Fetched reference body",
+            timestamp=datetime.now(UTC) - timedelta(seconds=5),
+        )
+        await asyncio.sleep(2.0)
+        return reference
+
+    options = HarnessOptions(
+        reference_reader=reader,
+        session_factory_wrapper=lambda factory: lambda: cast(
+            "AsyncSession", SessionProbe(factory())
+        ),
+    )
+    async with DecisionHarness(decision_database, options) as harness:
+        assert harness.decision is not None
+        await write_prompt()
+        monkeypatch.setattr(
+            nonebot_plugin_orm,
+            "get_session",
+            lambda **kwargs: cast(
+                "AsyncSession", SessionProbe(original_factory(**kwargs))
+            ),
+        )
+        identity = make_identity()
+        try:
+            result = await harness.decision.evaluate(
+                make_request(
+                    identity=identity,
+                    target=make_message(
+                        identity=identity, reference_ids=("old-reference",)
+                    ),
+                )
+            )
+            assert delayed
+            assert result.status == "success"
+            assert len(harness.reference_calls) == expected_calls
+            assert result.references.complete is not timed_out
+            assert result.references.timed_out is timed_out
+            conversation = harness.transport.state()["untrusted_group_conversation"]
+            texts = [message["text"] for message in conversation["messages"].values()]
+            assert ("Fetched reference body" in texts) is not timed_out
+            assert len(harness.transport.requests) == 1
+        finally:
+            monkeypatch.setattr(nonebot_plugin_orm, "get_session", original_factory)

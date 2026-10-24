@@ -814,9 +814,12 @@ class JevDecisionEngine:
         prepared = await self._prepare_dispatch(request, decision_id, frozen)
         if prepared.early is not None:
             return prepared.early
-        early, queue_ms = await self._await_slot(request, decision_id, prepared)
+        early, queue_ms, reference_deadline = await self._await_slot(
+            request, decision_id, prepared
+        )
         if early is not None:
             return early
+        prepared = replace(prepared, reference_deadline=reference_deadline)
         del started
         return await self._run_model_path(
             request=request,
@@ -1088,7 +1091,7 @@ class JevDecisionEngine:
         request: DecisionRequest,
         decision_id: str,
         prepared: _Prepared,
-    ) -> tuple[DecisionResult | None, float | None]:
+    ) -> tuple[DecisionResult | None, float | None, float | None]:
         """等待执行名额；取得名额返回 None，否则返回终态结果。"""
         row_id = prepared.reservation.row_id
         if row_id is None:
@@ -1096,6 +1099,7 @@ class JevDecisionEngine:
                 _terminal_result(
                     "failed", "storage_unavailable", decision_id=decision_id
                 ),
+                None,
                 None,
             )
         frozen = prepared.frozen
@@ -1122,6 +1126,7 @@ class JevDecisionEngine:
                     queue_ms=grant.queue_ms,
                 ),
                 grant.queue_ms,
+                None,
             )
         if self._lease_lost:
             await self._repository.release_slot(
@@ -1132,6 +1137,7 @@ class JevDecisionEngine:
             return (
                 _terminal_result("cancelled", "interrupted", decision_id=decision_id),
                 grant.queue_ms,
+                None,
             )
         try:
             await self._require_current(request, decision_id)
@@ -1144,8 +1150,11 @@ class JevDecisionEngine:
                     durations=PhaseDurations(queue_ms=grant.queue_ms),
                 ),
                 grant.queue_ms,
+                None,
             )
-        return None, grant.queue_ms
+        assert frozen is not None and grant.granted_monotonic is not None
+        deadline = grant.granted_monotonic + frozen.reference_timeout_seconds
+        return None, grant.queue_ms, deadline
 
     async def _slot_failed(
         self,
@@ -1286,6 +1295,7 @@ class JevDecisionEngine:
         if observation is not None:
             # 引用链一旦开始补取，未取得完整摘要前不得声称链接已完整。
             observation.mark_references_incomplete()
+        assert prepared.reference_deadline is not None
         reference_started = monotonic()
         references: ReferenceSummary | None = None
         references_ms = 0.0
@@ -1296,7 +1306,7 @@ class JevDecisionEngine:
                 reader=self._reference_reader,
                 guard=lambda: self._require_current(request, decision_id),
                 pseudonymizer=self._pseudonymizer,
-                deadline=reference_started + frozen.reference_timeout_seconds,
+                deadline=prepared.reference_deadline,
                 cutoff=request.received_at,
                 clock=monotonic,
             ).resolve(
@@ -2298,6 +2308,7 @@ class _Prepared:
     prompt: StoredPrompt | None = None
     path: _Path = field(default_factory=lambda: _Path(kind="ordinary"))
     predecessors: tuple[DecisionMessage, ...] = ()
+    reference_deadline: float | None = None
     reservation: Reservation = field(
         default_factory=lambda: Reservation(kind=ReservationKind.UNAVAILABLE)
     )
