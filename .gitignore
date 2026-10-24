@@ -141,6 +141,7 @@ dmypy.json
 .pytype/
 
 # programming tools
+/GLOSSARY.md
 /docs/*
 !/docs/adr/
 !/docs/adr/**
