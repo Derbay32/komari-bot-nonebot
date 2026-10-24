@@ -20,6 +20,7 @@ komari-bot 是基于 [NoneBot2](https://github.com/nonebot/nonebot2) 构建的 Q
 | 数据库 | PostgreSQL + **pgvector**（HNSW 索引） | 连接/会话由 **nonebot-plugin-orm**（SQLAlchemy 2.x）托管，Schema 由 **Alembic 版本链**（`migrations/`）唯一管理；特殊 DDL 表保留 raw SQL |
 | 缓存 | Redis >=7.1.0 | `redis.asyncio`（**禁止**使用 `aioredis`） |
 | LLM | OpenAI 兼容接口 | DeepSeek / Gemini 双后端 |
+| 判定 | 官方 TypeSafe Python SDK | Jev / System One；独立于回复生成网关 |
 | Embedding | OpenAI 兼容 API（远程） | 默认 `BAAI/bge-small-zh-v1.5` |
 | 部署 | Docker + Docker Compose | Gunicorn + Uvicorn；prestart 自动 `upgrade head` |
 | CI/CD | GitHub Actions → GitHub Container Registry | 所有 PR 执行静态、无服务、PostgreSQL/Redis 集成与迁移验收；发布 tag 自动构建镜像 |
@@ -40,7 +41,12 @@ komari-bot/
 │       ├── 0001_baseline_full_schema.py  #   全量基线（26 张既有表，含保留的 2 张 legacy 配置表）
 │       ├── 0002_typed_plugin_config_tables.py  # 14 张强类型配置表（0004 补充 komari_chat）
 │       ├── 0003_typed_prompt_tables.py   #   3 张强类型 Prompt 表
-│       └── 0004_komari_chat_config.py    #   komari_chat 配置表（承接 memory 迁出字段）
+│       ├── 0004_komari_chat_config.py    #   komari_chat 配置表（承接 memory 迁出字段）
+│       ├── ...                         #   其余历史迁移
+│       ├── 0022_jev_request_config.py  #   Jev 请求配置
+│       ├── 0023_jev_decision_storage.py #  判定调度、去重、日志与 Prompt
+│       ├── 0024_jev_recent_settlement.py # 判定近期上下文结算
+│       └── 0025_scene_storage_retirement.py # 不可逆删除旧场景存储
 │
 ├── komari_bot/                           # ★ 核心代码
 │   ├── core/                             # 核心启动与平台基础件（依赖 NoneBot 运行时）
@@ -56,11 +62,16 @@ komari-bot/
 │   │   ├── sql_like_utils.py             #   LIKE 模式转义等 SQL 工具
 │   │   ├── memory_agent_locks.py         #   记忆 Agent 并发锁
 │   │   └── versioned_keyword_index.py    #   版本化关键词索引
+│   ├── decision/                         # 判定纯契约（无 NoneBot / SDK 依赖）
+│   │   ├── jev.py                        #   请求、结果与诊断数据结构
+│   │   ├── engine_protocol.py            #   evaluate / claim_handoff / observe_delivered
+│   │   └── dispatch.py                   #   同次入站分发的共享判定载体
 │   ├── llm/                              # LLM 协议与安全上下文共享件（无 NoneBot 依赖）
 │   │   ├── llm_protocol.py               #   RequestApi 等协议类型（避免业务插件 import 网关）
 │   │   ├── untrusted_context.py          #   不可信上下文包装与渲染
 │   │   ├── content_budget.py             #   内容预算校验（字符/字节/估算 token）
 │   │   ├── token_counter.py              #   估算 token 计数
+│   │   ├── diagnostic_sanitizer.py       #   共享诊断脱敏（凭据与媒体载荷）
 │   │   └── dsv4_instruct.py              #   DSV4 指令注入
 │   ├── config/                           # 强类型配置与 Prompt 存储共享件（加载器依赖 NoneBot 运行时）
 │   │   ├── typed_config.py               #   强类型配置/Prompt 表基类、注册表、安全加载器
@@ -77,7 +88,7 @@ komari-bot/
 │   │   └── onebot_rules.py               #   group_message_rule() 等
 │   └── plugins/                          # NoneBot 插件模块
 │       ├── <插件>/config_schema.py       #   动态配置强类型表（SQLModel，15 个资源）
-│       ├── <插件>/prompt_schema.py       #   Prompt 强类型表（SQLModel，3 个资源）
+│       ├── <插件>/prompt_schema.py       #   Prompt 强类型表（3 个必需资源 + 独立判定资源）
 │       └── <插件>/orm_models.py          #   业务关系表 ORM 模型（user_ban/character_binding/
 │                                          #   user_data/komari_custom/komari_management/komari_decision）
 │
@@ -109,7 +120,7 @@ komari-bot/
 
 核心功能层
   komari_memory ────────────── 四层记忆系统
-  komari_decision ──────────── 回复/记忆判定引擎
+  komari_decision ──────────── Jev 回应资格、保留用途与群总结判定
   komari_chat ──────────────── AI 聊天处理器（编排者）
   komari_knowledge ─────────── RAG 知识库
   komari_help ──────────────── 智能帮助系统
@@ -128,14 +139,18 @@ komari-bot/
 ### 数据流路径
 
 ```
-群消息 → komari_chat（MessageHandler）
-         ├─ 调用 user_ban 判断是否允许实际聊天回复
-         ├─ 调用 komari_memory 获取记忆上下文
-         ├─ 调用 komari_decision 判定回复策略
-         ├─ 可选调用 komari_search 工具查询实时信息（search_web 搜索 / fetch_page 抓取网页正文）
-         ├─ 调用 llm_provider 生成回复
-         ├─ 由 agent_run_logger 汇总一条完整 Agent Run 日志
-         └─ 调用 komari_memory 写入新记忆
+群消息 → DecisionDispatch（冻结原始平台入口事实）
+         ├─ 总结候选入口 → 检查开关、准入、权限与能力 → 一次判定
+         │   ├─ 总结命中 → 停止传播 → 领取 summary 交接资格 → 执行总结
+         │   ├─ 正常未命中 → 聊天入口复用同一结果
+         │   └─ 技术失败 → 停止总结与聊天两条路径
+         └─ 聊天入口 → 按需判定或复用结果
+             ├─ 按保留用途交给既有消息保存流程
+             ├─ 检查 chat 封禁与既有回复履约身份
+             └─ 领取 chat 交接资格 → 读取记忆 → 生成回复 → 回复履约
+                 ├─ llm_provider 生成正文（可调用 komari_search 工具）
+                 ├─ agent_run_logger 记录回复任务
+                 └─ 确认送达后执行原有送达后承诺
 
 用户事件 → user_ban（run_preprocessor）
          ├─ SUPERUSER 或无可靠 QQ 号 → 直接放行
@@ -172,7 +187,7 @@ SUPERUSER 消息 → komari_debug（命令处理器）
 - **存储源**：业务插件动态配置统一存储在 PostgreSQL 强类型单行表 `komari_<插件>_config`（15 张，迁移 0002 建表、0004 为 komari_chat 补充）；每张表固定主键 `id=1`、CAS 修订号 `revision`（写操作原子自增）、写入时间 `updated_at`（存储层显式赋值）；可扩展字段（列表/字典/嵌套配置）保留 JSONB 列
 - **komari_chat 专属配置**：主动回复频控与回复送达副作用 outbox 的 10 个字段位于 `komari_chat_config`（迁移 0004 建表，从 `komari_memory_config` 单行迁入，死字段 `proactive_score_threshold` 随批删除）；TSK-192/TSK-193 起回复 Agent 预算（`agent_max_rounds` / `agent_max_tool_calls_per_round` / `agent_max_total_tool_calls`）与工具调用约束模式（`agent_tool_call_mode`）也落在此表；TSK-194/ADR-0010 起图片理解模式（`image_understanding_mode`）与 8 项下载预算（`vision_image_download_*`，迁移 0015）同样归 `komari_chat`，从 `komari_memory_config` 迁出后不保留 alias / 双读 / fallback；运行时经 `komari_chat/services/config_interface.py` 读取，该接口同时提供 `get_memory_config()` 承接聊天流程仍依赖的 memory 侧字段，komari_chat 不得 import `komari_memory.services.config_interface`
 - **结构真源**：各插件 `config_schema.py` 中的 SQLModel 元数据（`TypedConfigModel` 基类，见 `config/typed_config.py`）；Alembic 迁移环境只按源文件加载 schema（`load_all_typed_config_models()`），不执行插件包 `__init__`、不访问数据库
-- **旧 JSONB 表**：`komari_plugin_configs` 在 v2.0.0 保留（仅承载存量数据，运行时不读写），`DROP` 由后续版本的 autogenerate revision 执行
+- **旧 JSONB 表**：迁移 `0013` 已显式删除 `komari_plugin_configs`。运行时只使用强类型配置表。删除表必须使用手写迁移。
 - **Prompt 配置**：字符串 prompt 不存入配置表，统一使用独立强类型表（见 1.1 节）
 - **初始化**：PG 中缺失配置时，从 `.env` 环境变量 / Pydantic 默认值生成并写入 PG
 - **持久化**：`update_field()` → Pydantic 校验 → 写回 PostgreSQL（revision CAS，冲突时重载重试）
@@ -214,7 +229,7 @@ Prompt 管理写入使用强 `If-Match` 修订校验。
 ### 1.2 Komari Management v2
 
 - 管理路由统一使用 `/api/v2/<plugin>` 前缀，旧版路由、弃用别名和退役 stub 均不注册。
-- 鉴权只接受 `api_credentials` 具名凭据；启动时对遗留 `komari_plugin_configs` 中仍使用旧单 Token / `llm_logs:read` 权限名的凭据记录警告（不物理删除）。
+- 鉴权只接受 `api_credentials` 具名凭据。启动检查仍使用 `llm_logs:read` 权限名的凭据时记录警告。
 - Agent Run 日志权限为 `agent_run_logs:read`；搜索提供者描述端点使用 `search:read`。
 - Swagger 与 OpenAPI 入口分别为 `/api/docs` 和 `/api/openapi.json`。
 - `GET /api/v2/komari-search/provider-descriptors` 从 `komari_search` 配置 Schema 动态生成通用字段与 Tavily/EXA 专用字段描述。
@@ -359,31 +374,102 @@ ok, reason = await check_runtime_permission(bot, event, config)
 
 ### 5. 判定引擎 (`komari_decision`)
 
-依据：TSK-180、ADR-0007、ADR-0011。
+依据：TSK-180、TSK-181～183、ADR-0007、ADR-0011。
+修改入口交接或退役边界前，读取 ADR-0007。
+修改判定配置或 Prompt 初始化前，读取 ADR-0011。
+
+#### 请求与输入
+
+判定直接使用官方 TypeSafe SDK，不经过 `llm_provider`。
+`services/jev_request.py` 管理单次请求的客户端与总截止。
+默认模型为 `jev-1.14.0`。
+连接参数读取统一的 `komari_decision` 强类型配置。
+`jev_base_url` 与 `jev_api_key` 默认为空，配置后才允许调用。
+
+SDK 追加 `/v1/systemone`。
+基础地址只保留此前的网关前缀。
+
+每次判定最多发送 1 次远程请求。
+SDK 与业务层均关闭自动重试。
+失败时不切换模型或旧判定。
+输入使用当前目标、目标前 10 条合格近期上下文与引用消息链。
+OneBot 入口正文以 `event.original_message` 为真源。
+判定不读取长期记忆、用户画像或好感度。
+
+引用补取只沿明确的平台引用关系读取。
+显式引用允许读取被普通长度规则过滤的原文。
+引用节点不因此重新成为判定目标或普通近期上下文。
+不可读节点、循环与超时保留不完整标记。
+
+输入使用稳定身份代号。
+群消息标记为不可信数据。
+媒体与凭据脱敏复用 `komari_bot/llm/diagnostic_sanitizer.py`。
+
+#### 同次判定与单次交接
 
 - `get_decision_engine()` 是唯一公共引擎 getter。
 - `get_decision_dispatch()` 提供同次入站分发的共享载体。
 - 同次分发只执行一次 `evaluate(DecisionRequest)`。
 - 总结与聊天消费同一份冻结结果。
-- 外部效果前必须成功领取 `claim_handoff` 资格。
-- 总结命中后只交接总结。
-- 总结未命中后，聊天复用结果，不重调模型或抽签。
-- 平台重投不能重复领取交接资格。
+- 业务交接前必须成功领取 `claim_handoff` 资格。
+- 平台重投不能重复判定、抽签或领取交接资格。
 - `observe_delivered_reply()` 只接收已送达回复事实。
+- 跨插件共享的请求与结果类型位于 `komari_bot/decision/jev.py`。
 
-Jev 请求按需合并回应资格、保留用途与总结识别问题。
-总结候选的 Noul 结果只有在 `p > 0.7` 时命中。
-带数量的总结也必须经过判定。
+| 入口事实 | Jev 问题 |
+| --- | --- |
+| 普通非总结候选 | 回应资格 Choice + 保留用途 Choice |
+| 非平台召唤的总结候选 | 两个 Choice + 总结 Noul |
+| 平台召唤的总结候选 | 仅总结 Noul |
+| 非总结候选的平台召唤 | 无模型调用，仍检查持久去重与交接资格 |
+
+真实平台 @ 或引用角色消息构成确定性召唤。
+文本称呼只提供输入事实与长度例外。
+
+`required` 进入既有强制回复路径。
+`optional` 每个事件最多抽签一次。
+抽中后继续执行原有主动频控。
+`silent` 不生成普通回复。
+模型置信度只用于诊断，不作为抽签概率。
+
+原始 Choice 与代码组合后的保留资格分别记录。
+`required` 与 `optional` 均保留记忆候选资格。
+`silent + candidate` 同样保留记忆候选资格。
+`silent + noise` 排除记忆候选资格。
+技术失败不能伪装成 `silent` 或 `noise`。
+记忆仍由既有调用方保存，不由判定引擎直接写入。
+
+总结 Noul 仅在 `p > 0.7` 时命中。
+带数量的总结也必须经过 Noul。
 数量提取和范围校验仍由总结执行服务负责。
-真实平台 @ 或引用机器人消息支持确定性召唤。
-文本别名只提供输入事实与长度例外，不构成确定性召唤。
+总结命中后先停止传播，再领取 `summary` 交接资格。
+交接拒绝或异常时仍保持停止传播。
+总结未命中后，聊天复用同一份结果。
+
+#### 执行与失败边界
+
+执行占位与交接资格由 PostgreSQL 持久保存。
+判定使用独立 Redis 近期上下文，不替换回复历史来源。
+
+默认同群执行数为 1。
+默认部署共享执行数为 4。
+默认同群等待上限为 5 条，不含正在执行的任务。
+排队、整链引用补取与 Jev 请求各有独立的 3 秒默认截止。
+Jev 请求截止覆盖连接、发送、接收与响应校验。
+
+引用补取预算从取得执行名额时开始计算。
+取得名额后的 Prompt 读取耗时也计入该预算。
+引用补取超时后，使用已取得内容与缺失标记继续判定。
+迟到的 Jev 结果不能用于业务交接。
+重启不恢复旧队列或补做旧请求。
+判定日志清理不删除持久事件去重身份。
 
 `plugin_enable` 在新配置中默认为 `true`。
 迁移保留已有的显式关闭值。
 运行状态区分 `ready`、`disabled`、`failed`。
 启用但缺少有效连接或 Prompt 时报告 `failed`。
+判定初始化失败不阻止独立功能启动。
 停用撤销尚未交接结果的生效资格。
-重启不恢复旧队列。
 
 技术失败通知直接使用 `GroupTaskFailureNotifier.notify`。
 通知前先领取持久化的 `failure_notification` 资格。
@@ -392,11 +478,39 @@ Jev 请求按需合并回应资格、保留用途与总结识别问题。
 普通判定失败不逐条发送群错误提示。
 通知继续遵守共享开关、冷却及逐效果准入。
 
+聊天 `evaluate` 或 `chat` 交接抛出普通异常时，就地停止处理。
+该异常分支只记录固定安全日志，不触发回复生成失败通知。
+调用方取消继续传播 `CancelledError`。
+
+#### 管理与退役
+
+判定 Prompt 使用独立资源 `komari_decision`。
+角色描述、回应资格、保留用途与总结识别共同组成一个修订。
+配置、模型与 Prompt 在任务内保持冻结。
+共享调度额度仍按运行时配置控制新领取。
+
+管理接口统一位于 `/api/v2/komari-decision`。
+`/health` 只读取被动快照，不调用模型。
+健康与判定元数据要求 `decision:read` 权限。
+判定正文要求 `decision_logs:read` 权限。
+正文访问执行管理审计。
+
+不存在或已清理的日志返回 404。
+日志存储不可用返回 503。
+管理接口细节以 `komari_decision/management_api.py` 为准。
+
 旧场景运行代码、管理路由与后台任务已物理删除。
-迁移 `0025` 删除旧场景四表与 38 个专用配置字段。
+`/api/v2/komari-decision-scenes` 不再注册。
+迁移 `0025` 永久删除旧场景四表与 38 个专用配置字段。
+`0025` 的 `downgrade` 拒绝回退。
 禁止恢复旧签名适配、双跑或故障回退。
 公共向量生成与重排继续服务记忆召回。
+
 判定存储与迁移细节见插件 `orm_models.py` 和迁移 `0022` 至 `0025`。
+新组合效果验收使用固定模型与事前冻结的样例期望。
+回放分别记录误参与、漏回应与技术失败。
+回放不发送业务回复，也不写入业务记忆。
+代码合并不代表生产部署或生产数据删除已获授权。
 
 ### 6. 聊天处理器拆解 (`komari_chat`)
 
@@ -437,7 +551,8 @@ Jev 请求按需合并回应资格、保留用途与总结识别问题。
 `execution_service.py` 提供共享执行服务 `execute_group_summary()`：
 - 输入 bot、group ID、bot self ID、自然语言总结要求、动态配置、可选 collector
 - 复用 `_running_groups` 集合（非 TOCTOU）+ 共享 `_group_locks` 双重保障
-- 正常 handler 必须按“动态开关 → 群聊准入 → 运行时权限 → 平台能力 → Noul 判定”顺序检查；matcher 默认 `block=False`，只有确认接管总结请求后才对当前实例调用 `stop_propagation()`
+- 正常 handler 按“动态开关 → 群聊准入 → 运行时权限 → 平台能力 → Noul 判定”顺序检查。
+- matcher 默认 `block=False`。传播阻断与交接遵循第 5 节的单次判定契约。
 - debug 入口直接调用共享服务，跳过 Noul 判定与业务权限，但仍执行能力检查与群锁
 - 返回结构化 `SummaryExecutionResult`：正文、筛选数、规划结果、图片 base64、过滤标签、时间范围
 
@@ -571,4 +686,4 @@ KOMARI_TEST_POSTGRES_URL=postgresql+asyncpg://user:pass@host:5432/komari_bot_tes
 
 ---
 
-*本文件由 AI 生成于 2026-04-26，最后更新于 2026-09-14。发现不一致请以实际代码为准并更新本文档。*
+*本文件由 AI 生成于 2026-04-26，最后更新于 2026-10-24。发现不一致请以实际代码为准并更新本文档。*
