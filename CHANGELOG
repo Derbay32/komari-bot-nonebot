@@ -17,45 +17,7 @@
 - 拒绝提供双读、双写或运行时兼容回退，升级后旧字段从 Schema、管理 API 与数据库一并消失。
 - 移除完整降级路径，升级后回退只能恢复升级前备份。
 - 要求部署前按 `migrations/README.md` 执行数据库迁移升级程序，避免配置或初始数据缺失。
-
-### 运维注意
-
-升级操作顺序（关键）：
-
-**升级前**
-
-1. **先备份**：`pg_dump` 全量备份数据库。迁移脚本只 upsert 不删数据，但备份是唯一保险。
-2. 只有库还是 v1 键名结构的远古部署，才需要跑 `scripts/migrate_search_config_v2.py` 整理 search 配置键名；新部署跳过。
-
-**补齐旧数据（全部幂等，可重跑）**
-
-3. 按需执行四个搬运脚本，把旧 JSONB 表和旧文件搬进 PG：
-   - `scripts/migrate_json_config_to_pg.py`：旧 `config/config_manager/*_config.json` → `komari_plugin_configs`
-   - `scripts/migrate_prompt_config_to_pg.py`：旧 `config/prompts/*.yaml` → `komari_prompt_configs`
-   - `scripts/migrate_character_binding_to_pg.py`：旧 `data/character_binding/bindings.json` → `komari_character_bindings`
-   - `scripts/migrate_komari_decision_scenes_to_pg.py`：旧 YAML 场景 → `komari_decision_scenes`
-
-**老部署必须先标基线（最容易翻车的一步）**
-
-4. 库里已有 v1 业务表但没有 `alembic_version` 的部署，必须先离线执行 `stamp 0001` 再升级：
-   - `stamp 0001` 只写版本号、不建表；
-   - 随后 `upgrade head` 应用 0002/0003；
-   - 最后 `check` 验证零 diff——它同时校验既有业务表与 ORM 模型精确一致，发现漂移要先按原版本升级流程修复再继续。
-   - 跳过的后果：prestart 的 `upgrade head` 会对既有表重复 `CREATE TABLE`，直接失败。
-   - 全新部署（空库）跳过 stamp，`upgrade head` 会从 0001 全量建表。
-
-**升级与收尾**
-
-5. 部署 v2.0.0 镜像：容器 prestart 自动执行 `upgrade head`（老部署上一步已执行则为 no-op），失败 fail fast。
-6. 跑主力搬运脚本 `scripts/migrate_legacy_config_to_typed_tables.py`（`--dsn` 或 `SQLALCHEMY_DATABASE_URL` 指定连接，幂等可重跑），核对 stdout 决算报告。
-7. 启动应用；数据库配置只需 `SQLALCHEMY_DATABASE_URL`。
-
-**其他注意**
-
-- 全新部署：0001 基线建表时从 `EMBEDDING_DIMENSION`（默认 512）读取向量列维度，必须与运行时 `embedding_dimension` 配置一致，不匹配时记忆/知识插件初始化会 fail fast；老部署走 stamp 不建表，不受影响。
-- 开发守门：改过任何 SQLModel 后必须 autogenerate 生成迁移，并跑 `check` 零 diff；CI 的 migration-check 同样守门。
-- 集成测试：真实库模式需要 `SQLALCHEMY_DATABASE_URL` 与 `KOMARI_TEST_POSTGRES_URL` 同时提供且指向同一数据库，不一致会被守卫拒绝并 skip：
-  `SQLALCHEMY_DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/komari_bot_test KOMARI_TEST_POSTGRES_URL=postgresql+asyncpg://user:pass@host:5432/komari_bot_test poetry run pytest tests/`
+- 更改了角色名绑定机制，每个群之间隔离，支持双框架同步。
 
 ### 新增
 
@@ -66,6 +28,8 @@
 - 新增回复履约深模块，统一消息送达事实 (#100)。
 - 新增回复 Agent 轮次、单轮工具调用数与总工具调用数配置项 (#131)。
 - 新增 prompt 与场景初始化设置能力 (#131)。
+- 新增 俄罗斯轮盘小游戏，通过 QQ 官 Bot 接入。
+- 新增 QQ 官 Bot 接入支持。
 
 ### 变更
 
@@ -76,6 +40,7 @@
 - 优化对话总结进程为统一深模块 (#115)。
 - 优化回复 Agent 的工具调用约束流程，减少纯文本回复错误 (#131)。
 - 变更群聊准入策略，黑白名单配置可管理一切机器人行为 (#150)。
+- 更换判定系统至 System One 模型。
 
 ### 修复
 
