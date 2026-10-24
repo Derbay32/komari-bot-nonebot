@@ -25,6 +25,9 @@ from komari_bot.plugins.komari_chat.prompt_schema import (
     DISPLAY_NAME as KOMARI_CHAT_PROMPT_DISPLAY_NAME,
 )
 from komari_bot.plugins.komari_decision.config_schema import KomariDecisionConfigSchema
+from komari_bot.plugins.komari_decision.prompt_schema import (
+    DISPLAY_NAME as KOMARI_DECISION_PROMPT_DISPLAY_NAME,
+)
 from komari_bot.plugins.komari_help.config_schema import (
     DynamicConfigSchema as HelpConfigSchema,
 )
@@ -104,6 +107,8 @@ def _load_management_components() -> ManagementApiComponents:
     from komari_bot.plugins import character_binding as character_binding_plugin
     require("komari_roulette")
     from komari_bot.plugins import komari_roulette as roulette_plugin
+    require("komari_decision")
+    from komari_bot.plugins import komari_decision as decision_plugin
 
     return ManagementApiComponents(
         register_knowledge_api=knowledge_plugin.register_knowledge_api,
@@ -124,6 +129,7 @@ def _load_management_components() -> ManagementApiComponents:
         character_binding_repair_service_getter=character_binding_plugin.get_binding_repair_service,
         register_roulette_management_api=roulette_plugin.register_roulette_management_api,
         roulette_observation_getter=roulette_plugin.get_roulette_observation,
+        register_decision_api=decision_plugin.register_decision_api,
         config_resources=(
             ManagedConfigResource(
                 resource_id="komari_management",
@@ -247,6 +253,10 @@ def _load_management_components() -> ManagementApiComponents:
             ManagedPromptResource(
                 resource_id="group_history_summary",
                 display_name=GROUP_HISTORY_PROMPT_DISPLAY_NAME,
+            ),
+            ManagedPromptResource(
+                resource_id="komari_decision",
+                display_name=KOMARI_DECISION_PROMPT_DISPLAY_NAME,
             ),
         ),
     )

@@ -43,6 +43,7 @@ def test_decision_config_declares_ordered_chat_and_summary_sections() -> None:
         ("chat_scene", "聊天场景", 10),
         ("summary_classification", "群总结归类", 20),
         ("jev_request", "Jev 请求", 30),
+        ("jev_execution", "Jev 执行", 40),
     ]
 
     for field_name in (

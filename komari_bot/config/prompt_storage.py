@@ -90,6 +90,16 @@ def _public_field_names(model_cls: type[TypedConfigModel]) -> set[str]:
     return set(model_cls.model_fields) - _INTERNAL_STORAGE_FIELDS
 
 
+def _copy_stored_prompt(stored: StoredPrompt) -> StoredPrompt:
+    """返回与缓存隔离的 Prompt 快照副本（正文深拷贝）。"""
+    return StoredPrompt(
+        resource_id=stored.resource_id,
+        prompt_data=dict(stored.prompt_data),
+        revision=stored.revision,
+        updated_at=stored.updated_at,
+    )
+
+
 def _stored_prompt_from_entity(
     resource_id: str, entity: TypedConfigModel
 ) -> StoredPrompt:
@@ -795,6 +805,8 @@ class PromptTemplateLoader:
         self.display_name = display_name
         self._log_prefix = log_prefix
         self._cache: dict[str, str] = {}
+        #: 与缓存正文同一次读取得到的存储快照（正文 + 修订 + 写入时间）。
+        self._cache_stored: StoredPrompt | None = None
         self._cache_updated_at: datetime | None = None
         self._cache_revision = 0
         self._cache_checked_at = 0.0
@@ -828,6 +840,34 @@ class PromptTemplateLoader:
                 return dict(self._cache)
         return None
 
+    def _cached_stored_if_fresh(self) -> StoredPrompt | None:
+        """命中新鲜缓存时返回不可变的版本化快照副本。"""
+        with self._cache_lock:
+            if (
+                self._cache
+                and self._cache_stored is not None
+                and not self._invalidated
+                and monotonic() - self._cache_checked_at
+                < _PROMPT_CACHE_MAX_STALENESS_SECONDS
+            ):
+                return _copy_stored_prompt(self._cache_stored)
+        return None
+
+    def _fallback_stored(self) -> StoredPrompt:
+        """存储读取异常时回退最后有效的版本化快照；无缓存则冷启动失败。"""
+        with self._cache_lock:
+            stored = self._cache_stored
+            if stored is not None:
+                self._cache_checked_at = monotonic()
+                self._invalidated = False
+                return _copy_stored_prompt(stored)
+            msg = (
+                f"{self._log_prefix} komari_bot Prompt 资源 {self.resource_id}"
+                f"（{self.display_name}）的 PostgreSQL 初始数据不可用且无缓存，"
+                "无法取得版本化快照"
+            )
+            raise RuntimeError(msg)
+
     def _fallback_template(self) -> dict[str, str]:
         """数据库读取异常时回退最后有效缓存；无缓存则冷启动明确失败。
 
@@ -857,9 +897,17 @@ class PromptTemplateLoader:
         values = validate_prompt_snapshot(self, prompt_data)
         updated_at = stored.updated_at if stored is not None else None
         revision = stored.revision if stored is not None else 0
+        snapshot = StoredPrompt(
+            resource_id=self.resource_id,
+            prompt_data=dict(values),
+            revision=revision,
+            updated_at=updated_at if updated_at is not None else _utcnow(),
+        )
         with self._cache_lock:
             changed = not self._cache or revision != self._cache_revision
             self._cache = dict(values)
+            # 正文与修订在同一临界区一并替换：读取方不可能看到错配组合。
+            self._cache_stored = snapshot
             self._cache_updated_at = updated_at
             self._cache_revision = revision
             self._cache_checked_at = monotonic()
@@ -900,6 +948,44 @@ class PromptTemplateLoader:
             )
             return self._fallback_template()
         return self._accept_loaded(loaded)
+
+    async def get_versioned_snapshot_async(self) -> StoredPrompt:
+        """原子返回「正文 + 匹配修订」的不可变 Prompt 快照。
+
+        复用本加载器既有缓存、单飞锁与存储失效注册：正文与 revision 来自同一次
+        存储读取（或同一份缓存），调用方不需要（也无法）在两次读取之间拼接。
+        缓存命中返回防御性副本，零 SQL；存储读取异常回退最后有效快照，无快照时
+        冷启动明确失败。
+        """
+        storage = get_prompt_storage()
+        self._register_invalidator(storage)
+        cached = self._cached_stored_if_fresh()
+        if cached is not None:
+            return cached
+
+        async with self._async_lock:
+            cached = self._cached_stored_if_fresh()
+            if cached is not None:
+                return cached
+            try:
+                loaded = await load_prompt_values_async(self)
+            except Exception:
+                logger.warning(
+                    "{} Prompt 配置异步读取失败，使用最后有效版本化快照",
+                    self._log_prefix,
+                    exc_info=True,
+                )
+                return self._fallback_stored()
+            self._accept_loaded(loaded)
+            with self._cache_lock:
+                stored = self._cache_stored
+            if stored is None:
+                msg = (
+                    f"{self._log_prefix} komari_bot Prompt 资源 {self.resource_id}"
+                    " 未产生版本化快照"
+                )
+                raise RuntimeError(msg)
+            return _copy_stored_prompt(stored)
 
     async def get_template_async(self) -> dict[str, str]:
         """异步获取模板；缓存命中零 SQL，失效检查使用单飞。"""

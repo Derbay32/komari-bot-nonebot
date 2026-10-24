@@ -14,6 +14,7 @@ from komari_bot.decision import (
     SummaryRequestClassificationResult,
 )
 
+from .management_api import register_decision_api
 from .services.config_interface import get_config, get_config_async
 from .services.decision_engine import DecisionEngine
 
@@ -57,9 +58,12 @@ def _get_ready_memory_pool(memory_plugin: object) -> Pool:
     return memory_pool
 
 
-# 先加载 embedding 与 memory
+# 先加载 embedding 与 memory（保留到 TSK-183 交接完成）
 require("embedding_provider")
 require("komari_memory")
+# TSK-182：引用补取准入裁决与判定调度都是硬依赖，必须在 import 对应模块前声明。
+require("group_admission")
+require("nonebot_plugin_apscheduler")
 
 __plugin_meta__ = PluginMetadata(
     name="小鞠判定",
@@ -75,7 +79,11 @@ __all__ = [
     "get_decision_engine",
     "get_plugin_manager",
     "get_scene_admin_service",
+    "register_decision_api",
 ]
+
+_CONFIG_UNAVAILABLE_REASON = "判定配置暂不可用"
+"""配置读取失败时的固定安全文案（启动失败态与公共健康态共用）。"""
 
 
 class PluginManager:
@@ -91,8 +99,17 @@ class PluginManager:
 
     @property
     def runtime_state(self) -> DecisionRuntimeState:
-        """返回与动态开关及 scene 快照一致的当前状态。"""
-        return self._resolve_runtime_state(get_config())
+        """返回与动态开关及 scene 快照一致的当前状态。
+
+        配置读取失败时如实投影 ``failed``：不把更早的 ready 状态当作当前状态
+        返回，也不在这里缓存或伪造默认配置（``get_config`` 仍会拒绝非法输入）。
+        健康读可能被高频轮询，因此该分支不写日志。
+        """
+        try:
+            config = get_config()
+        except Exception:
+            return DecisionRuntimeState.failed(_CONFIG_UNAVAILABLE_REASON)
+        return self._resolve_runtime_state(config)
 
     def _resolve_runtime_state(
         self,
@@ -125,8 +142,24 @@ class PluginManager:
         self.scene_embedding_worker = None
 
     async def initialize(self) -> None:
-        """初始化 scene 运行时与同步任务。"""
-        config = await get_config_async()
+        """初始化 scene 运行时与同步任务。
+
+        首次配置读取失败只让主动回复判定进入 failed，不中断进程启动
+        （TSK-180 §7 / §10）：scene 子系统完全不启动，也不缓存或透传任何
+        默认配置；修复配置后再次显式调用即可走正常初始化路径。
+        """
+        try:
+            config = await get_config_async()
+        except Exception as exc:
+            self._runtime_state = DecisionRuntimeState.failed(
+                _CONFIG_UNAVAILABLE_REASON
+            )
+            logger.error(
+                "[KomariDecision] 判定配置读取失败，主动回复判定进入 failed 状态: "
+                "error_type={}",
+                type(exc).__name__,
+            )
+            return
         if not config.plugin_enable:
             self._runtime_state = DecisionRuntimeState.disabled(
                 "komari_decision 已关闭"
@@ -414,3 +447,7 @@ if driver is not None:
             await manager.shutdown()
         _plugin_manager = None
         _clear_decision_engine_cache()
+
+    # TSK-182：判定常驻运行时生命周期注册在既有 legacy 钩子**之后**，因此
+    # NoneBot 的反向 shutdown 会先停 Jev，再轮到共享配置/Prompt 存储关闭。
+    from .services import jev_lifecycle  # noqa: F401 — 生产生命周期与调度装配

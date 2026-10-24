@@ -6,7 +6,7 @@
 检查」，而不是把升级、播种、校验拆散到互不相关的测试里。
 
 覆盖（对应验收标准）：
-- AC1：从基线重建的全新数据库可依次完成 Alembic 升级（head = 0022）、
+- AC1：从基线重建的全新数据库可依次完成 Alembic 升级（head = 0024）、
   初始数据播种与冷启动完整性验证（三个 Prompt 资源单行 + 判定场景）；
 - AC3：迁移链单一 head 且 ``orm_bootstrap check`` 零漂移（升级后与
   播种后各一次）；
@@ -25,7 +25,9 @@ from typing import Any
 
 import asyncpg
 import pytest
+import yaml
 
+from komari_bot.db.seed_bootstrap import DEFAULT_DECISION_SEED_FILE
 from tests.config.prompt_field_contract import (
     PROMPT_RESOURCE_IDS,
     prompt_resource_field_names,
@@ -63,9 +65,10 @@ async def test_fresh_database_completes_upgrade_seed_and_cold_start_gate() -> No
 
         connection = await asyncpg.connect(**scratch)
         try:
-            assert await connection.fetchval(
-                "SELECT version_num FROM alembic_version"
-            ) == HEAD_REVISION, "全新库升级后必须停留在单一 head 0022"
+            assert (
+                await connection.fetchval("SELECT version_num FROM alembic_version")
+                == HEAD_REVISION
+            ), "全新库升级后必须停留在单一 head 0024"
         finally:
             await connection.close()
 
@@ -79,8 +82,8 @@ async def test_fresh_database_completes_upgrade_seed_and_cold_start_gate() -> No
         result = run_seed(db_url)
         output = f"{result.stdout}\n{result.stderr}"
         assert result.returncode == 0, output
-        assert "新建 3 行" in output, (
-            f"播种报告必须确认三个 Prompt 资源均新建单行: {output}"
+        assert "新建 4 行" in output, (
+            f"播种报告必须确认三个必需 Prompt 与一个可选判定 Prompt 均新建单行: {output}"
         )
 
         connection = await asyncpg.connect(**scratch)
@@ -106,9 +109,7 @@ async def test_fresh_database_completes_upgrade_seed_and_cold_start_gate() -> No
             before_rows: dict[str, dict[str, Any] | None] = {}
             for resource_id in PROMPT_RESOURCE_IDS:
                 row = await fetch_prompt_row(connection, resource_id)
-                assert row is not None, (
-                    f"seed 后 {resource_id} Prompt 单行必须存在"
-                )
+                assert row is not None, f"seed 后 {resource_id} Prompt 单行必须存在"
                 schema_fields = prompt_resource_field_names(resource_id)
                 assert set(row) - {"id", "revision", "updated_at"} == schema_fields
                 expected_values = asset_values(resource_id)
@@ -121,6 +122,25 @@ async def test_fresh_database_completes_upgrade_seed_and_cold_start_gate() -> No
                 )
                 before_rows[resource_id] = row
 
+            # 默认可选资产存在时，第四个判定 Prompt 也必须完整落库。
+            decision_values = yaml.safe_load(
+                DEFAULT_DECISION_SEED_FILE.read_text(encoding="utf-8")
+            )["decision_prompt"]
+            assert set(decision_values) == {
+                "role_description",
+                "reply_eligibility",
+                "retention_purpose",
+                "summary_recognition",
+            }
+            decision_before = await connection.fetchrow(
+                "SELECT * FROM komari_prompt_komari_decision WHERE id = 1"
+            )
+            assert decision_before is not None
+            assert decision_before["revision"] == 1
+            for field, expected in decision_values.items():
+                assert expected.strip()
+                assert decision_before[field] == expected
+
             # 6. 重复播种幂等：无 revision/content 变化
             result = run_seed(db_url)
             assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
@@ -129,12 +149,17 @@ async def test_fresh_database_completes_upgrade_seed_and_cold_start_gate() -> No
                 assert after == before_rows[resource_id], (
                     f"重复播种不得产生 {resource_id} revision/content 变化"
                 )
+            assert (
+                await connection.fetchrow(
+                    "SELECT * FROM komari_prompt_komari_decision WHERE id = 1"
+                )
+                == decision_before
+            )
             scene_count = await connection.fetchval(
                 "SELECT count(*) FROM komari_decision_scenes"
             )
             fixed_count = await connection.fetchval(
-                "SELECT count(*) FROM komari_decision_scenes"
-                " WHERE scene_type = 'fixed'"
+                "SELECT count(*) FROM komari_decision_scenes WHERE scene_type = 'fixed'"
             )
             assert scene_count == fixed_count + general_count, (
                 "重复播种不得重复插入场景"

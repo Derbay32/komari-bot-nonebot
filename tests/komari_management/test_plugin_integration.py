@@ -17,6 +17,7 @@ from komari_bot.plugins.character_binding.management_api import (
     register_character_binding_repair_api,
 )
 from komari_bot.plugins.group_admission import register_group_admission_api
+from komari_bot.plugins.komari_decision import register_decision_api
 from komari_bot.plugins.komari_help.api import register_help_api
 from komari_bot.plugins.komari_knowledge.api import register_knowledge_api
 from komari_bot.plugins.komari_management.api_runtime import (
@@ -100,6 +101,7 @@ def _build_components() -> ManagementApiComponents:
         character_binding_repair_service_getter=lambda: None,
         register_roulette_management_api=_noop_roulette_registrar,
         roulette_observation_getter=_noop_roulette_observation_getter,
+        register_decision_api=register_decision_api,
         config_resources=(
             ManagedConfigResource(
                 resource_id="komari_management",
@@ -308,4 +310,30 @@ def test_production_loader_carries_real_roulette_symbols(
     assert (
         components.roulette_observation_getter
         is roulette_plugin.get_roulette_observation
+    )
+
+
+# ---------------------------------------------------------------------------
+# TSK-186: the *production* loader must carry the real decision registrar.
+#
+# The suite shims ``komari_bot.plugins.komari_management`` (``__file__`` is
+# ``None``), so its module body cannot be imported normally.  The assertions
+# below therefore execute the real file through ``real_management_loader`` and
+# check the actual ``_load_management_components`` wiring, not a hand-built
+# component object.
+# ---------------------------------------------------------------------------
+
+
+def test_production_loader_carries_real_decision_registrar(
+    real_management_loader: SimpleNamespace,
+) -> None:
+    """真实 loader 必须把真实顶层 decision registrar 传入管理组件（行为证据）。"""
+
+    import komari_bot.plugins.komari_decision as decision_plugin
+
+    components = real_management_loader.load_components()
+
+    assert "komari_decision" in real_management_loader.required_plugins
+    assert (
+        components.register_decision_api is decision_plugin.register_decision_api
     )

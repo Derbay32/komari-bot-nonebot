@@ -3,6 +3,16 @@
 统一、版本化且幂等的初始数据播种命令，供本地、容器 prestart 与 CI 复用：
 
     python -m komari_bot.db.seed_bootstrap [--seed-file PATH]
+        [--decision-seed-file PATH]
+
+TSK-182 起新增**可选**的判定 Prompt 初始数据资产
+（``--decision-seed-file``，默认
+``komari_bot/db/initial_data/decision_prompt.yaml``）：它独立解析与校验，
+避免可选资产的格式错误影响必需资源的校验；必需资源提交并通过校验后，才
+以自己的独立连接租约与独立事务写入判定 Prompt。可选资产的读取/校验/
+取用/写入/归还失败只输出一条固定安全诊断（不含正文、未知字段值、凭据、
+原始异常或回溯），不阻止角色服务启动，也绝不把运行时健康状态判成失败
+（ADR-0011《判定 Prompt 的隔离初始化》）。
 
 执行顺序与约束：
 
@@ -25,6 +35,18 @@
    应用启动（fail fast）。
 4. **运行时从不读取本文件**：初始化数据只是 bootstrap seed，运行时的场景
    快照与 Prompt 快照一律从 PostgreSQL 构建（见 ADR-0011）。
+5. **可选判定 Prompt 的隔离初始化**（TSK-182）：独立的
+   ``decision_prompt.yaml`` 只校验自己的严格固定形状，只在必需资源已提交并
+   通过校验之后、以自己的独立连接租约与独立事务写入判定 Prompt；只新建
+   缺失单行或补齐空字段，保留非空管理员文案。可选步骤的读取/校验/取用/
+   写入/归还失败都只输出一条固定安全诊断，不影响必需资源，也不阻断容器
+   启动；该诊断只陈述“未能确认完成”，不声称写入已回滚或运行时健康失败
+   （提交之后才发生的归还失败不能撤销已经持久化的行）。运行时仍只读
+   PostgreSQL（没有文件回退、Python 长文本默认值或模型探测）。
+
+注：必需/可选资产共用的 YAML 读取函数仍以既有 legacy 载荷报错（可能
+带有 PyYAML/OSError 的原始消息），只有可选判定资产的 CLI 入口边界会把
+它们归约为固定安全诊断。
 
 数据库访问统一走 nonebot-plugin-orm 共享连接边界
 （``komari_bot.db.orm_connection.get_shared_orm_connection_pool``），
@@ -59,6 +81,11 @@ if TYPE_CHECKING:
 
 DEFAULT_SEED_FILE = Path(__file__).resolve().parent / "initial_data" / "scenes.yaml"
 
+#: TSK-182：判定 Prompt 的独立可选初始数据资产（与必需 manifest 隔离）。
+DEFAULT_DECISION_SEED_FILE = (
+    Path(__file__).resolve().parent / "initial_data" / "decision_prompt.yaml"
+)
+
 #: 必需 fixed 场景键（seed 资产与数据库冷启动校验共用）。
 _REQUIRED_FIXED_SCENE_KEYS: tuple[str, ...] = (
     "NOISE",
@@ -78,6 +105,24 @@ _PROMPT_RESOURCE_IDS: tuple[str, ...] = (
     "komari_memory_summary",
     "group_history_summary",
 )
+
+#: TSK-182：可选的判定 Prompt 资源（独立资产、独立事务、非强制冷启动 gate）。
+_DECISION_PROMPT_RESOURCE_ID = "komari_decision"
+
+#: TSK-182：可选判定资产中的固定节键（只读显式键，不递归搜索可选块）。
+_DECISION_PROMPT_SECTION_KEY = "decision_prompt"
+
+#: TSK-182：可选判定资产允许的顶层键集合（严格固定形状，不多不少）。
+_DECISION_SEED_ROOT_KEYS: frozenset[str] = frozenset(
+    {"version", _DECISION_PROMPT_SECTION_KEY}
+)
+
+#: TSK-182：可选判定资产不可用或未能确认完成时唯一的固定安全诊断。
+#:
+#: 只陈述“未能确认完成”，绝不包含资产正文、未知字段值、路径细节、原始
+#: 异常或回溯，也不据此宣称写入已回滚或运行时健康状态失败（事务提交之后
+#: 才发生的连接归还失败不能撤销已经持久化的行）。
+_DECISION_SEED_UNAVAILABLE_MESSAGE = "判定 Prompt 初始化未能确认完成。"
 
 
 #: 由 ``flatten_mapping`` 特殊消费、不构成真实 mapping 键的 YAML 标签。
@@ -308,16 +353,33 @@ def _normalize_prompt(
     mapping = _find_prompt_mapping(raw, resource_id)
     if mapping is None:
         return {}
+    return _validate_prompt_values(mapping, resource_id, path)
+
+
+def _validate_prompt_values(
+    mapping: object,
+    resource_id: str,
+    path: Path,
+) -> dict[str, str]:
+    """按 resource_id 的强类型 Schema 与共享内容预算校验一个 Prompt 初始块。
+
+    必需资源与可选判定资产共用同一校验：字段集合一一对应、全部非空字符串、
+    共享内容预算通过；错误消息只含资源名、字段名与文件路径。
+    """
+    if not isinstance(mapping, dict):
+        msg = f"{resource_id} Prompt 初始数据必须是对象: {path}"
+        raise SeedValidationError(msg)
 
     fields = _prompt_schema_fields(resource_id)
-    missing = sorted(fields - set(mapping))
+    provided = {key for key in mapping if isinstance(key, str)}
+    missing = sorted(fields - provided)
     if missing:
         msg = (
             f"{resource_id} Prompt 初始数据缺少字段: "
             f"{', '.join(missing)}（{path}）"
         )
         raise SeedValidationError(msg)
-    extra = sorted(set(mapping) - fields)
+    extra = sorted(str(key) for key in set(mapping) - fields)
     if extra:
         msg = (
             f"{resource_id} Prompt 初始数据包含未知字段: "
@@ -347,6 +409,54 @@ def _normalize_prompt(
     return normalized
 
 
+def load_decision_prompt_seed(path: Path) -> dict[str, str]:
+    """读取并校验独立的可选判定 Prompt 初始数据资产。
+
+    固定形状为 ``{version: 非空字符串, decision_prompt: {四个正文字段}}``，
+    并且是**严格**的：只读显式 ``decision_prompt`` 键（不递归搜索任意嵌套
+    可选块）；``version`` 必须是非空字符串（整数/布尔/序列/映射一律拒绝，
+    绝不做 ``str()`` 强转）；顶层键集合恰为 ``{version, decision_prompt}``；
+    字段集合与 ``komari_decision`` 强类型 Schema 一一对应，全部非空字符串
+    并通过共享内容预算。
+
+    失败抛出 :class:`SeedValidationError`。解析器错误可能包含资产片段，
+    CLI 层只输出固定安全诊断，不展示原始错误。
+    """
+    path = path if path.is_absolute() else path.resolve()
+    raw = _load_yaml_document(path)
+
+    version = raw.get("version")
+    if not isinstance(version, str) or not version.strip():
+        msg = f"判定 Prompt 初始数据的 version 必须是非空字符串: {path}"
+        raise SeedValidationError(msg)
+
+    section = raw.get(_DECISION_PROMPT_SECTION_KEY)
+    if section is None:
+        msg = (
+            "判定 Prompt 初始数据缺少 "
+            f"{_DECISION_PROMPT_SECTION_KEY} 块: {path}"
+        )
+        raise SeedValidationError(msg)
+    if not isinstance(section, dict):
+        msg = (
+            "判定 Prompt 初始数据的 "
+            f"{_DECISION_PROMPT_SECTION_KEY} 必须是对象: {path}"
+        )
+        raise SeedValidationError(msg)
+
+    unexpected_root = sorted(
+        str(key) for key in set(raw) - _DECISION_SEED_ROOT_KEYS
+    )
+    if unexpected_root:
+        msg = (
+            "判定 Prompt 初始数据包含未知顶层键: "
+            f"{', '.join(unexpected_root)}（{path}）"
+        )
+        raise SeedValidationError(msg)
+
+    return _validate_prompt_values(section, _DECISION_PROMPT_RESOURCE_ID, path)
+
+
 def _find_duplicate_scene_keys(
     fixed_candidates: dict[str, str],
     general_scenes: list[dict[str, str]],
@@ -364,19 +474,22 @@ def _find_duplicate_scene_keys(
     return duplicates
 
 
-def load_seed_file(path: Path) -> SeedPayload:
-    """读取并校验版本化 seed 文件，返回归一化载荷。
+def _load_yaml_document(path: Path) -> dict[str, Any]:
+    """读取 YAML 文档并拒绝 mapping 重复键（必需与可选资产共用同一严格解析）。
 
-    校验失败抛出 :class:`SeedValidationError`，消息始终指明出错的 seed 文件
-    路径，并在缺键 / 重复键场景点名具体键。
+    失败一律归约为 :class:`SeedValidationError`：读取失败（含非法 UTF-8）、
+    YAML 解析失败（含重复键）、根节点非对象。消息始终指明出错文件。
+
+    注意：这里的失败消息是**既有 legacy 载荷**，会带上 ``OSError`` 或 PyYAML
+    的原始消息（后者可能内含出错文档片段），本函数不做脱敏；只有可选判定
+    资产的 CLI 入口边界会把它们归约为固定安全诊断。
     """
-    path = path if path.is_absolute() else path.resolve()
     try:
         raw = yaml.load(
             path.read_text(encoding="utf-8"),
             Loader=_UniqueKeySafeLoader,
         ) or {}
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         msg = f"读取初始数据文件失败: {path}（{exc}）"
         raise SeedValidationError(msg) from exc
     except yaml.YAMLError as exc:
@@ -386,6 +499,17 @@ def load_seed_file(path: Path) -> SeedPayload:
     if not isinstance(raw, dict):
         msg = f"初始数据根节点必须是对象: {path}"
         raise SeedValidationError(msg)
+    return raw
+
+
+def load_seed_file(path: Path) -> SeedPayload:
+    """读取并校验版本化 seed 文件，返回归一化载荷。
+
+    校验失败抛出 :class:`SeedValidationError`，消息始终指明出错的 seed 文件
+    路径，并在缺键 / 重复键场景点名具体键。
+    """
+    path = path if path.is_absolute() else path.resolve()
+    raw = _load_yaml_document(path)
 
     version = str(raw.get("version") or "").strip()
     if not version:
@@ -575,12 +699,57 @@ async def _verify_prompt_cold_start(conn: Any, resource_id: str) -> None:
         raise SeedVerificationError(msg)
 
 
-async def _seed_database(payload: SeedPayload) -> SeedReport:
+async def _seed_optional_decision_prompt(
+    pool: Any,
+    prompt_values: dict[str, str],
+) -> tuple[int, int] | None:
+    """在独立连接租约与独立事务中初始化可选判定 Prompt。
+
+    连接从事务外的共享 pool **重新借出**（不是复用已经归还的驱动连接），
+    因此可选阶段的取用、写入、写入后校验与归还失败全部落在同一个可选
+    错误边界内：必需资源早已提交并通过校验，可选阶段的任何失败都不得
+    把必需初始化变成失败。
+
+    只重用既有 helper 的新建/补齐空字段与写入后校验语义。诊断只有固定
+    文案（不含正文、未知字段值、原始异常或回溯），也不据此宣称写入回滚
+    或运行时健康失败：事务提交之后才发生的归还失败不能撤销已持久化的
+    行。只有整个可选作用域成功完成才返回计数。
+    """
+    counts: tuple[int, int] | None = None
+    try:
+        async with pool.acquire() as conn, conn.transaction():
+            counts = await _seed_prompt_row(
+                conn,
+                _DECISION_PROMPT_RESOURCE_ID,
+                prompt_values,
+            )
+            await _verify_prompt_cold_start(
+                conn,
+                _DECISION_PROMPT_RESOURCE_ID,
+            )
+    except Exception:
+        # 可选资源隔离：这里不捕获 BaseException/CancelledError，取消与
+        # 进程级信号不得被当作“可选资产不可用”的正常分支。
+        print(_DECISION_SEED_UNAVAILABLE_MESSAGE, file=sys.stderr)  # noqa: T201
+        return None
+    return counts
+
+
+async def _seed_database(
+    payload: SeedPayload,
+    *,
+    decision_prompt: dict[str, str] | None = None,
+) -> SeedReport:
     """写入缺失场景与聊天 Prompt 初始数据，并在写入后校验冷启动充分性。
 
     数据库访问经 nonebot-plugin-orm 共享连接边界（shared engine pool）：
     只借还连接，不捕获也不 dispose 共享引擎（生命周期由 nonebot-plugin-orm
     托管）；查询为既有表的只读与幂等写入，不使用任何运行时 DDL。
+
+    ``decision_prompt`` 为 TSK-182 的可选判定 Prompt 正文：``None`` 明确
+    表示可选资产未提供或不可用（运行时没有回退正文），不表示已写入任何
+    默认值。提供的正文只在必需资源已提交并通过校验后，以自己的独立连接
+    租约与独立事务写入与校验（取用/写入/校验/归还失败只落入可选错误边界）。
     """
     from komari_bot.db.orm_connection import get_shared_orm_connection_pool
 
@@ -625,8 +794,19 @@ async def _seed_database(payload: SeedPayload) -> SeedReport:
             FROM komari_decision_scenes
             """
         )
+        state = verify_cold_start_state([dict(row) for row in rows])
+    # 必需租约到这里完整结束：取用、写入、提交、写入后校验与归还同属
+    # 必需资源的错误边界（其中的失败仍然判主失败）。
 
-    state = verify_cold_start_state([dict(row) for row in rows])
+    if decision_prompt is not None:
+        # TSK-182：必需资源已提交且通过校验，才从同一个共享 pool 借出**独立**
+        # 的第二个租约写可选判定 Prompt；报告的 Prompt 计数只统计成功完成
+        # 的可选新建/补齐，失败/跳过不增加计数。
+        seeded = await _seed_optional_decision_prompt(pool, decision_prompt)
+        if seeded is not None:
+            prompt_rows_inserted += seeded[0]
+            prompt_fields_filled += seeded[1]
+
     return SeedReport(
         inserted=inserted,
         total=len(rows),
@@ -651,14 +831,26 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         default=DEFAULT_SEED_FILE,
         help=f"版本化初始数据文件路径（默认: {DEFAULT_SEED_FILE}）",
     )
+    parser.add_argument(
+        "--decision-seed-file",
+        type=Path,
+        default=DEFAULT_DECISION_SEED_FILE,
+        help=(
+            "判定 Prompt 初始数据文件路径（可选资源；"
+            f"默认: {DEFAULT_DECISION_SEED_FILE}）"
+        ),
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     """播种命令入口。
 
-    顺序严格为：seed 文件校验 → 数据库播种 → 写入后冷启动校验；
-    任一步失败均以非零退出码结束，配合 prestart 的 ``set -e`` 阻止冷启动。
+    顺序严格为：必需 seed 文件校验（含缺块门禁）→ 可选判定资产独立校验
+    → 数据库播种 → 写入后冷启动校验。必需步骤失败以非零退出码结束，
+    配合 prestart 的 ``set -e`` 阻止冷启动；可选判定资产不可用或未能
+    确认完成（含可选租约的取用/归还失败）时只输出一条固定安全诊断并以
+    ``decision_prompt=None`` 继续。
     """
     args = _parse_args(argv)
 
@@ -683,7 +875,18 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         raise SystemExit(1)
 
-    # 校验通过后才初始化 NoneBot / 共享引擎，保证非法 seed 绝不触碰数据库。
+    # TSK-182：可选判定资产独立读取/校验。失败只输出固定安全诊断（不含
+    # 资产正文、未知字段值、路径细节、原始异常或回溯），也不据此宣称
+    # 写入回滚或运行时健康失败；以 None 继续表示“未提供可选初始值”，运行时
+    # 没有回退正文，仍只读 PostgreSQL。
+    decision_prompt: dict[str, str] | None
+    try:
+        decision_prompt = load_decision_prompt_seed(args.decision_seed_file)
+    except SeedValidationError:
+        print(_DECISION_SEED_UNAVAILABLE_MESSAGE, file=sys.stderr)  # noqa: T201
+        decision_prompt = None
+
+    # 必需校验通过后才初始化 NoneBot / 共享引擎，保证非法 seed 绝不触碰数据库。
     try:
         _bootstrap_nonebot()
     except Exception as exc:
@@ -691,7 +894,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise SystemExit(1) from exc
 
     try:
-        report = asyncio.run(_seed_database(payload))
+        report = asyncio.run(
+            _seed_database(payload, decision_prompt=decision_prompt)
+        )
     except SeedVerificationError as exc:
         print(  # noqa: T201
             f"播种后数据库校验失败（seed 文件: {args.seed_file}）: {exc}",

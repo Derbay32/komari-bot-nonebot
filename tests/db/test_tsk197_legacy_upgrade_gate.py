@@ -287,8 +287,8 @@ async def test_legacy_database_upgrades_to_head_migrates_values_and_seeds_cleanl
         result = run_seed(db_url)
         output = f"{result.stdout}\n{result.stderr}"
         assert result.returncode == 0, output
-        assert "新建 2 行" in output, (
-            f"chat Prompt 行已存在，seed 应新建 memory/group 两个资源行: {output}"
+        assert "新建 3 行" in output, (
+            f"chat Prompt 行已存在，seed 应新建 memory/group/decision 三个资源行: {output}"
         )
 
         connection = await asyncpg.connect(**scratch)

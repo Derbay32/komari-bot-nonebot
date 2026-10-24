@@ -86,6 +86,9 @@ class KomariDecisionConfigSchema(TypedConfigModel, table=True):
     """Komari Decision 插件配置。"""
 
     plugin_name: ClassVar[str] = "komari_decision"
+    # 判定配置缺失或损坏只降级主动回复判定，不得中断整个进程启动
+    # （TSK-180 §7 / §10）；未声明该政策的资源配置仍按启动必需处理。
+    startup_required: ClassVar[bool] = False
     __tablename__ = "komari_decision_config"
 
     model_config = typed_model_config(
@@ -108,6 +111,11 @@ class KomariDecisionConfigSchema(TypedConfigModel, table=True):
                     "section_id": "jev_request",
                     "display_name": "Jev 请求",
                     "order": 30,
+                },
+                {
+                    "section_id": "jev_execution",
+                    "display_name": "Jev 执行",
+                    "order": 40,
                 },
             ],
         },
@@ -348,6 +356,59 @@ class KomariDecisionConfigSchema(TypedConfigModel, table=True):
         ),
         json_schema_extra={"section_id": "jev_request"},
     )
+    max_concurrent_decisions: int = Field(
+        default=4,
+        ge=1,
+        description=(
+            "同一部署内同时执行的判定任务上限（部署级共享额度，不是单进程或"
+            "单个 SDK 调用的数量；执行名额同时覆盖引用补取与 Jev 调用）"
+        ),
+        json_schema_extra={"section_id": "jev_execution"},
+    )
+    max_queued_messages_per_group: int = Field(
+        default=5,
+        ge=1,
+        description=(
+            "同群等待执行的判定任务上限（不含当前正在执行的任务）；队列满时"
+            "拒绝新任务，不挤掉已接收任务"
+        ),
+        json_schema_extra={"section_id": "jev_execution"},
+    )
+    queue_timeout_seconds: float = Field(
+        default=3.0,
+        description=(
+            "排队等待执行名额的最长秒数，从入队时刻开始计算；必须是正的有限值"
+        ),
+        json_schema_extra={"section_id": "jev_execution"},
+    )
+    reference_timeout_seconds: float = Field(
+        default=3.0,
+        description=(
+            "取得执行名额后整条引用链补取共享的截止秒数（单个截止覆盖整链）；"
+            "必须是正的有限值"
+        ),
+        json_schema_extra={"section_id": "jev_execution"},
+    )
+    optional_reply_probability: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "optional 类判定结果的抽签命中概率（0 到 1 的有限值）；模型置信度"
+            "不参与该概率，且仅新任务读取新值"
+        ),
+        json_schema_extra={"section_id": "jev_execution"},
+    )
+    decision_log_retention_days: int = Field(
+        default=7,
+        ge=1,
+        le=30,
+        description=(
+            "判定诊断日志的保留天数（1 至 30）；只作用于判定诊断日志，不影响"
+            "事件去重身份与回复日志"
+        ),
+        json_schema_extra={"section_id": "jev_execution"},
+    )
 
     @field_validator("jev_base_url")
     @classmethod
@@ -381,6 +442,20 @@ class KomariDecisionConfigSchema(TypedConfigModel, table=True):
         """拒绝非正或非有限的请求总截止。"""
         return normalize_jev_timeout_seconds(
             value, field_name="jev_request_timeout_seconds"
+        )
+
+    @field_validator("queue_timeout_seconds")
+    @classmethod
+    def validate_queue_timeout(cls, value: float) -> float:
+        """拒绝非正或非有限的排队等待截止。"""
+        return normalize_jev_timeout_seconds(value, field_name="queue_timeout_seconds")
+
+    @field_validator("reference_timeout_seconds")
+    @classmethod
+    def validate_reference_timeout(cls, value: float) -> float:
+        """拒绝非正或非有限的整链引用补取截止。"""
+        return normalize_jev_timeout_seconds(
+            value, field_name="reference_timeout_seconds"
         )
 
     @field_validator("bot_aliases", mode="before")
