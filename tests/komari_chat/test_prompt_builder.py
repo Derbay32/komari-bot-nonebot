@@ -20,6 +20,8 @@ from importlib import import_module
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from komari_bot.plugins.komari_chat.services.reply_context import ReplyContext
 
 prompt_builder_module = import_module(
@@ -260,10 +262,29 @@ def test_build_prompt_injects_current_favorability_stage(monkeypatch: Any) -> No
     assert "<favorability_modifier>" not in joined
 
 
-def test_build_prompt_injects_recent_interactions_as_yaml_content_time_only(
+def test_build_prompt_no_longer_injects_cross_group_interaction_records(
     monkeypatch: Any,
 ) -> None:
+    """TSK-195 retires the old structured interaction-buffer injection."""
     _patch_dependencies(monkeypatch)
+
+    with pytest.raises(TypeError):
+        asyncio.run(
+            prompt_builder_module.build_prompt(
+                user_message="继续聊",
+                config=_build_config(),
+                current_user_id="user-1",
+                current_user_nickname="阿虚",
+                interaction_records=[
+                    {
+                        "event": "用户问候小鞠",
+                        "result": "小鞠回应",
+                        "emotion": "开心",
+                        "timestamp": 1780495200.0,
+                    }
+                ],
+            )
+        )
 
     messages = asyncio.run(
         prompt_builder_module.build_prompt(
@@ -271,26 +292,11 @@ def test_build_prompt_injects_recent_interactions_as_yaml_content_time_only(
             config=_build_config(),
             current_user_id="user-1",
             current_user_nickname="阿虚",
-            interaction_records=[
-                {
-                    "event": "用户问候小鞠",
-                    "result": "小鞠回应",
-                    "emotion": "开心",
-                    "timestamp": 1780495200.0,
-                    "message_id": "msg-1",
-                    "importance": 5,
-                }
-            ],
         )
     )
-
     joined = "\n".join(str(message["content"]) for message in messages)
-    assert "<recent_interaction_history>" in joined
-    assert "content: 用户问候小鞠；小鞠回应；开心" in joined
-    assert "timestamp" not in joined
-    assert "message_id" not in joined
-    assert "similarity" not in joined
-    assert "importance_current" not in joined
+    assert "<recent_interaction_history>\nrecords:" not in joined
+    assert "用户问候小鞠；小鞠回应；开心" not in joined
 
 
 def test_build_prompt_inserts_bot_reply_image_as_user_attachment(

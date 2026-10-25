@@ -62,7 +62,6 @@ from ..services.llm_service import (
     RECALL_MEMORY_TOOL,
     RECORD_FAVORABILITY_DELTA_TOOL,
     SEARCH_WEB_TOOL,
-    InteractionHistoryRecord,
     NativeMultimodalRequestError,
     ReplyResult,
     generate_reply,
@@ -140,7 +139,6 @@ class DebugReplyResult:
     reply_to_message_id: str | None
     favorability_delta: int | None
     favorability_reason: str | None
-    interaction_history: InteractionHistoryRecord | None
     collector: LLMDiagnosticCollector
 
 
@@ -164,6 +162,7 @@ class PendingReply:
     fulfillment_id: str
     request_trace_id: str
     reply_timestamp: float
+    hindsight_target_fingerprint: str
     proactive_reservation_id: str | None = None
     proactive_handoff: ReservationHandoff | None = None
     reaction_sent: bool = False
@@ -1155,14 +1154,13 @@ class MessageHandler:
         self,
         *,
         group_id: str,
-        user_id: str,
         message: MessageSchema,
         store_current: bool,
-    ) -> tuple[list[MessageSchema], list[dict[str, object]], bool]:
-        """读取已有缓冲：recent messages + global interaction buffer。
+    ) -> tuple[list[MessageSchema], bool]:
+        """读取已有缓冲：同群 recent messages（含已确认角色回复）。
 
         Returns:
-            (recent_messages, interaction_records, stored)
+            (recent_messages, stored)
         """
         config = get_config()
         stored = False
@@ -1180,31 +1178,18 @@ class MessageHandler:
                 getattr(config, "context_max_estimated_tokens", 6_000)
             ),
         )
-        try:
-            interaction_records = await self.redis.get_global_interaction_buffer(
-                user_id,
-                limit=10,
-            )
-        except Exception:
-            logger.debug(
-                "[KomariChat] 近期互动原始缓冲读取失败，跳过注入: user={}",
-                user_id,
-                exc_info=True,
-            )
-            interaction_records = []
 
         if store_current:
             await self._handle_normal_message(message)
             stored = True
 
-        return recent_messages, interaction_records, stored
+        return recent_messages, stored
 
     async def _generate_reply_core(
         self,
         *,
         message: MessageSchema,
         recent_messages: list[MessageSchema],
-        interaction_records: list[dict[str, object]],
         image_urls: list[str] | None,
         reply_context: ReplyContext | None,
         reply_context_requested: bool,
@@ -1216,53 +1201,35 @@ class MessageHandler:
     ) -> ReplyResult:
         """Run the read/generate core with a supplied task memory session.
 
-        A supplied session is the ordinary chat/debug reuse path.  Only the
-        standalone debug path opens its own session here.  Current-group
-        admission runs immediately before the first memory effect in both.
+        Ordinary chat supplies its candidate session; standalone debug opens
+        its own session. Annotate the result from that same active session,
+        never from model arguments or a later configuration read.
         """
         try:
-            if recall_session is None:
-                if not effect_business_admitted(group_id=message.group_id):
-                    return ReplyResult(
-                        content="",
-                        interaction_history={
-                            "event": "",
-                            "result": "",
-                            "emotion": "",
-                        },
-                    )
-                async with self.hindsight_memory.open_session() as opened_session:
-                    return await self._generate_reply_with_session(
-                        message=message,
-                        recent_messages=recent_messages,
-                        interaction_records=interaction_records,
-                        image_urls=image_urls,
-                        reply_context=reply_context,
-                        reply_context_requested=reply_context_requested,
-                        reply_context_refetched=reply_context_refetched,
-                        request_trace_id=request_trace_id,
-                        caller_is_superuser=caller_is_superuser,
-                        collector=collector,
-                        recall_session=opened_session,
-                    )
             if not effect_business_admitted(group_id=message.group_id):
-                return ReplyResult(
-                    content="",
-                    interaction_history={"event": "", "result": "", "emotion": ""},
+                return ReplyResult(content="")
+            async with AsyncExitStack() as session_stack:
+                active_session = recall_session
+                if active_session is None:
+                    active_session = await session_stack.enter_async_context(
+                        self.hindsight_memory.open_session()
+                    )
+                reply_result = await self._generate_reply_with_session(
+                    message=message,
+                    recent_messages=recent_messages,
+                    image_urls=image_urls,
+                    reply_context=reply_context,
+                    reply_context_requested=reply_context_requested,
+                    reply_context_refetched=reply_context_refetched,
+                    request_trace_id=request_trace_id,
+                    caller_is_superuser=caller_is_superuser,
+                    collector=collector,
+                    recall_session=active_session,
                 )
-            return await self._generate_reply_with_session(
-                message=message,
-                recent_messages=recent_messages,
-                interaction_records=interaction_records,
-                image_urls=image_urls,
-                reply_context=reply_context,
-                reply_context_requested=reply_context_requested,
-                reply_context_refetched=reply_context_refetched,
-                request_trace_id=request_trace_id,
-                caller_is_superuser=caller_is_superuser,
-                collector=collector,
-                recall_session=recall_session,
-            )
+                return replace(
+                    reply_result,
+                    hindsight_target_fingerprint=active_session.target_fingerprint,
+                )
         except Exception:
             # TSK-196：委托核心的敏感图片 locals 已由其单点安全抛出点清空；
             # 本包装帧同样重绑参数与 collector，保持既有 traceback 投影边界。
@@ -1276,7 +1243,6 @@ class MessageHandler:
         *,
         message: MessageSchema,
         recent_messages: list[MessageSchema],
-        interaction_records: list[dict[str, object]],
         image_urls: list[str] | None,
         reply_context: ReplyContext | None,
         reply_context_requested: bool,
@@ -1313,10 +1279,7 @@ class MessageHandler:
         # TSK-225 / TSK-193：召回实际外呼前按当前群重新裁决。准入拒绝走
         # 既有安静空 ReplyResult 控制路径，不调用 SDK/provider，也不记录记忆故障。
         if not effect_business_admitted(group_id=message.group_id):
-            return ReplyResult(
-                content="",
-                interaction_history={"event": "", "result": "", "emotion": ""},
-            )
+            return ReplyResult(content="")
 
         recall_query_source = rewritten_query.strip() or _MEDIA_ONLY_RECALL_QUERY
         recall_query = normalize_required_text(
@@ -1484,7 +1447,6 @@ class MessageHandler:
                 reply_context=reply_context,
                 reply_image_urls=reply_image_urls if image_session is None else None,
                 favorability=favorability,
-                interaction_records=interaction_records,
                 delegated_image_mode=use_vision_tool,
                 delegated_quoted_image_count=(
                     image_session.quoted_count if image_session is not None else None
@@ -1699,9 +1661,8 @@ class MessageHandler:
 
             # === 读取已有缓冲 ===
             try:
-                recent_messages, interaction_records, stored = await self._read_buffers(
+                recent_messages, stored = await self._read_buffers(
                     group_id=message.group_id,
-                    user_id=message.user_id,
                     message=message,
                     store_current=store_current,
                 )
@@ -1733,7 +1694,6 @@ class MessageHandler:
                 input_data={
                     "message": message,
                     "recent_messages": recent_messages,
-                    "interaction_records": interaction_records,
                     "image_urls": image_urls,
                     "reply_context": reply_context,
                     "reason": reason,
@@ -1744,7 +1704,6 @@ class MessageHandler:
                 reply_result = await self._generate_reply_core(
                     message=message,
                     recent_messages=recent_messages,
-                    interaction_records=interaction_records,
                     image_urls=image_urls,
                     reply_context=reply_context,
                     reply_context_requested=reply_context_requested,
@@ -1840,6 +1799,23 @@ class MessageHandler:
                     ),
                 )
 
+            hindsight_target_fingerprint = reply_result.hindsight_target_fingerprint
+            if not hindsight_target_fingerprint:
+                logger.warning(
+                    "[KomariChat] 回复缺少 Hindsight 目标指纹，按生成失败处理"
+                )
+                return (
+                    None,
+                    stored,
+                    ReplyFailureInfo(
+                        stage="generate",
+                        error_type="HindsightTargetFingerprintMissingError",
+                        summary="回复缺少 Hindsight 目标指纹",
+                        request_trace_id=request_trace_id,
+                        reaction_sent=reaction_sent,
+                    ),
+                )
+
             # === 生成完成：内联一次续租裁决，成功后才移交窄凭据 ===
             if lease is not None:
                 try:
@@ -1894,6 +1870,7 @@ class MessageHandler:
                 fulfillment_id=self._reply_fulfillment_id(message),
                 request_trace_id=request_trace_id,
                 reply_timestamp=time.time(),
+                hindsight_target_fingerprint=hindsight_target_fingerprint,
                 proactive_reservation_id=reservation_id,
                 proactive_handoff=handoff,
                 reaction_sent=reaction_sent,
@@ -1933,7 +1910,7 @@ class MessageHandler:
 
         Returns:
             DebugReplyResult（reply, favorability_delta, favorability_reason,
-            interaction_history, collector）
+            collector）
 
         Raises:
             RuntimeError: 底层服务未初始化
@@ -1987,9 +1964,8 @@ class MessageHandler:
             )
 
             # === 读取已有缓冲（不 store_current，不写当前消息） ===
-            recent_messages, interaction_records, _stored = await self._read_buffers(
+            recent_messages, _stored = await self._read_buffers(
                 group_id=group_id,
-                user_id=user_id,
                 message=message,
                 store_current=False,
             )
@@ -2018,7 +1994,6 @@ class MessageHandler:
             reply_result = await self._generate_reply_core(
                 message=message,
                 recent_messages=recent_messages,
-                interaction_records=interaction_records,
                 image_urls=image_urls,
                 reply_context=reply_context,
                 reply_context_requested=reply_context is not None,
@@ -2072,7 +2047,6 @@ class MessageHandler:
             ),
             favorability_delta=reply_result.favorability_delta,
             favorability_reason=reply_result.favorability_reason,
-            interaction_history=reply_result.interaction_history,
             collector=collector,
         )
         await agent_run_logger_plugin.finalize_collector(

@@ -353,9 +353,9 @@ def _wire_native_core(
         generate_kwargs.update(kwargs)
         return llm_service_module.ReplyResult(
             content="回复内容",
-            interaction_history={"event": "看图", "result": "描述", "emotion": "好奇"},
             favorability_delta=0,
             favorability_reason="无变化",
+            hindsight_target_fingerprint="a" * 64,
         )
 
     monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
@@ -376,7 +376,6 @@ def _wire_native_core(
         return await handler._generate_reply_core(
             message=_make_message(),
             recent_messages=[],
-            interaction_records=[],
             image_urls=image_urls,
             reply_context=None,
             reply_context_requested=False,
@@ -489,7 +488,6 @@ def _wire_delegated_core(
         return await handler._generate_reply_core(
             message=_make_message(),
             recent_messages=[],
-            interaction_records=[],
             image_urls=image_urls,
             reply_context=None,
             reply_context_requested=False,
@@ -532,7 +530,6 @@ def test_native_provider_failure_core_frame_locals_are_cleared(
             handler._generate_reply_core(
                 message=_make_message(),
                 recent_messages=[],
-                interaction_records=[],
                 image_urls=[_CANARY_URL],
                 reply_context=None,
                 reply_context_requested=False,
@@ -580,7 +577,6 @@ def test_native_all_download_unavailable_core_frame_locals_are_cleared(
             handler._generate_reply_core(
                 message=_make_message(),
                 recent_messages=[],
-                interaction_records=[],
                 image_urls=[_CANARY_URL, _CANARY_URL_B],
                 reply_context=None,
                 reply_context_requested=False,
@@ -629,7 +625,6 @@ def test_delegated_all_unavailable_core_frame_locals_are_cleared(
             handler._generate_reply_core(
                 message=_make_message(),
                 recent_messages=[],
-                interaction_records=[],
                 image_urls=[_CANARY_URL],
                 reply_context=None,
                 reply_context_requested=False,

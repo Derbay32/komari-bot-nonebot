@@ -24,6 +24,7 @@ TSK-101 补齐发送前恢复路径的真实组件证据缺口：既有 3 个用
 
 from __future__ import annotations
 
+import asyncio
 import os
 from contextlib import asynccontextmanager, suppress
 from types import SimpleNamespace
@@ -64,6 +65,9 @@ from komari_bot.plugins.user_data.database import UserDataDB
 from komari_bot.plugins.user_data.orm_models import (
     UserFavorabilityAdjustmentLedgerRow,
     UserFavorabilityRow,
+)
+from tests.komari_chat.hindsight_commitment_support import (
+    HindsightServiceDouble,
 )
 
 if TYPE_CHECKING:
@@ -175,12 +179,14 @@ class _E2EStack:
         self.proactive = reservation_service
         self.config = config
         self.repository = ReplyFulfillmentRepository(pool)
+        self.hindsight = HindsightServiceDouble()
         self.commitments = ReplyCommitmentWorkflow(
             repository=self.repository,
             redis=redis_manager,
             proactive_reservation=reservation_service,
             user_data=user_data,
             config_getter=lambda: config,
+            hindsight_memory=self.hindsight,
         )
         self.alerts = ReplyFulfillmentAlertService(
             repository=self.repository,
@@ -327,6 +333,7 @@ def _pending_reply(
     reservation_id: str | None = None,
     group_id: str = _E2E_GROUP_ID,
     user_id: str = _E2E_USER_ID,
+    target_fingerprint: str = "a" * 64,
 ) -> Any:
     fulfillment_id = build_reply_fulfillment_id(
         group_id=group_id,
@@ -347,13 +354,9 @@ def _pending_reply(
         message=message,
         reply_result=handler_module.ReplyResult(
             content="端到端角色回复",
-            interaction_history={
-                "event": "发言",
-                "result": "回复",
-                "emotion": "平静",
-            },
             favorability_delta=5,
             favorability_reason="端到端互动",
+            hindsight_target_fingerprint=target_fingerprint,
         ),
         force_reply=False,
         bot_nickname="小鞠",
@@ -369,14 +372,12 @@ def _pending_reply(
             else (handoff.reservation_id if handoff is not None else None)
         ),
         proactive_handoff=handoff,
+        hindsight_target_fingerprint=target_fingerprint,
     )
 
 
-def _evidence_keys(fulfillment_id: str) -> tuple[str, str]:
-    return (
-        RedisKeys.chat_commit_step(fulfillment_id, "ai_history"),
-        RedisKeys.chat_commit_step(fulfillment_id, "interaction"),
-    )
+def _evidence_keys(fulfillment_id: str) -> tuple[str, ...]:
+    return (RedisKeys.chat_commit_step(fulfillment_id, "ai_history"),)
 
 
 async def _commitment_states(
@@ -478,7 +479,7 @@ async def test_e2e_delivered_reply_full_lifecycle(
                 "proactive_reply_confirmation": "COMPLETED",
                 "favorability_adjustment": "COMPLETED",
                 "assistant_reply_history": "COMPLETED",
-                "interaction_history": "COMPLETED",
+                "hindsight_memory": "COMPLETED",
             }
             # 子项载荷已最小化
             async with stack.pool.acquire() as connection:
@@ -493,9 +494,8 @@ async def test_e2e_delivered_reply_full_lifecycle(
             assert non_null_payloads == 0
 
             # 真实 Redis：两枚幂等证据键持久（TTL=-1，超越旧固定 TTL 语义）
-            ai_key, interaction_key = _evidence_keys(fulfillment_id)
+            (ai_key,) = _evidence_keys(fulfillment_id)
             assert await stack.redis_client.ttl(ai_key) == -1
-            assert await stack.redis_client.ttl(interaction_key) == -1
             # 主动预占已转已送达：冷却键存在
             cooldown_key = f"komari_chat:proactive:cd:{_E2E_GROUP_ID}"
             assert await stack.redis_client.exists(cooldown_key) == 1
@@ -540,7 +540,6 @@ async def test_e2e_delivered_reply_full_lifecycle(
             await _age_terminal_beyond_protection(stack.pool, fulfillment_id)
             assert await stack.commitments.cleanup_terminal_fulfillments() == 1
             assert await stack.redis_client.exists(ai_key) == 0
-            assert await stack.redis_client.exists(interaction_key) == 0
             session = get_session(expire_on_commit=False)
             try:
                 ledger_after = (
@@ -581,6 +580,286 @@ async def test_e2e_delivered_reply_full_lifecycle(
                 *_evidence_keys(fulfillment_id),
                 f"komari_chat:proactive:cd:{_E2E_GROUP_ID}",
                 f"komari_chat:proactive:slots:{_E2E_GROUP_ID}",
+            )
+
+
+@pytest.mark.parametrize(
+    ("delivery_result", "expected_state"),
+    [
+        ("pending_confirmation", "PENDING_CONFIRMATION"),
+        ("not_delivered", "NOT_DELIVERED"),
+    ],
+)
+async def test_e2e_unconfirmed_delivery_never_retains_or_runs_commitments(
+    monkeypatch: pytest.MonkeyPatch,
+    delivery_result: str,
+    expected_state: str,
+) -> None:
+    """TSK-195: pending/unknown and definitive failure write no memory effect."""
+    run_id = uuid4().hex
+    fulfillment_id = build_reply_fulfillment_id(
+        group_id=_E2E_GROUP_ID,
+        trigger_message_id=f"message-{run_id}",
+        trigger_user_id=_E2E_USER_ID,
+    )
+    async with _stack(monkeypatch) as stack:
+        try:
+
+            async def _send(_pending: object) -> ReplyDeliveryResult:
+                return getattr(ReplyDeliveryResult, delivery_result)()
+
+            pending = _pending_reply(run_id, handoff=None)
+            buffer_before = await cast(
+                "Awaitable[int]",
+                stack.redis_client.llen(RedisKeys.buffer(_E2E_GROUP_ID)),
+            )
+            assert await stack.workflow.fulfill(pending, send_reply=_send) is False
+
+            async with stack.pool.acquire() as connection:
+                parent = await connection.fetchrow(
+                    """
+                    SELECT delivery_state, completed_at, reply_content
+                    FROM komari_chat_reply_fulfillments
+                    WHERE fulfillment_id = $1
+                    """,
+                    fulfillment_id,
+                )
+                children = await connection.fetch(
+                    """
+                    SELECT commitment_type, state,
+                           jsonb_typeof(payload) AS payload_type
+                    FROM komari_chat_reply_fulfillment_commitments
+                    WHERE fulfillment_id = $1
+                    ORDER BY commitment_type
+                    """,
+                    fulfillment_id,
+                )
+            assert parent is not None
+            assert parent["delivery_state"] == expected_state
+            assert parent["completed_at"] is None
+            child_state = {str(row["commitment_type"]): row for row in children}
+            assert "hindsight_memory" in child_state
+            assert child_state["hindsight_memory"]["state"] == "PENDING"
+            if expected_state == "PENDING_CONFIRMATION":
+                assert parent["reply_content"] == "端到端角色回复"
+                assert child_state["hindsight_memory"]["payload_type"] == "object"
+            else:
+                assert parent["reply_content"] is None
+                assert child_state["hindsight_memory"]["payload_type"] is None
+            assert all(row["state"] != "COMPLETED" for row in children)
+            assert stack.hindsight.open_calls == []
+            assert stack.hindsight.retain_calls == []
+            assert (
+                await cast(
+                    "Awaitable[int]",
+                    stack.redis_client.llen(RedisKeys.buffer(_E2E_GROUP_ID)),
+                )
+                == buffer_before
+            )
+        finally:
+            await _cleanup_rows(stack.pool, [fulfillment_id])
+            await _cleanup_favorability(f"{fulfillment_id}:favorability")
+            await stack.redis_client.delete(
+                RedisKeys.buffer(_E2E_GROUP_ID),
+                *_evidence_keys(fulfillment_id),
+            )
+
+
+async def test_e2e_memory_recovery_reuses_frozen_request_and_never_resends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TSK-195: a lost retain acknowledgement retries the same IDs, no resend."""
+    from komari_bot.plugins.komari_memory.services.hindsight_service import (
+        HindsightUnavailableError,
+    )
+
+    run_id = uuid4().hex
+    fulfillment_id = build_reply_fulfillment_id(
+        group_id=_E2E_GROUP_ID,
+        trigger_message_id=f"message-{run_id}",
+        trigger_user_id=_E2E_USER_ID,
+    )
+    async with _stack(monkeypatch) as stack:
+        try:
+            stack.hindsight.retain_error = HindsightUnavailableError("request_timeout")
+
+            async def _send(_pending: object) -> ReplyDeliveryResult:
+                return ReplyDeliveryResult.delivered(
+                    platform_message_id=f"platform-{run_id}"
+                )
+
+            pending = _pending_reply(run_id, handoff=None)
+            assert await stack.workflow.fulfill(pending, send_reply=_send) is True
+            states = await _commitment_states(stack.pool, fulfillment_id)
+            assert states["hindsight_memory"] == "RETRY_WAIT"
+            assert states["assistant_reply_history"] == "COMPLETED"
+            assert len(stack.hindsight.retain_calls) == 1
+            first = stack.hindsight.retain_calls[0]
+
+            async with stack.pool.acquire() as connection:
+                await connection.execute(
+                    """
+                    UPDATE komari_chat_reply_fulfillment_commitments
+                    SET next_retry_at = NOW() - INTERVAL '1 second'
+                    WHERE fulfillment_id = $1 AND state = 'RETRY_WAIT'
+                    """,
+                    fulfillment_id,
+                )
+            stack.hindsight.retain_error = None
+            resent: list[object] = []
+
+            async def _sender(_reply: object) -> ReplyDeliveryResult:
+                resent.append(_reply)
+                return ReplyDeliveryResult.delivered("unexpected")
+
+            restarted = _restarted_workflow(
+                stack,
+                {("bot-e2e", "onebot.v11"): _sender},
+            )
+            await restarted.recover_pending()
+
+            states = await _commitment_states(stack.pool, fulfillment_id)
+            assert set(states.values()) == {"COMPLETED"}
+            assert len(stack.hindsight.retain_calls) == 2
+            second = stack.hindsight.retain_calls[1]
+            assert second.source_id == first.source_id
+            assert second.document_id == first.document_id
+            assert second.operation_id == first.operation_id
+            assert second.payload_sha256 == first.payload_sha256
+            assert resent == []
+        finally:
+            await _cleanup_rows(stack.pool, [fulfillment_id])
+            await _cleanup_favorability(f"{fulfillment_id}:favorability")
+            await stack.redis_client.delete(
+                RedisKeys.buffer(_E2E_GROUP_ID),
+                *_evidence_keys(fulfillment_id),
+            )
+
+
+async def test_e2e_actual_hindsight_service_retries_identical_sdk_envelope_without_resend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TSK-195: real caller, doubled official SDK; lost ack retries same envelope."""
+    from komari_bot.plugins.komari_memory.services import (
+        hindsight_service as hindsight_service_module,
+    )
+    from tests.komari_memory.test_hindsight_retain import (
+        BANK_ID,
+        _FakeBackend,
+        _receipt,
+    )
+
+    base_url = "https://hindsight.invalid"
+    api_key = "local-test-key-not-real"
+    target_fingerprint = hindsight_service_module.derive_target_fingerprint(
+        base_url=base_url,
+        bank_id=BANK_ID,
+    )
+
+    backend = _FakeBackend()
+    retain_envelopes: list[dict[str, Any]] = []
+
+    async def _retain(_client: Any, kwargs: dict[str, Any]) -> Any:
+        retain_envelopes.append(dict(kwargs))
+        if len(retain_envelopes) == 1:
+            raise TimeoutError
+        return _receipt(
+            bank_id=str(kwargs["bank_id"]),
+            operation_id=str(kwargs["operation_id"]),
+        )
+
+    backend.retain_handler = _retain
+
+    async def _hindsight_config() -> SimpleNamespace:
+        return SimpleNamespace(
+            plugin_enable=True,
+            hindsight_base_url=base_url,
+            hindsight_api_key=api_key,
+            hindsight_bank_id=BANK_ID,
+            hindsight_request_timeout_seconds=5.0,
+            hindsight_recovery_interval_seconds=0.01,
+        )
+
+    service = hindsight_service_module.HindsightMemoryService(
+        config_getter=_hindsight_config,
+    )
+    monkeypatch.setattr(
+        hindsight_service_module,
+        "_build_client",
+        lambda _settings: backend.build_client(),
+    )
+
+    run_id = uuid4().hex
+    fulfillment_id = build_reply_fulfillment_id(
+        group_id=_E2E_GROUP_ID,
+        trigger_message_id=f"message-{run_id}",
+        trigger_user_id=_E2E_USER_ID,
+    )
+    async with _stack(monkeypatch) as stack:
+        stack.commitments.hindsight_memory = service
+        try:
+            sent: list[object] = []
+
+            async def _send(_pending: object) -> ReplyDeliveryResult:
+                sent.append(_pending)
+                return ReplyDeliveryResult.delivered(
+                    platform_message_id=f"platform-{run_id}"
+                )
+
+            pending = _pending_reply(
+                run_id,
+                handoff=None,
+                target_fingerprint=target_fingerprint,
+            )
+            assert await stack.workflow.fulfill(pending, send_reply=_send) is True
+
+            states = await _commitment_states(stack.pool, fulfillment_id)
+            assert states["favorability_adjustment"] == "COMPLETED"
+            assert states["assistant_reply_history"] == "COMPLETED"
+            assert states["hindsight_memory"] == "RETRY_WAIT"
+            assert len(retain_envelopes) == 1
+            assert len(sent) == 1
+
+            calls_after_first = list(backend.calls)
+            await asyncio.sleep(0.2)
+            assert backend.calls == calls_after_first, "no background polling"
+
+            async with stack.pool.acquire() as connection:
+                await connection.execute(
+                    """
+                    UPDATE komari_chat_reply_fulfillment_commitments
+                    SET next_retry_at = NOW() - INTERVAL '1 second'
+                    WHERE fulfillment_id = $1 AND state = 'RETRY_WAIT'
+                    """,
+                    fulfillment_id,
+                )
+            resent: list[object] = []
+
+            async def _sender(_reply: object) -> ReplyDeliveryResult:
+                resent.append(_reply)
+                return ReplyDeliveryResult.delivered("unexpected")
+
+            restarted = _restarted_workflow(
+                stack,
+                {("bot-e2e", "onebot.v11"): _sender},
+            )
+            await restarted.recover_pending()
+
+            states = await _commitment_states(stack.pool, fulfillment_id)
+            assert set(states.values()) == {"COMPLETED"}
+            assert len(retain_envelopes) == 2
+            assert retain_envelopes[0] == retain_envelopes[1]
+            assert retain_envelopes[0]["retain_async"] is True
+            assert retain_envelopes[0]["bank_id"] == BANK_ID
+            assert len(sent) == 1
+            assert resent == []
+        finally:
+            await service.close()
+            await _cleanup_rows(stack.pool, [fulfillment_id])
+            await _cleanup_favorability(f"{fulfillment_id}:favorability")
+            await stack.redis_client.delete(
+                RedisKeys.buffer(_E2E_GROUP_ID),
+                *_evidence_keys(fulfillment_id),
             )
 
 
@@ -625,21 +904,17 @@ async def test_e2e_unresolved_fulfillment_keeps_persistent_evidence(
             states = await _commitment_states(stack.pool, fulfillment_id)
             assert states["favorability_adjustment"] == "RETRY_WAIT"
             assert states["assistant_reply_history"] == "COMPLETED"
-            assert states["interaction_history"] == "COMPLETED"
+            assert states["hindsight_memory"] == "COMPLETED"
             assert "proactive_reply_confirmation" not in states
 
             # 证据键持久：即使超过任何旧固定 TTL 窗口也不会自动消失
-            ai_key, interaction_key = _evidence_keys(fulfillment_id)
+            (ai_key,) = _evidence_keys(fulfillment_id)
             assert await stack.redis_client.ttl(ai_key) == -1
-            assert await stack.redis_client.ttl(interaction_key) == -1
             buffer_before = await cast(
                 "Awaitable[int]",
                 stack.redis_client.llen(RedisKeys.buffer(_E2E_GROUP_ID)),
             )
-            interaction_before = await cast(
-                "Awaitable[int]",
-                stack.redis_client.llen(RedisKeys.global_interaction(_E2E_USER_ID)),
-            )
+            retain_before = len(stack.hindsight.retain_calls)
 
             # 恢复：好感度补兑现；已完成两项由证据键幂等跳过
             async with stack.pool.acquire() as connection:
@@ -655,14 +930,14 @@ async def test_e2e_unresolved_fulfillment_keeps_persistent_evidence(
 
             states = await _commitment_states(stack.pool, fulfillment_id)
             assert set(states.values()) == {"COMPLETED"}
-            assert await cast(
-                "Awaitable[int]",
-                stack.redis_client.llen(RedisKeys.buffer(_E2E_GROUP_ID)),
-            ) == buffer_before
-            assert await cast(
-                "Awaitable[int]",
-                stack.redis_client.llen(RedisKeys.global_interaction(_E2E_USER_ID)),
-            ) == interaction_before
+            assert (
+                await cast(
+                    "Awaitable[int]",
+                    stack.redis_client.llen(RedisKeys.buffer(_E2E_GROUP_ID)),
+                )
+                == buffer_before
+            )
+            assert len(stack.hindsight.retain_calls) == retain_before == 1
             score = await stack.user_data.get_user_favorability(_E2E_USER_ID)
             assert score.favorability == 105
         finally:
@@ -670,9 +945,6 @@ async def test_e2e_unresolved_fulfillment_keeps_persistent_evidence(
             await _cleanup_favorability(f"{fulfillment_id}:favorability")
             await stack.redis_client.delete(*_evidence_keys(fulfillment_id))
             await stack.redis_client.delete(RedisKeys.buffer(_E2E_GROUP_ID))
-            await stack.redis_client.delete(
-                RedisKeys.global_interaction(_E2E_USER_ID)
-            )
 
 
 async def test_e2e_cleanup_never_deletes_tombstone_before_all_evidence(
@@ -692,6 +964,7 @@ async def test_e2e_cleanup_never_deletes_tombstone_before_all_evidence(
     )
     async with _stack(monkeypatch) as stack:
         try:
+
             async def _send(_pending: object) -> ReplyDeliveryResult:
                 return ReplyDeliveryResult.delivered(
                     platform_message_id=f"platform-{run_id}"
@@ -700,7 +973,7 @@ async def test_e2e_cleanup_never_deletes_tombstone_before_all_evidence(
             pending = _pending_reply(run_id, handoff=None)
             assert await stack.workflow.fulfill(pending, send_reply=_send) is True
             await _age_terminal_beyond_protection(stack.pool, fulfillment_id)
-            ai_key, interaction_key = _evidence_keys(fulfillment_id)
+            (ai_key,) = _evidence_keys(fulfillment_id)
 
             # 第一轮：Redis 证据删除失败 → tombstone 必须保留
             original_redis_delete = stack.redis.delete_chat_commit_evidence
@@ -724,7 +997,7 @@ async def test_e2e_cleanup_never_deletes_tombstone_before_all_evidence(
             assert parent["idempotency_evidence_cleared_at"] is None
 
             # 第二轮：Redis 证据删除成功、好感度删除失败 → tombstone 仍保留
-            #（显式恢复原方法，不用 monkeypatch.undo() 以免误伤 stack 装配）
+            # （显式恢复原方法，不用 monkeypatch.undo() 以免误伤 stack 装配）
             stack.redis.delete_chat_commit_evidence = original_redis_delete  # type: ignore[method-assign]
 
             async def _fail_ledger_delete(_operation_id: str) -> bool:
@@ -733,7 +1006,6 @@ async def test_e2e_cleanup_never_deletes_tombstone_before_all_evidence(
             stack.user_data.delete_favorability_operation = _fail_ledger_delete  # type: ignore[method-assign]
             assert await stack.commitments.cleanup_terminal_fulfillments() == 0
             assert await stack.redis_client.exists(ai_key) == 0
-            assert await stack.redis_client.exists(interaction_key) == 0
             async with stack.pool.acquire() as connection:
                 parent = await connection.fetchrow(
                     """
@@ -765,9 +1037,6 @@ async def test_e2e_cleanup_never_deletes_tombstone_before_all_evidence(
             await _cleanup_favorability(f"{fulfillment_id}:favorability")
             await stack.redis_client.delete(*_evidence_keys(fulfillment_id))
             await stack.redis_client.delete(RedisKeys.buffer(_E2E_GROUP_ID))
-            await stack.redis_client.delete(
-                RedisKeys.global_interaction(_E2E_USER_ID)
-            )
 
 
 async def test_e2e_recovery_after_prepare_crash_resends_and_advances_all_commitments(
@@ -793,9 +1062,7 @@ async def test_e2e_recovery_after_prepare_crash_resends_and_advances_all_commitm
     cooldown_key, slots_key = _reservation_keys(group_id)
     async with _stack(monkeypatch) as stack:
         try:
-            lease = await stack.proactive.reserve(
-                group_id, f"reservation-{run_id}"
-            )
+            lease = await stack.proactive.reserve(group_id, f"reservation-{run_id}")
             assert isinstance(lease, proactive_module.ProactiveLease)
             async with lease:
                 handoff = await lease.handoff()
@@ -863,11 +1130,10 @@ async def test_e2e_recovery_after_prepare_crash_resends_and_advances_all_commitm
                 "proactive_reply_confirmation": "COMPLETED",
                 "favorability_adjustment": "COMPLETED",
                 "assistant_reply_history": "COMPLETED",
-                "interaction_history": "COMPLETED",
+                "hindsight_memory": "COMPLETED",
             }
-            ai_key, interaction_key = _evidence_keys(fulfillment_id)
+            (ai_key,) = _evidence_keys(fulfillment_id)
             assert await stack.redis_client.ttl(ai_key) == -1
-            assert await stack.redis_client.ttl(interaction_key) == -1
             # 主动预占已确认：冷却键存在
             assert await stack.redis_client.exists(cooldown_key) == 1
 
@@ -893,14 +1159,13 @@ async def test_e2e_recovery_after_prepare_crash_resends_and_advances_all_commitm
             assert ledger_count == 1
 
             # AI 历史与互动缓冲各写入一条
-            assert await cast(
-                "Awaitable[int]",
-                stack.redis_client.llen(RedisKeys.buffer(group_id)),
-            ) == 1
-            assert await cast(
-                "Awaitable[int]",
-                stack.redis_client.llen(RedisKeys.global_interaction(user_id)),
-            ) == 1
+            assert (
+                await cast(
+                    "Awaitable[int]",
+                    stack.redis_client.llen(RedisKeys.buffer(group_id)),
+                )
+                == 1
+            )
             # 子项载荷已最小化
             async with stack.pool.acquire() as connection:
                 non_null_payloads = await connection.fetchval(
@@ -923,7 +1188,6 @@ async def test_e2e_recovery_after_prepare_crash_resends_and_advances_all_commitm
                 cooldown_key,
                 slots_key,
                 RedisKeys.buffer(group_id),
-                RedisKeys.global_interaction(user_id),
             )
 
 
@@ -948,9 +1212,7 @@ async def test_e2e_crash_after_send_start_registered_is_never_resent(
     cooldown_key, slots_key = _reservation_keys(group_id)
     async with _stack(monkeypatch) as stack:
         try:
-            lease = await stack.proactive.reserve(
-                group_id, f"reservation-{run_id}"
-            )
+            lease = await stack.proactive.reserve(group_id, f"reservation-{run_id}")
             assert isinstance(lease, proactive_module.ProactiveLease)
             async with lease:
                 handoff = await lease.handoff()
@@ -966,8 +1228,7 @@ async def test_e2e_crash_after_send_start_registered_is_never_resent(
                 user_id=user_id,
             )
             assert (
-                await stack.workflow.fulfill(pending, send_reply=_send_unknown)
-                is False
+                await stack.workflow.fulfill(pending, send_reply=_send_unknown) is False
             )
             async with stack.pool.acquire() as connection:
                 parent = await connection.fetchrow(
@@ -983,10 +1244,7 @@ async def test_e2e_crash_after_send_start_registered_is_never_resent(
             assert parent["send_started_at"] is not None
             assert parent["platform_message_id"] is None
             # 崩溃后预占仍真实占用
-            assert (
-                await stack.redis_client.get(cooldown_key)
-                == handoff.reservation_id
-            )
+            assert await stack.redis_client.get(cooldown_key) == handoff.reservation_id
             assert (
                 await stack.redis_client.zscore(slots_key, reservation_member)
                 is not None
@@ -1018,10 +1276,7 @@ async def test_e2e_crash_after_send_start_registered_is_never_resent(
                 )
             assert after is not None
             assert after["delivery_state"] == "PENDING_CONFIRMATION"
-            assert (
-                await stack.redis_client.get(cooldown_key)
-                == handoff.reservation_id
-            )
+            assert await stack.redis_client.get(cooldown_key) == handoff.reservation_id
             assert (
                 await stack.redis_client.zscore(slots_key, reservation_member)
                 is not None
@@ -1051,9 +1306,7 @@ async def test_e2e_recovery_sender_unknown_result_keeps_pending_without_resend(
     cooldown_key, slots_key = _reservation_keys(group_id)
     async with _stack(monkeypatch) as stack:
         try:
-            lease = await stack.proactive.reserve(
-                group_id, f"reservation-{run_id}"
-            )
+            lease = await stack.proactive.reserve(group_id, f"reservation-{run_id}")
             assert isinstance(lease, proactive_module.ProactiveLease)
             async with lease:
                 handoff = await lease.handoff()
@@ -1082,10 +1335,7 @@ async def test_e2e_recovery_sender_unknown_result_keeps_pending_without_resend(
             assert await restarted.recover_pending() == 0
             assert recovery_send_count == 1
             # 保守待确认：预占仍真实占用
-            assert (
-                await stack.redis_client.get(cooldown_key)
-                == handoff.reservation_id
-            )
+            assert await stack.redis_client.get(cooldown_key) == handoff.reservation_id
             assert (
                 await stack.redis_client.zscore(slots_key, reservation_member)
                 is not None
@@ -1214,8 +1464,7 @@ async def test_e2e_recovery_only_claims_exact_original_bot_identity(
                     [match_id, mismatch_id],
                 )
             by_id = {
-                str(row["fulfillment_id"]): str(row["delivery_state"])
-                for row in rows
+                str(row["fulfillment_id"]): str(row["delivery_state"]) for row in rows
             }
             assert by_id[match_id] == "DELIVERED"
             assert by_id[mismatch_id] == "NOT_STARTED"
@@ -1228,7 +1477,6 @@ async def test_e2e_recovery_only_claims_exact_original_bot_identity(
             await stack.redis_client.delete(
                 *_evidence_keys(match_id),
                 RedisKeys.buffer(group_id),
-                RedisKeys.global_interaction(user_id),
             )
 
 
@@ -1253,17 +1501,12 @@ async def test_e2e_recovery_expiration_releases_real_reservation_and_minimizes_p
     cooldown_key, slots_key = _reservation_keys(group_id)
     async with _stack(monkeypatch) as stack:
         try:
-            lease = await stack.proactive.reserve(
-                group_id, f"reservation-{run_id}"
-            )
+            lease = await stack.proactive.reserve(group_id, f"reservation-{run_id}")
             assert isinstance(lease, proactive_module.ProactiveLease)
             async with lease:
                 handoff = await lease.handoff()
             reservation_member = f"pending:{handoff.reservation_id}"
-            assert (
-                await stack.redis_client.get(cooldown_key)
-                == handoff.reservation_id
-            )
+            assert await stack.redis_client.get(cooldown_key) == handoff.reservation_id
             assert (
                 await stack.redis_client.zscore(slots_key, reservation_member)
                 is not None
@@ -1322,14 +1565,10 @@ async def test_e2e_recovery_expiration_releases_real_reservation_and_minimizes_p
             # 真实 Redis：预占被真实释放，重复释放不再生效
             assert await stack.redis_client.exists(cooldown_key) == 0
             assert (
-                await stack.redis_client.zscore(slots_key, reservation_member)
-                is None
+                await stack.redis_client.zscore(slots_key, reservation_member) is None
             )
             assert (
-                await stack.proactive.release(
-                    group_id, handoff.reservation_id
-                )
-                is False
+                await stack.proactive.release(group_id, handoff.reservation_id) is False
             )
         finally:
             await _cleanup_rows(stack.pool, [fulfillment_id])

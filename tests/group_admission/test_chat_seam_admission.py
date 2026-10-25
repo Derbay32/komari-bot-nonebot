@@ -381,7 +381,6 @@ async def _run_recall_core(handler: Any) -> Any:
     return await handler._generate_reply_core(
         message=message,
         recent_messages=[],
-        interaction_records=[],
         image_urls=None,
         reply_context=None,
         reply_context_requested=False,
@@ -445,7 +444,6 @@ def _patch_recall_core(
             generate_calls.append(kwargs)
         return llm.ReplyResult(
             content="ok",
-            interaction_history={"event": "e", "result": "r", "emotion": "m"},
             favorability_delta=0,
             favorability_reason="无变化",
         )

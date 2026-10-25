@@ -232,11 +232,7 @@ def test_generate_reply_does_not_delegate_logging_to_provider(monkeypatch: Any) 
     )
 
     assert result.content == "今天就陪陪Master"
-    assert result.interaction_history == {
-        "event": "向我打招呼",
-        "result": "陪他说话",
-        "emotion": "开心",
-    }
+    assert not hasattr(result, "interaction_history")
     assert "record_chat_log" not in fake_provider.completion_calls[0]
     assert fake_provider.completion_calls[0]["request_trace_id"] == "chat-2001"
     assert fake_provider.completion_calls[0]["tool_choice"] == "required"
@@ -646,10 +642,10 @@ def test_generate_reply_with_tools_retries_invalid_final_response_in_same_sessio
     )
 
 
-def test_generate_reply_with_tools_rejects_final_response_without_interaction_history(
+def test_generate_reply_with_tools_accepts_final_response_without_interaction_history(
     monkeypatch: Any,
 ) -> None:
-    """TSK-193：final_response 缺少 interaction_history 不得成功。"""
+    """TSK-195: the retired interaction record is no longer required."""
     fake_provider = _FakeLLMProvider("")
     fake_provider.completions = [
         SimpleNamespace(
@@ -658,26 +654,8 @@ def test_generate_reply_with_tools_rejects_final_response_without_interaction_hi
                 _tool_call(
                     "final_response",
                     "{}",
-                    {"content": "缺互动记录的回复"},
-                    call_id="call-final-no-history",
-                )
-            ],
-        ),
-        SimpleNamespace(
-            content="",
-            tool_calls=[
-                _tool_call(
-                    "final_response",
-                    "{}",
-                    {
-                        "content": "补完互动记录后输出",
-                        "interaction_history": {
-                            "event": "首次缺互动记录",
-                            "result": "补完后正常输出",
-                            "emotion": "平静",
-                        },
-                    },
-                    call_id="call-final-history-ok",
+                    {"content": "仅正文的回复"},
+                    call_id="call-final-content-only",
                 )
             ],
         ),
@@ -689,24 +667,19 @@ def test_generate_reply_with_tools_rejects_final_response_without_interaction_hi
             config=_build_config(),
             messages=[{"role": "user", "content": "不带互动记录"}],
             tools=[llm_service_module.SEARCH_WEB_TOOL],
-            request_trace_id="chat-no-history-1",
+            request_trace_id="chat-content-only-1",
         )
     )
 
-    assert result.content == "补完互动记录后输出"
-    second_messages = fake_provider.completion_calls[1]["messages"]
-    assert any(
-        message.get("role") == "tool"
-        and message.get("tool_call_id") == "call-final-no-history"
-        and "interaction_history" in str(message.get("content", ""))
-        for message in second_messages
-    )
+    assert result.content == "仅正文的回复"
+    assert result.hindsight_target_fingerprint is None
+    assert len(fake_provider.completion_calls) == 1
 
 
-def test_generate_reply_with_tools_rejects_final_response_with_incomplete_history(
+def test_generate_reply_with_tools_ignores_legacy_interaction_history_shape(
     monkeypatch: Any,
 ) -> None:
-    """TSK-193：final_response.interaction_history 缺 event/result/emotion 不得成功。"""
+    """Legacy event/result/emotion shapes are not parsed as a protocol."""
     fake_provider = _FakeLLMProvider("")
     fake_provider.completions = [
         SimpleNamespace(
@@ -716,28 +689,11 @@ def test_generate_reply_with_tools_rejects_final_response_with_incomplete_histor
                     "final_response",
                     "{}",
                     {
-                        "content": "缺 emotion 的回复",
+                        "content": "正文照常输出",
                         "interaction_history": {"event": "e", "result": "r"},
+                        "hindsight_target_fingerprint": "f" * 64,
                     },
-                    call_id="call-final-incomplete",
-                )
-            ],
-        ),
-        SimpleNamespace(
-            content="",
-            tool_calls=[
-                _tool_call(
-                    "final_response",
-                    "{}",
-                    {
-                        "content": "补全 emotion 后输出",
-                        "interaction_history": {
-                            "event": "首次缺 emotion",
-                            "result": "补全后正常输出",
-                            "emotion": "平静",
-                        },
-                    },
-                    call_id="call-final-complete",
+                    call_id="call-final-legacy-shape",
                 )
             ],
         ),
@@ -749,19 +705,13 @@ def test_generate_reply_with_tools_rejects_final_response_with_incomplete_histor
             config=_build_config(),
             messages=[{"role": "user", "content": "残缺互动记录"}],
             tools=[llm_service_module.SEARCH_WEB_TOOL],
-            request_trace_id="chat-incomplete-history-1",
+            request_trace_id="chat-legacy-shape-1",
         )
     )
 
-    assert result.content == "补全 emotion 后输出"
-    second_messages = fake_provider.completion_calls[1]["messages"]
-    assert any(
-        message.get("role") == "tool"
-        and message.get("tool_call_id") == "call-final-incomplete"
-        and "event" in str(message.get("content", ""))
-        and "emotion" in str(message.get("content", ""))
-        for message in second_messages
-    )
+    assert result.content == "正文照常输出"
+    assert result.hindsight_target_fingerprint is None
+    assert len(fake_provider.completion_calls) == 1
 
 
 def test_generate_reply_with_tools_does_not_repeat_successful_search_after_final_response_error(

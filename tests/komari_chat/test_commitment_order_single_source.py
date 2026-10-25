@@ -19,7 +19,7 @@ KNOWN_COMMITMENT_TYPES = (
     "proactive_reply_confirmation",
     "favorability_adjustment",
     "assistant_reply_history",
-    "interaction_history",
+    "hindsight_memory",
 )
 
 

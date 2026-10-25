@@ -237,7 +237,6 @@ def _wire_entry(
         generate_calls.append(kwargs)
         return llm.ReplyResult(
             content="回复正文",
-            interaction_history={"event": "e", "result": "r", "emotion": "m"},
             favorability_delta=0,
             favorability_reason="测试",
         )
@@ -1305,13 +1304,21 @@ async def test_real_service_keeps_one_config_snapshot_across_candidate_and_recal
 
     service = HindsightMemoryService(config_getter=_config_getter)
     handler = _handler(service)
+    frozen_target = hindsight_service.derive_target_fingerprint(
+        base_url=state["config"].hindsight_base_url,
+        bank_id=BANK_ID,
+    )
+
+    def _rotate_during_candidate() -> None:
+        state["config"] = _service_config(hindsight_bank_id="rotated-bank")
+
+    backend.on_document = _rotate_during_candidate
 
     async def _generate(**kwargs: Any) -> Any:
         session = kwargs["recall_session"]
         await session.recall("tool recall")
         return llm.ReplyResult(
             content="回复正文",
-            interaction_history={"event": "e", "result": "r", "emotion": "m"},
             favorability_delta=0,
             favorability_reason="测试",
         )
@@ -1322,7 +1329,9 @@ async def test_real_service_keeps_one_config_snapshot_across_candidate_and_recal
     pending = await _run(handler, dispatch)
 
     assert pending is not None
-    state["config"] = _service_config(hindsight_bank_id="rotated-bank")
+    assert state["config"].hindsight_bank_id == "rotated-bank"
+    assert pending.hindsight_target_fingerprint == frozen_target
+    assert pending.reply_result.hindsight_target_fingerprint == frozen_target
     recall_banks = [call[1]["bank_id"] for call in backend.calls if call[0] == "recall"]
     retain_banks = [call[1]["bank_id"] for call in backend.calls if call[0] == "retain"]
     assert recall_banks

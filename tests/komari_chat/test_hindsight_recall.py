@@ -143,9 +143,9 @@ def _wire_core(
         generate_calls.append(kwargs)
         return llm.ReplyResult(
             content="回复",
-            interaction_history={"event": "e", "result": "r", "emotion": "m"},
             favorability_delta=0,
             favorability_reason="无变化",
+            hindsight_target_fingerprint="a" * 64,
         )
 
     monkeypatch.setattr(message_handler_module, "get_config", lambda: _config())
@@ -167,7 +167,6 @@ async def _run_core(handler: Any, message: Any | None = None) -> Any:
     return await handler._generate_reply_core(
         message=message or _message(),
         recent_messages=[],
-        interaction_records=[],
         image_urls=None,
         reply_context=None,
         reply_context_requested=False,
@@ -339,9 +338,9 @@ async def test_session_opens_before_query_rewrite(
         order.append("provider")
         return llm.ReplyResult(
             content="回复",
-            interaction_history={"event": "e", "result": "r", "emotion": "m"},
             favorability_delta=0,
             favorability_reason="无变化",
+            hindsight_target_fingerprint="a" * 64,
         )
 
     monkeypatch.setattr(message_handler_module, "get_config", lambda: _config())
