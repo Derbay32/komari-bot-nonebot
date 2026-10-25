@@ -389,6 +389,87 @@ async def _run_recall_core(handler: Any) -> Any:
     )
 
 
+class _BlockingContextRedis:
+    """Recent-context double whose existing-buffer read pauses the turn."""
+
+    def __init__(self) -> None:
+        self.read_started = asyncio.Event()
+        self.read_release = asyncio.Event()
+        self.pushed: list[Any] = []
+        self.buffer: list[Any] = []
+
+    async def get_buffer(self, _group_id: str, *, limit: int = 10) -> list[Any]:
+        del limit
+        self.read_started.set()
+        await self.read_release.wait()
+        return list(self.buffer)
+
+    async def push_message(self, _group_id: str, message: Any) -> None:
+        self.pushed.append(message)
+        self.buffer.append(message)
+
+
+@pytest.mark.parametrize("state", ["restricted", "failed"])
+async def test_context_push_rechecks_live_admission_after_buffer_await(
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+) -> None:
+    """Denied current-context write returns not-stored and performs no push."""
+    from komari_bot.plugins.group_admission import AdmissionIntent
+
+    scripted = ScriptedAdjudicate("admitted")
+    install_scripted_adjudicate(monkeypatch, scripted)
+    redis = _BlockingContextRedis()
+    handler = mh.MessageHandler.__new__(mh.MessageHandler)
+    handler.redis = redis
+    monkeypatch.setattr(
+        mh,
+        "get_config",
+        lambda: SimpleNamespace(
+            context_messages_limit=10,
+            context_max_utf8_bytes=24_000,
+            context_max_estimated_tokens=6_000,
+        ),
+    )
+    previous = mh.MessageSchema(
+        user_id="u-old",
+        user_nickname="旧消息",
+        group_id=str(GROUP_ID),
+        content="旧上下文",
+        timestamp=1.0,
+        message_id="old-1",
+    )
+    current = mh.MessageSchema(
+        user_id="u-current",
+        user_nickname="当前用户",
+        group_id=str(GROUP_ID),
+        content="当前消息",
+        timestamp=2.0,
+        message_id="current-1",
+    )
+    redis.buffer.append(previous)
+
+    task = asyncio.create_task(
+        handler._read_buffers(
+            group_id=str(GROUP_ID),
+            message=current,
+            store_current=True,
+        )
+    )
+    await asyncio.wait_for(redis.read_started.wait(), timeout=2)
+    scripted.set_state(state)
+    redis.read_release.set()
+    recent, stored = await asyncio.wait_for(task, timeout=2)
+
+    assert stored is False
+    assert [message.message_id for message in recent] == ["old-1"]
+    assert redis.pushed == []
+    assert len(scripted.calls) == 1
+    groups, intent = scripted.calls[0]
+    assert groups == (GROUP_ID,)
+    assert intent is AdmissionIntent.BUSINESS
+
+
 def _patch_recall_core(
     monkeypatch: pytest.MonkeyPatch,
     *,
