@@ -21,6 +21,7 @@ from komari_bot.plugins.komari_chat.config_schema import (
     KomariChatConfigSchema,  # noqa: TC001
 )
 
+from .admission_gate import effect_business_admitted
 from .prompt_template import get_template
 from .reply_context import ReplyContext  # noqa: TC001
 
@@ -394,6 +395,9 @@ async def build_prompt(
             knowledge_results = await komari_knowledge.search_knowledge(
                 query=query_for_search,
                 limit=config.knowledge_limit,
+                embedding_guard=lambda: effect_business_admitted(
+                    group_id=lookup_group_id
+                ),
             )
             if knowledge_results:
                 dynamic_parts.extend(

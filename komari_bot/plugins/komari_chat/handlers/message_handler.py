@@ -943,9 +943,17 @@ class MessageHandler:
         """处理低价值消息（直接丢弃，不存储）。"""
         logger.debug("[KomariMemory] 低价值消息已丢弃: {}...", message.content[:30])
 
-    async def _handle_normal_message(self, message: MessageSchema) -> None:
-        """处理普通消息（连续追加到当前会话缓冲区）。"""
+    async def _handle_normal_message(self, message: MessageSchema) -> bool:
+        """Append one admitted message to the current-group recent buffer.
+
+        The admission check is the last synchronous step before starting the
+        Redis write.  A denied write reports ``False`` so ``_read_buffers``
+        cannot claim the current trigger was stored.
+        """
+        if not effect_business_admitted(group_id=message.group_id):
+            return False
         await self.redis.push_message(message.group_id, message)
+        return True
 
     def _schedule_reply_reaction(
         self,
@@ -1180,8 +1188,7 @@ class MessageHandler:
         )
 
         if store_current:
-            await self._handle_normal_message(message)
-            stored = True
+            stored = await self._handle_normal_message(message)
 
         return recent_messages, stored
 

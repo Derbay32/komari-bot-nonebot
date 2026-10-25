@@ -7,6 +7,7 @@ generation, platform calls, persistence adapter for decision rows) is replaced.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from dataclasses import dataclass, field
@@ -78,6 +79,20 @@ class _Redis:
     ) -> list[dict[str, object]]:
         del limit
         return []
+
+
+class _BlockingRedis(_Redis):
+    """_Redis whose existing-buffer read can be paused by the test."""
+
+    def __init__(self, buffer: list[Any] | None = None) -> None:
+        super().__init__(buffer)
+        self.read_started = asyncio.Event()
+        self.read_release = asyncio.Event()
+
+    async def get_buffer(self, group_id: str, *, limit: int = 10) -> list[Any]:
+        self.read_started.set()
+        await self.read_release.wait()
+        return await super().get_buffer(group_id, limit=limit)
 
 
 class _CooldownRedis:
@@ -873,9 +888,10 @@ async def test_duplicate_or_cancelled_decision_has_no_memory_effect(
     assert wired.generate_calls == []
 
 
-async def test_candidate_submission_failure_stores_once_and_stops_generation(
+async def test_admitted_candidate_submission_failure_stores_once_and_stops_generation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Admitted positive control: one rejected retain keeps context once."""
     wired = _wire_entry(monkeypatch)
     memory = FakeHindsightMemory(
         retain_error=HindsightUnavailableError("response_invalid")
@@ -936,7 +952,159 @@ async def test_admission_revoked_before_chat_session_open_skips_all_memory_io(
     assert result is None
     assert memory.open_calls == 0
     assert memory.retain_calls == []
-    assert len(redis.pushed) == 1
+    assert redis.pushed == []
+
+
+@pytest.mark.parametrize("state", ["restricted", "failed"])
+async def test_post_handoff_admission_loss_never_stores_or_opens_memory(
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+) -> None:
+    from tests.group_admission.chat_admission_support import (
+        ScriptedAdjudicate,
+        install_scripted_adjudicate,
+    )
+
+    wired = _wire_entry(monkeypatch)
+    admission = ScriptedAdjudicate("admitted")
+    install_scripted_adjudicate(monkeypatch, admission)
+    memory = FakeHindsightMemory()
+    redis = _Redis()
+    handler = _handler(memory, redis=redis)
+    dispatch = _ScriptedDispatch(_request(), _result(route="chat", force_reply=True))
+    original_claim = dispatch.claim_handoff
+
+    async def _claim(route: str) -> bool:
+        claimed = await original_claim(route)
+        admission.set_state(state)
+        return claimed
+
+    monkeypatch.setattr(dispatch, "claim_handoff", _claim)
+
+    result = await _run(handler, dispatch)
+
+    assert result is None
+    assert dispatch.claim_routes == ["chat"]
+    assert memory.open_calls == 0
+    assert memory.retain_calls == []
+    assert redis.pushed == []
+    assert wired.generate_calls == []
+    assert handler.reply_fulfillment.pending == []
+
+
+@pytest.mark.parametrize("state", ["restricted", "failed"])
+async def test_session_open_failure_after_admission_loss_never_stores(
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+) -> None:
+    from tests.group_admission.chat_admission_support import (
+        ScriptedAdjudicate,
+        install_scripted_adjudicate,
+    )
+
+    _wire_entry(monkeypatch)
+    admission = ScriptedAdjudicate("admitted")
+    install_scripted_adjudicate(monkeypatch, admission)
+    memory = FakeHindsightMemory(
+        open_error=HindsightUnavailableError("bank_unavailable")
+    )
+    original_open = memory.open_session
+
+    def _open_session(**kwargs: Any) -> Any:
+        admission.set_state(state)
+        return original_open(**kwargs)
+
+    monkeypatch.setattr(memory, "open_session", _open_session)
+    redis = _Redis()
+    handler = _handler(memory, redis=redis)
+    dispatch = _ScriptedDispatch(_request(), _result(route="chat", force_reply=True))
+
+    result = await _run(handler, dispatch)
+
+    assert result is None
+    assert memory.open_calls == 1
+    assert memory.retain_calls == []
+    assert redis.pushed == []
+    assert handler.reply_fulfillment.pending == []
+
+
+@pytest.mark.parametrize("state", ["restricted", "failed"])
+async def test_retain_failure_after_admission_loss_never_stores_retry_context(
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+) -> None:
+    from tests.group_admission.chat_admission_support import (
+        ScriptedAdjudicate,
+        install_scripted_adjudicate,
+    )
+
+    wired = _wire_entry(monkeypatch)
+    admission = ScriptedAdjudicate("admitted")
+    install_scripted_adjudicate(monkeypatch, admission)
+    memory = FakeHindsightMemory()
+
+    async def _retain(_session: Any, _request: Any, _guard: Any) -> None:
+        admission.set_state(state)
+        raise HindsightUnavailableError("retain_failed")
+
+    memory.retain_handler = _retain
+    redis = _Redis()
+    handler = _handler(memory, redis=redis)
+    decisions: list[dict[str, object]] = []
+    handler._log_decision = decisions.append
+    dispatch = _ScriptedDispatch(_request(), _result(route="chat", force_reply=True))
+
+    result = await _run(handler, dispatch)
+
+    assert result is None
+    assert len(memory.retain_calls) == 1
+    assert memory.sessions[0].retain_observations == [True]
+    assert redis.pushed == []
+    assert wired.generate_calls == []
+    assert handler.reply_fulfillment.pending == []
+    assert decisions[-1]["reply_action"] == "memory_failed"
+    assert decisions[-1]["memory_failure_reason"] == "retain_failed"
+
+
+@pytest.mark.parametrize("state", ["restricted", "failed"])
+async def test_admission_loss_while_buffer_read_awaits_reports_not_stored(
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+) -> None:
+    from tests.group_admission.chat_admission_support import (
+        ScriptedAdjudicate,
+        install_scripted_adjudicate,
+    )
+
+    wired = _wire_entry(monkeypatch)
+    admission = ScriptedAdjudicate("admitted")
+    install_scripted_adjudicate(monkeypatch, admission)
+    memory = FakeHindsightMemory()
+    redis = _BlockingRedis()
+    handler = _handler(memory, redis=redis)
+    dispatch = _ScriptedDispatch(_request(), _result(route="chat", force_reply=True))
+    attempts: list[tuple[Any, bool, Any]] = []
+    original_attempt = handler._attempt_reply
+
+    async def _attempt(**kwargs: Any) -> Any:
+        outcome = await original_attempt(**kwargs)
+        attempts.append(outcome)
+        return outcome
+
+    monkeypatch.setattr(handler, "_attempt_reply", _attempt)
+
+    task = asyncio.create_task(_run(handler, dispatch))
+    await asyncio.wait_for(redis.read_started.wait(), timeout=2)
+    admission.set_state(state)
+    redis.read_release.set()
+    result = await asyncio.wait_for(task, timeout=2)
+
+    assert result is None
+    assert attempts and attempts[0][1] is False
+    assert redis.pushed == []
+    assert len(memory.retain_calls) == 1
+    assert wired.generate_calls == []
+    assert handler.reply_fulfillment.pending == []
 
 
 async def test_candidate_engine_fault_is_never_reported_as_normal_filtering(
@@ -1284,7 +1452,9 @@ async def test_real_service_group_revocation_during_preflight_blocks_actual_reta
     pending = await _run(handler, dispatch)
 
     assert pending is None
-    assert len(redis.pushed) == 1
+    # Revocation is checked again immediately before the recent-context write;
+    # a denied candidate must not leave a standalone retry copy behind.
+    assert redis.pushed == []
     assert not [call for call in backend.calls if call[0] == "retain"]
     assert decisions[-1]["reply_action"] == "memory_failed"
     assert decisions[-1]["memory_failure_reason"] == "submission_not_admitted"
