@@ -58,6 +58,7 @@ NEW_CHAT_CONFIG_FIELDS: set[str] = {
 
 #: 协调式破坏升级后必须从管理面消失的旧字段。
 REMOVED_CHAT_CONFIG_FIELDS: set[str] = {
+    "memory_search_limit",  # 无调用方的死配置（0031 退役）
     "vision_tool_enabled",  # 旧图片开关（TSK-194 已删）
     "output_instruction",  # 旧聊天 Prompt 输出协议（TSK-190 已删）
     "reply_commit_worker_interval_seconds",  # 0011 改名
@@ -108,6 +109,7 @@ async def test_config_api_exposes_only_new_chat_contract_fields(
     """AC5：管理 API 的 komari_chat 资源只暴露新字段，不再出现旧字段。"""
     schema = ensure_typed_config_model("komari_chat")
     assert schema is not None, "komari_chat 强类型配置 Schema 必须可加载"
+    assert "memory_search_limit" not in schema.model_fields
 
     async with app.test_server(
         asgi=cast("Any", _build_chat_config_app(schema)),
@@ -121,19 +123,27 @@ async def test_config_api_exposes_only_new_chat_contract_fields(
 
     assert listed.status_code == 200
     assert listed.json()["total"] == 1
-    exposed = set(listed.json()["items"][0]["fields"])
+    summary = listed.json()["items"][0]
+    exposed = set(summary["fields"])
     assert exposed >= NEW_CHAT_CONFIG_FIELDS, (
         f"管理 API 必须暴露新契约字段，缺失: {sorted(NEW_CHAT_CONFIG_FIELDS - exposed)}"
     )
     assert not (REMOVED_CHAT_CONFIG_FIELDS & exposed), (
         f"管理 API 不得暴露已删除旧字段: {sorted(REMOVED_CHAT_CONFIG_FIELDS & exposed)}"
     )
+    assert "memory_search_limit" not in summary["field_descriptions"]
+    assert "memory_search_limit" not in summary["field_metadata"]
 
     assert detail.status_code == 200
-    values = detail.json()["values"]
+    detail_payload = detail.json()
+    values = detail_payload["values"]
     assert not (REMOVED_CHAT_CONFIG_FIELDS & set(values)), (
         "资源详情值不得包含已删除旧字段"
     )
+    assert "memory_search_limit" not in values
+    assert "memory_search_limit" not in detail_payload["field_descriptions"]
+    assert "memory_search_limit" not in detail_payload["field_metadata"]
+    assert "memory_search_limit" not in detail_payload["field_states"]
     # 新字段以数据库默认值出现在详情中
     assert values["agent_tool_call_mode"] == "required"
     assert values["image_understanding_mode"] == "delegated"

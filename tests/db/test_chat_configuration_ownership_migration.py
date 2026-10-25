@@ -32,6 +32,10 @@ _CHAT_REVISION = 42
 _CONTEXT_REVISION = 12
 _UPDATED_AT = datetime(2026, 10, 25, 18, 45, tzinfo=UTC)
 
+#: 0031 retires this dead chat field.  Historical 0027/0026 assertions keep
+#: requiring its exact moved value; only the current-head view omits it.
+RETIRED_CHAT_FIELDS: frozenset[str] = frozenset({"memory_search_limit"})
+
 MOVED_TO_CHAT: dict[str, Any] = {
     "llm_model_chat": "chat-model-phase-b",
     "llm_temperature_chat": 0.42,
@@ -328,7 +332,8 @@ async def test_migration_moves_every_owned_field_and_preserves_unrelated_data() 
             await connection.close()
 
         # Advance to the current head: 0030 removes only the retired memory
-        # columns, while chat/context live values and admin prompts survive.
+        # columns plus 0031 the dead chat memory_search_limit, while surviving
+        # chat/context live values and admin prompts stay intact.
         result = run_bootstrap(db_url, "upgrade", "head")
         assert result.returncode == 0, result.stderr
         check = run_bootstrap(db_url, "check")
@@ -337,7 +342,11 @@ async def test_migration_moves_every_owned_field_and_preserves_unrelated_data() 
         try:
             chat = await _fetch_row(connection, _CHAT_TABLE)
             for field, expected in {**MOVED_TO_CHAT, **QUERY_REWRITE_TARGET}.items():
+                if field in RETIRED_CHAT_FIELDS:
+                    continue
                 assert chat[field] == expected, field
+            for field in RETIRED_CHAT_FIELDS:
+                assert field not in chat, field
             for field, expected in CHAT_SENTINELS.items():
                 assert chat[field] == expected, field
             assert chat["plugin_enable"] is True
@@ -398,6 +407,7 @@ async def test_migration_creates_missing_rows_with_schema_defaults() -> None:
         try:
             chat = await _fetch_row(connection, _CHAT_TABLE)
             expected_chat = KomariChatConfigSchema().model_dump(mode="json")
+            assert "memory_search_limit" not in chat
             for field, expected in expected_chat.items():
                 assert chat[field] == expected, field
             assert chat["revision"] == 1
@@ -443,6 +453,7 @@ async def test_migration_preserves_existing_target_rows_without_source_row() -> 
         connection = await asyncpg.connect(**scratch)
         try:
             chat = await _fetch_row(connection, _CHAT_TABLE)
+            assert "memory_search_limit" not in chat
             for field, expected in CHAT_SENTINELS.items():
                 assert chat[field] == expected, field
             assert chat["plugin_enable"] is False
@@ -562,7 +573,11 @@ async def test_migration_uses_source_row_when_both_target_rows_are_missing() -> 
                 "plugin_enable",
             }
             for field, expected in MOVED_TO_CHAT.items():
+                if field in RETIRED_CHAT_FIELDS:
+                    continue
                 assert chat[field] == expected, field
+            for field in RETIRED_CHAT_FIELDS:
+                assert field not in chat, field
             for field, expected in QUERY_REWRITE_TARGET.items():
                 assert chat[field] == expected, field
             assert chat["plugin_enable"] is True

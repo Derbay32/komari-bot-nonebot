@@ -877,7 +877,7 @@ def test_0013_fresh_empty_database_passes_head_without_redis() -> None:
     """空库 fresh 豁免：单次 upgrade head 不经 Redis 认证直通（纯 PG 成功路径）。
 
     与生产/prestart 同构：全新空库在同一次 upgrade 调用内走完
-    0001→0030（fresh 标记、缺省策略播种、零数据自动推进与 fresh 豁免
+    0001→0031（fresh 标记、缺省策略播种、零数据自动推进与 fresh 豁免
     全部生效），绝不要求 operator 先跑 Redis 认证。
     """
     params = asyncio.run(recreate_scratch_database("_tsk232b1c13fe"))
@@ -885,6 +885,6 @@ def test_0013_fresh_empty_database_passes_head_without_redis() -> None:
     try:
         result = run_bootstrap(database_url, "upgrade", "head")
         assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
-        assert asyncio.run(_fetch_version(params)) == "0030"
+        assert asyncio.run(_fetch_version(params)) == "0031"
     finally:
         asyncio.run(drop_scratch_database(str(params["database"])))

@@ -25,7 +25,7 @@ from tests.db.tsk197_gate_support import (
 
 pytestmark = [SKIP_NO_POSTGRES, pytest.mark.asyncio]
 
-HEAD = "0030"
+HEAD = "0031"
 PREVIOUS = "0028"
 UNFINISHED_CODE = "TSK195_UNFINISHED_REPLY_FULFILLMENT"
 PARENT = "komari_chat_reply_fulfillments"
@@ -199,9 +199,7 @@ async def test_0029_upgrades_empty_database_to_head_with_zero_orm_drift() -> Non
         connection = await asyncpg.connect(**scratch)
         try:
             assert (
-                await connection.fetchval(
-                    "SELECT version_num FROM alembic_version"
-                )
+                await connection.fetchval("SELECT version_num FROM alembic_version")
                 == HEAD
             )
         finally:

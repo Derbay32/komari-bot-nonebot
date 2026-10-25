@@ -15,6 +15,7 @@ from komari_bot.plugins.komari_context.config_schema import (
 )
 from komari_bot.plugins.komari_memory.config_schema import KomariMemoryConfigSchema
 from tests.db.tsk197_gate_support import (
+    HEAD_REVISION,
     SKIP_NO_POSTGRES,
     drop_scratch_database,
     recreate_scratch_database,
@@ -350,10 +351,8 @@ async def test_0030_drops_retired_surface_and_preserves_sources_and_admin_values
         finally:
             await connection.close()
 
-        result = run_bootstrap(db_url, "upgrade", "head")
+        result = run_bootstrap(db_url, "upgrade", "0030")
         assert result.returncode == 0, result.stderr
-        check = run_bootstrap(db_url, "check")
-        assert check.returncode == 0, f"{check.stdout}\n{check.stderr}"
 
         connection = await asyncpg.connect(**scratch)
         try:
@@ -431,6 +430,49 @@ async def test_0030_drops_retired_surface_and_preserves_sources_and_admin_values
             }
         finally:
             await connection.close()
+
+        # The historical 0030 guard is verified above.  Continue to the current
+        # head and prove the new revision changes no source row or index while
+        # the current metadata is drift-free.
+        result = run_bootstrap(db_url, "upgrade", "head")
+        assert result.returncode == 0, result.stderr
+        check = run_bootstrap(db_url, "check")
+        assert check.returncode == 0, f"{check.stdout}\n{check.stderr}"
+        connection = await asyncpg.connect(**scratch)
+        try:
+            assert (
+                await connection.fetchval("SELECT version_num FROM alembic_version")
+                == HEAD_REVISION
+            )
+            await _assert_formal_source_snapshot(
+                connection, source_rows_before, source_indexes_before
+            )
+            assert (
+                dict(
+                    await connection.fetchrow(
+                        f"SELECT * FROM {MEMORY_TABLE} WHERE id = 1"
+                    )
+                )
+                == memory_row
+            )
+            assert (
+                dict(
+                    await connection.fetchrow(
+                        f"SELECT * FROM {CONTEXT_TABLE} WHERE id = 1"
+                    )
+                )
+                == context_row
+            )
+            assert (
+                dict(
+                    await connection.fetchrow(
+                        f"SELECT * FROM {CHAT_PROMPT_TABLE} WHERE id = 1"
+                    )
+                )
+                == prompt_row
+            )
+        finally:
+            await connection.close()
     finally:
         await drop_scratch_database(str(scratch["database"]))
 
@@ -449,7 +491,7 @@ async def test_0030_fresh_database_and_legacy_upgrade_keep_hindsight_configurati
         try:
             assert (
                 await connection.fetchval("SELECT version_num FROM alembic_version")
-                == "0030"
+                == HEAD_REVISION
             )
             assert await _column_names(connection, MEMORY_TABLE) == set(
                 KomariMemoryConfigSchema.model_fields
