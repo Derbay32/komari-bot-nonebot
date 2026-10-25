@@ -9,7 +9,7 @@
 数据不受影响。用例之间各自重建唯一的隔离库，重复运行与并行安全。
 
 覆盖清单（对应 TSK-182 可选资源切片）：
-- 全新数据库 upgrade head（0030）后运行真实播种命令：两个必需 Prompt
+- 全新数据库 upgrade head（0031）后运行真实播种命令：两个必需 Prompt
   资源齐全，另加可选判定 Prompt 单行（值等于打包资产）；场景初始化已
   退役，4 张退役场景表不得存在；
 - 重复初始化：判定 Prompt 正文/revision/updated_at 不变；
@@ -73,8 +73,8 @@ SENTINEL = "TSK182-DECISION-BODY-SENTINEL-91a4"
 #: 合成“连接归还失败”异常里的哨兵：失败路径不得将它回显给用户。
 RELEASE_SENTINEL = "TSK182-RELEASE-SENTINEL-4c1d"
 
-#: 当前迁移 head（TSK-197 退役旧记忆面后为 0030）。
-TSK182_HEAD_REVISION = "0030"
+#: 当前迁移 head（TSK-191 review rework B 后为 0031）。
+TSK182_HEAD_REVISION = "0031"
 
 #: 已退役的 4 张场景表（test-owned 字面量，来自 TSK-190 manifest）。
 RETIRED_SCENE_TABLES: tuple[str, ...] = (

@@ -459,7 +459,6 @@ TSK192_CHAT_OWNED_FIELDS = {
     "context_max_estimated_tokens": 6_000,
     "face_reaction_enabled": False,
     "face_reaction_id": "76",
-    "memory_search_limit": 3,
 }
 
 TSK192_QUERY_REWRITE_FIELDS = {
@@ -483,6 +482,15 @@ def test_phase_b_fields_have_one_chat_owner_with_original_defaults() -> None:
         assert getattr(config, field_name) == expected, field_name
 
 
+def test_retired_memory_search_limit_is_absent_from_live_chat_schema() -> None:
+    """0031 retires the dead chat setting from schema and serialization."""
+    config = KomariChatConfigSchema()
+
+    assert "memory_search_limit" not in KomariChatConfigSchema.model_fields
+    assert "memory_search_limit" not in config.model_dump()
+    assert not hasattr(config, "memory_search_limit")
+
+
 def test_phase_b_fields_preserve_validation_and_apply_metadata() -> None:
     plugin_field = KomariChatConfigSchema.model_fields["plugin_enable"]
     assert plugin_field.json_schema_extra == {"apply_mode": "restart"}
@@ -494,7 +502,6 @@ def test_phase_b_fields_preserve_validation_and_apply_metadata() -> None:
         "context_messages_limit": (4, 51),
         "context_max_utf8_bytes": (1023, 131_073),
         "context_max_estimated_tokens": (255, 32_001),
-        "memory_search_limit": (0, 11),
     }
     for field_name, (lower, upper) in bounds.items():
         with pytest.raises(ValidationError):

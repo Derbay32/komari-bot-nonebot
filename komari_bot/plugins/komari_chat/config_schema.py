@@ -120,9 +120,6 @@ class KomariChatConfigSchema(TypedConfigModel, table=True):
     knowledge_limit: int = Field(
         default=3, ge=1, le=10, description="常识库检索数量限制"
     )
-    memory_search_limit: int = Field(
-        default=3, ge=1, le=10, description="检索相关记忆的最大数量"
-    )
     context_messages_limit: int = Field(
         default=10, ge=5, le=50, description="获取最近消息上下文的最大数量"
     )
