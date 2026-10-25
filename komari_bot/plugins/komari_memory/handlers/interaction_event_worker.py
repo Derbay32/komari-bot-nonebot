@@ -14,7 +14,8 @@ from nonebot import logger
 from nonebot.plugin import require
 from nonebot_plugin_apscheduler import scheduler
 
-from ..core.retry import retry_async
+from komari_bot.core.retry import retry_async
+
 from ..services.admission import memory_admitted_partition_groups
 from ..services.config_interface import get_config
 from ..services.interaction_event_summary_service import (

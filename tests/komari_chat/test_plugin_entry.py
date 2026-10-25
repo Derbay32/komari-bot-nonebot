@@ -217,15 +217,20 @@ def test_reply_fulfillment_ops_does_not_require_decision_engine(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """履约运维只依赖 PostgreSQL/Redis，不应被判定引擎故障拖垮。"""
-    redis = SimpleNamespace(redis=object())
-    memory = SimpleNamespace(pg_pool=object())
+    store = SimpleNamespace(redis=object())
+    pg_pool = object()
     built: list[tuple[object, object]] = []
     service = object()
 
     monkeypatch.setattr(
         chat_module,
-        "get_memory_plugin_manager",
-        lambda: SimpleNamespace(redis=redis, memory=memory),
+        "context_plugin",
+        SimpleNamespace(get_context_store=lambda: store),
+    )
+    monkeypatch.setattr(
+        chat_module,
+        "get_shared_orm_connection_pool",
+        lambda: pg_pool,
     )
     monkeypatch.setattr(chat_module, "get_decision_engine", lambda: None)
     monkeypatch.setattr(
@@ -239,15 +244,56 @@ def test_reply_fulfillment_ops_does_not_require_decision_engine(
     monkeypatch.setattr(chat_module, "_reply_fulfillment_ops_components", None)
 
     assert chat_module.get_reply_fulfillment_ops_service() is service
-    assert built == [(memory.pg_pool, redis.redis)]
+    assert built == [(pg_pool, store.redis)]
+
+
+def test_fulfillment_stays_buildable_without_memory_or_decision(
+    chat_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Context + shared PG are sufficient for recovery/workflow construction."""
+    store = SimpleNamespace(redis=object())
+    pg_pool = object()
+    workflow = object()
+    built: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        chat_module,
+        "context_plugin",
+        SimpleNamespace(get_context_store=lambda: store),
+    )
+    monkeypatch.setattr(
+        chat_module,
+        "get_shared_orm_connection_pool",
+        lambda: pg_pool,
+    )
+    monkeypatch.setattr(
+        chat_module,
+        "memory_plugin",
+        SimpleNamespace(get_memory_service=lambda: None),
+    )
+    monkeypatch.setattr(chat_module, "get_decision_engine", lambda: None)
+    monkeypatch.setattr(
+        chat_module,
+        "build_reply_fulfillment_workflow",
+        lambda **kwargs: built.append(kwargs) or workflow,
+    )
+    monkeypatch.setattr(chat_module, "_reply_fulfillment", None)
+    monkeypatch.setattr(chat_module, "_reply_fulfillment_components", None)
+
+    assert chat_module._resolve_runtime_components() is None
+    assert chat_module._get_or_build_reply_fulfillment() is workflow
+    assert built
+    assert built[0]["pg_pool"] is pg_pool
+    assert built[0]["redis"] is store
 
 
 def test_handler_rebuilds_when_decision_engine_changes(
     chat_module: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    redis = object()
-    memory = SimpleNamespace(pg_pool=object())
+    redis = SimpleNamespace(redis=object())
+    memory = SimpleNamespace()
     engine_ref = SimpleNamespace(value=object())
     built_engines: list[object] = []
 
@@ -267,8 +313,13 @@ def test_handler_rebuilds_when_decision_engine_changes(
 
     monkeypatch.setattr(
         chat_module,
-        "get_memory_plugin_manager",
-        lambda: SimpleNamespace(redis=redis, memory=memory),
+        "context_plugin",
+        SimpleNamespace(get_context_store=lambda: redis),
+    )
+    monkeypatch.setattr(
+        chat_module,
+        "memory_plugin",
+        SimpleNamespace(get_memory_service=lambda: memory),
     )
     monkeypatch.setattr(
         chat_module,

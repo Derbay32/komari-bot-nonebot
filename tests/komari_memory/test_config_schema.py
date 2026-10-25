@@ -32,7 +32,6 @@ def test_config_schema_exposes_profile_trait_limit() -> None:
 def test_config_schema_declares_non_immediate_lifecycle_fields() -> None:
     expected_modes = {
         "plugin_enable": "restart",
-        "redis_db": "rebuild",
         "global_interaction_summary_interval_minutes": "rebuild",
     }
 
@@ -45,6 +44,13 @@ def test_config_schema_declares_non_immediate_lifecycle_fields() -> None:
         ].json_schema_extra
         assert isinstance(field_extra, dict)
         assert field_extra["apply_mode"] == expected_mode
+
+
+def test_config_schema_no_longer_owns_redis_db() -> None:
+    """TSK-192：Redis 数据库编号由 komari_context 唯一拥有。"""
+
+    assert "redis_db" not in KomariMemoryConfigSchema.model_fields
+    assert "redis_db" not in KomariMemoryConfigSchema().model_dump()
 
 
 def test_config_schema_rejects_too_small_profile_trait_limit() -> None:

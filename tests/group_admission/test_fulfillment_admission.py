@@ -32,7 +32,7 @@ def _pending(fid: str) -> tuple[Any, fas.ReservationHandoff]:
     mh = importlib.import_module(
         "komari_bot.plugins.komari_chat.handlers.message_handler"
     )
-    from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
+    from komari_bot.context.redis_store import MessageSchema
 
     off = fas.ReservationHandoff()
     p = mh.PendingReply(

@@ -14,10 +14,12 @@ if TYPE_CHECKING:
 require("nonebot_plugin_apscheduler")
 require("agent_run_logger")
 require("group_admission")
+require("komari_context")
+
+from komari_bot.plugins.komari_context import get_context_store
 
 from .api import register_memory_api
 from .config_schema import KomariMemoryConfigSchema
-from .core.retry import retry_async
 from .database.connection import create_pool
 from .handlers.forgetting_worker import (
     register_forgetting_task,
@@ -34,7 +36,7 @@ from .repositories.interaction_event_repository import InteractionEventRepositor
 from .services.config_interface import get_config_async
 from .services.forgetting_service import ForgettingService
 from .services.memory_service import MemoryService
-from .services.redis_manager import MessageSchema, RedisManager
+from .services.redis_manager import RedisManager
 
 __plugin_meta__ = PluginMetadata(
     name="小鞠记忆",
@@ -45,14 +47,11 @@ __plugin_meta__ = PluginMetadata(
 __all__ = [
     "KomariMemoryConfigSchema",
     "MemoryService",
-    "MessageSchema",
     "PluginManager",
-    "RedisManager",
     "get_memory_service",
     "get_plugin_manager",
     "get_redis_manager",
     "register_memory_api",
-    "retry_async",
 ]
 
 
@@ -76,16 +75,20 @@ class PluginManager:
         logger.info("[KomariMemory] 正在初始化组件...")
 
         try:
-            # 1. 初始化 PostgreSQL 连接池 (用于向量检索)
+            # 1. Borrow the context-owned Redis client; memory never owns it.
+            context_store = get_context_store()
+            if context_store is None:
+                msg = "komari_context Redis store 未就绪"
+                raise RuntimeError(msg)  # noqa: TRY301
+            self.redis = RedisManager(context_store.redis)
+
+            # 2. 初始化 PostgreSQL 连接池 (用于向量检索)
             self.pg_pool = await create_pool()
             logger.info("[KomariMemory] PostgreSQL 连接池已建立")
 
             expected_dimension = self._resolve_expected_embedding_dimension()
             await self._validate_embedding_dimension(expected_dimension)
 
-            # 2. 初始化 Redis 管理器
-            self.redis = RedisManager(self.startup_config)
-            await self.redis.initialize()
             # 3. 初始化数据访问层
             conversation_repo = ConversationRepository(self.pg_pool)
             entity_repo = EntityRepository(self.pg_pool)
@@ -104,12 +107,17 @@ class PluginManager:
             self.forgetting = ForgettingService(self.pg_pool)
             register_forgetting_task(self.forgetting, self.redis)
             register_interaction_event_task(self.redis, self.memory)
-        except Exception:
-            logger.exception("[KomariMemory] 初始化失败")
+        except Exception as exc:
+            logger.error(
+                "[KomariMemory] 初始化失败: error_type={}", type(exc).__name__
+            )
             try:
                 await self.shutdown()
-            except Exception:
-                logger.exception("[KomariMemory] 初始化失败后的清理失败")
+            except Exception as cleanup_error:
+                logger.error(
+                    "[KomariMemory] 初始化失败后的清理失败: error_type={}",
+                    type(cleanup_error).__name__,
+                )
             raise
 
         logger.info("[KomariMemory] 组件初始化完成")
@@ -168,15 +176,10 @@ class PluginManager:
 
         self.forgetting = None
 
-        # 关闭 Redis 连接
-        if self.redis:
-            await self.redis.close()
-            self.redis = None
-
-        # 关闭 PostgreSQL 连接池
-        if self.pg_pool:
-            await self.pg_pool.close()
-            self.pg_pool = None
+        # The context plugin owns the Redis client and the ORM plugin owns the
+        # shared engine; memory only drops its references.
+        self.redis = None
+        self.pg_pool = None
 
         logger.info("[KomariMemory] 已关闭")
 
@@ -218,16 +221,28 @@ async def startup() -> None:
     """启动时初始化。"""
     global _plugin_manager  # noqa: PLW0603
 
-    config = await get_config_async()
+    try:
+        config = await get_config_async()
+    except Exception as exc:
+        _plugin_manager = None
+        logger.error(
+            "[KomariMemory] 配置读取失败，记忆子系统保持不可用: error_type={}",
+            type(exc).__name__,
+        )
+        return
 
     if config.plugin_enable:
         logger.info("[KomariMemory] 插件已启用（记忆/持久化子系统）")
         manager = PluginManager(config)
         try:
             await manager.initialize()
-        except Exception:
+        except Exception as exc:
             _plugin_manager = None
-            raise
+            logger.error(
+                "[KomariMemory] 启动失败，记忆子系统保持不可用: error_type={}",
+                type(exc).__name__,
+            )
+            return
         _plugin_manager = manager
     else:
         logger.warning("[KomariMemory] 插件未启用，请在配置中设置 plugin_enable=true")

@@ -11,22 +11,22 @@ from uuid import uuid4
 from nonebot import logger
 from nonebot.plugin import require
 
+from komari_bot.core.retry import retry_async
 from komari_bot.llm.untrusted_context import (
     UntrustedContext,
     render_untrusted_context,
 )
 
-from ..core.retry import retry_async
 from .message_chunking import MEMORY_UNTRUSTED_CONTEXT_MAX_CHARS
 from .summary_prompt_template import get_template as get_summary_template
 from .summary_prompt_template import render_template as render_summary_template
 from .token_counter import estimate_text_tokens
 
 if TYPE_CHECKING:
+    from komari_bot.context.redis_store import MessageSchema
     from komari_bot.plugins.agent_run_logger.diagnostic import AgentRunCollector
 
     from ..config_schema import KomariMemoryConfigSchema
-    from .redis_manager import MessageSchema
 
 # 依赖 llm_provider 插件
 require("llm_provider")

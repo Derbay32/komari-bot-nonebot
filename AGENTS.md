@@ -51,6 +51,7 @@ komari-bot/
 ├── komari_bot/                           # ★ 核心代码
 │   ├── core/                             # 核心启动与平台基础件（依赖 NoneBot 运行时）
 │   │   ├── nonebot_compat.py             #   NoneBot ForwardRef 兼容补丁（显式安装点）
+│   │   ├── retry.py                      #   共享异步重试装饰器
 │   │   ├── project_paths.py              #   项目路径常量（DATA_DIR 等）
 │   │   └── sentry_support.py             #   Sentry 初始化 + 异常过滤
 │   ├── db/                               # PostgreSQL 边界共享件（经 nonebot-plugin-orm 托管连接）
@@ -73,6 +74,9 @@ komari-bot/
 │   │   ├── token_counter.py              #   估算 token 计数
 │   │   ├── diagnostic_sanitizer.py       #   共享诊断脱敏（凭据与媒体载荷）
 │   │   └── dsv4_instruct.py              #   DSV4 指令注入
+│   ├── context/                          # 近期上下文 Redis 键与中性存储操作（不依赖插件）
+│   │   ├── redis_keys.py                 #   共享近期上下文/履约证据键
+│   │   └── redis_store.py                #   RecentContextStore + MessageSchema
 │   ├── config/                           # 强类型配置与 Prompt 存储共享件（加载器依赖 NoneBot 运行时）
 │   │   ├── typed_config.py               #   强类型配置/Prompt 表基类、注册表、安全加载器
 │   │   ├── prompt_storage.py             #   Prompt 强类型表与运行时加载
@@ -105,11 +109,12 @@ komari-bot/
 
 插件的 `require()` 声明就是硬依赖，修改前必须理解依赖链。
 
-跨插件 import 边界（ADR-0006）：`require()` 仅作依赖加载声明，实际引用一律走普通 import；import 只允许指向依赖插件的顶层包暴露面（`__all__`），禁止指向其内部子模块（`services` / `repositories` / `handlers` 等）。唯一豁免：管理插件 import 各插件配置 Schema 以注册管理资源。komari_memory 遵循同一规则并采用顶层暴露面方案：其顶层 `__all__` 暴露配置 Schema 与共享工具符号（`KomariMemoryConfigSchema` / `retry_async` / `MemoryService` / `MessageSchema` / `RedisManager`），komari_chat 经自有 `config_interface` 与上述顶层暴露面读取 memory 配置与共享工具，不属于管理插件豁免。详见 `docs/adr/0006-cross-plugin-top-level-imports-decision-contracts.md`。
+跨插件 import 边界（ADR-0006）：`require()` 仅作依赖加载声明，实际引用一律走普通 import；import 只允许指向依赖插件的顶层包暴露面（`__all__`），禁止指向其内部子模块（`services` / `repositories` / `handlers` 等）。唯一豁免：管理插件 import 各插件配置 Schema 以注册管理资源。`komari_context` 是近期上下文与聊天履约证据 Redis 客户端的唯一所有者，顶层暴露 `RecentContextStore` / `MessageSchema` / `get_context_store`；`komari_memory` 顶层只暴露当前旧记忆 API 所需的 `KomariMemoryConfigSchema` / `MemoryService` / `get_memory_service` / `get_redis_manager`，其 `RedisManager` 仅借用 context 客户端；共享 `retry_async` 位于 `komari_bot.core.retry`。komari_chat 经自有 `config_interface` 与上述顶层暴露面读取配置和共享资源，不属于管理插件豁免。详见 `docs/adr/0006-cross-plugin-top-level-imports-decision-contracts.md`。
 
 ```
 基础服务层（被依赖，不应依赖业务插件）
   config_manager ───────────── 动态配置存储（PostgreSQL 强类型表 + .env 初始化）
+  komari_context ───────────── 近期上下文 Redis 客户端唯一所有者
   permission_manager ───────── 权限检查（白名单、插件开关、SUPERUSER）
   user_ban ─────────────────── 全局 QQ 用户封禁（chat / command；ORM 表 + revision 缓存）
   embedding_provider ───────── 向量化 + Rerank 服务
@@ -184,7 +189,7 @@ SUPERUSER 消息 → komari_debug（命令处理器）
 
 ### 1. 配置管理 (`config_manager`)
 
-- **存储源**：业务插件动态配置统一存储在 PostgreSQL 强类型单行表 `komari_<插件>_config`（15 张，迁移 0002 建表、0004 为 komari_chat 补充）；每张表固定主键 `id=1`、CAS 修订号 `revision`（写操作原子自增）、写入时间 `updated_at`（存储层显式赋值）；可扩展字段（列表/字典/嵌套配置）保留 JSONB 列
+- **存储源**：业务插件动态配置统一存储在 PostgreSQL 强类型单行表 `komari_<插件>_config`（16 张，迁移 0002 建表、0004 为 komari_chat 补充、0026 新增 komari_context）；每张表固定主键 `id=1`、CAS 修订号 `revision`（写操作原子自增）、写入时间 `updated_at`（存储层显式赋值）；可扩展字段（列表/字典/嵌套配置）保留 JSONB 列
 - **komari_chat 专属配置**：主动回复频控与回复送达副作用 outbox 的 10 个字段位于 `komari_chat_config`（迁移 0004 建表，从 `komari_memory_config` 单行迁入，死字段 `proactive_score_threshold` 随批删除）；TSK-192/TSK-193 起回复 Agent 预算（`agent_max_rounds` / `agent_max_tool_calls_per_round` / `agent_max_total_tool_calls`）与工具调用约束模式（`agent_tool_call_mode`）也落在此表；TSK-194/ADR-0010 起图片理解模式（`image_understanding_mode`）与 8 项下载预算（`vision_image_download_*`，迁移 0015）同样归 `komari_chat`，从 `komari_memory_config` 迁出后不保留 alias / 双读 / fallback；运行时经 `komari_chat/services/config_interface.py` 读取，该接口同时提供 `get_memory_config()` 承接聊天流程仍依赖的 memory 侧字段，komari_chat 不得 import `komari_memory.services.config_interface`
 - **结构真源**：各插件 `config_schema.py` 中的 SQLModel 元数据（`TypedConfigModel` 基类，见 `config/typed_config.py`）；Alembic 迁移环境只按源文件加载 schema（`load_all_typed_config_models()`），不执行插件包 `__init__`、不访问数据库
 - **旧 JSONB 表**：迁移 `0013` 已显式删除 `komari_plugin_configs`。运行时只使用强类型配置表。删除表必须使用手写迁移。

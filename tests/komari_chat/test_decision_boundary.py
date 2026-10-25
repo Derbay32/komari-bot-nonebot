@@ -101,8 +101,13 @@ def test_handler_is_none_when_engine_unavailable(
 ) -> None:
     monkeypatch.setattr(
         chat_entry_module,
-        "get_memory_plugin_manager",
-        lambda: SimpleNamespace(redis=object(), memory=object()),
+        "context_plugin",
+        SimpleNamespace(get_context_store=lambda: SimpleNamespace(redis=object())),
+    )
+    monkeypatch.setattr(
+        chat_entry_module,
+        "memory_plugin",
+        SimpleNamespace(get_memory_service=lambda: object()),
     )
     monkeypatch.setattr(chat_entry_module, "get_decision_engine", lambda: None)
     monkeypatch.setattr(chat_entry_module, "_handler", None)
@@ -131,12 +136,17 @@ def test_handler_built_with_engine_and_rebuilt_on_identity_change(
             self.decision_engine = decision_engine
             built_engines.append(decision_engine)
 
+    context_store = SimpleNamespace(redis=object())
+    memory_service = SimpleNamespace()
     monkeypatch.setattr(
         chat_entry_module,
-        "get_memory_plugin_manager",
-        lambda: SimpleNamespace(
-            redis=object(), memory=SimpleNamespace(pg_pool=object())
-        ),
+        "context_plugin",
+        SimpleNamespace(get_context_store=lambda: context_store),
+    )
+    monkeypatch.setattr(
+        chat_entry_module,
+        "memory_plugin",
+        SimpleNamespace(get_memory_service=lambda: memory_service),
     )
     monkeypatch.setattr(
         chat_entry_module,

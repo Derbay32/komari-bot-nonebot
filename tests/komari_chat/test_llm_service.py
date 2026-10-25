@@ -14,7 +14,7 @@ from pydantic import ValidationError
 llm_service_module = import_module(
     "komari_bot.plugins.komari_chat.services.llm_service"
 )
-retry_module = import_module("komari_bot.plugins.komari_memory.core.retry")
+retry_module = import_module("komari_bot.core.retry")
 image_reading_session_module = import_module(
     "komari_bot.plugins.komari_chat.services.image_reading_session"
 )

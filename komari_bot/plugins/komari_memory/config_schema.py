@@ -27,14 +27,6 @@ class KomariMemoryConfigSchema(TypedConfigModel, table=True):
         json_schema_extra={"apply_mode": "restart"},
     )
 
-    # 白名单配置
-    # Redis 配置
-    redis_db: int = Field(
-        default=1,
-        description="Redis 数据库编号 (避免与其他插件冲突)",
-        json_schema_extra={"apply_mode": "rebuild"},
-    )
-
     # LLM 配置 - 对话模型（用于生成回复）
     llm_model_chat: str = Field(
         default="gemini-3-flash-preview", description="对话使用模型"

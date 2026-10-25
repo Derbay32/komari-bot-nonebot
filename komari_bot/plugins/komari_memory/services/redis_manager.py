@@ -1,18 +1,16 @@
 """Komari Memory Redis 操作管理器。"""
 
-import hashlib
+from __future__ import annotations
+
 import json
 import time
-from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
-import redis.asyncio as aioredis
 from nonebot import logger
 
-from komari_bot.config.redis_config import get_shared_redis_config
+from komari_bot.context.redis_store import RecentContextStore, _log_redis_json_error
 
-from ..config_schema import KomariMemoryConfigSchema
 from .config_interface import get_config
 from .conversation_processing import (
     CONVERSATION_ACK_SCRIPT,
@@ -31,71 +29,13 @@ from .conversation_processing import (
 )
 from .redis_keys import RedisKeys
 
-_CHAT_COMMIT_MESSAGE_ONCE_SCRIPT = """
--- chat_commit_message_once_v1
-local dedupe_key = KEYS[1]
-local buffer_key = KEYS[2]
-local session_start_key = KEYS[3]
-local last_message_key = KEYS[4]
-local payload = ARGV[1]
-local timestamp = ARGV[2]
-local dedupe_ttl_seconds = tonumber(ARGV[3])
+if TYPE_CHECKING:
+    import redis.asyncio as aioredis
 
-if redis.call("EXISTS", dedupe_key) == 1 then
-    return 0
-end
-if redis.call("LLEN", buffer_key) == 0 then
-    redis.call("SET", session_start_key, timestamp)
-end
-redis.call("RPUSH", buffer_key, payload)
-redis.call("SET", last_message_key, timestamp)
-if dedupe_ttl_seconds > 0 then
-    redis.call("SET", dedupe_key, "1", "EX", dedupe_ttl_seconds)
-else
-    redis.call("SET", dedupe_key, "1")
-end
-return 1
-"""
-_CHAT_COMMIT_INTERACTION_ONCE_SCRIPT = """
--- chat_commit_interaction_once_v1
-local dedupe_key = KEYS[1]
-local interaction_key = KEYS[2]
-local pending_key = KEYS[3]
-local payload = ARGV[1]
-local user_id = ARGV[2]
-local trigger_size = tonumber(ARGV[3])
-local dedupe_ttl_seconds = tonumber(ARGV[4])
+    from komari_bot.context.redis_store import MessageSchema
 
-if redis.call("EXISTS", dedupe_key) == 1 then
-    return 0
-end
-redis.call("RPUSH", interaction_key, payload)
-if redis.call("LLEN", interaction_key) >= trigger_size then
-    redis.call("SADD", pending_key, user_id)
-end
-if dedupe_ttl_seconds > 0 then
-    redis.call("SET", dedupe_key, "1", "EX", dedupe_ttl_seconds)
-else
-    redis.call("SET", dedupe_key, "1")
-end
-return 1
-"""
-_GLOBAL_INTERACTION_PUSH_SCRIPT = """
--- global_interaction_push_v1
-local interaction_key = KEYS[1]
-local pending_key = KEYS[2]
-local user_id = ARGV[1]
-local trigger_size = tonumber(ARGV[2])
+    from ..config_schema import KomariMemoryConfigSchema
 
-for index = 3, #ARGV do
-    redis.call("RPUSH", interaction_key, ARGV[index])
-end
-local buffer_length = redis.call("LLEN", interaction_key)
-if buffer_length >= trigger_size then
-    redis.call("SADD", pending_key, user_id)
-end
-return buffer_length
-"""
 _INTERACTION_CLAIM_SCRIPT = """
 -- interaction_summary_claim
 local pending_key = KEYS[1]
@@ -249,19 +189,6 @@ _GLOBAL_INTERACTION_SNAPSHOT_TTL_SECONDS = 7 * 24 * 60 * 60
 _PROCESSING_SNAPSHOT_DORMANCY_TTL_SECONDS = 7 * 24 * 60 * 60
 
 
-@dataclass(frozen=True)
-class MessageSchema:
-    """消息数据结构。"""
-
-    user_id: str
-    user_nickname: str
-    group_id: str
-    content: str
-    timestamp: float
-    message_id: str
-    is_bot: bool = False
-
-
 def _get_today_4am_timestamp() -> float:
     """获取当前时区今日凌晨 4:00 的时间戳。"""
     now = datetime.now().astimezone()
@@ -269,77 +196,17 @@ def _get_today_4am_timestamp() -> float:
     return today_4am.timestamp()
 
 
-def _log_redis_json_error(*, context: str, key: str, raw_item: object) -> None:
-    """记录可关联但不包含原始正文的 Redis 反序列化错误。"""
-    raw_bytes = (
-        raw_item
-        if isinstance(raw_item, bytes)
-        else str(raw_item).encode("utf-8", errors="replace")
-    )
-    logger.warning(
-        "[KomariMemory] Redis JSON 解析失败: "
-        "context={} key={} bytes={} sha256={}",
-        context,
-        key,
-        len(raw_bytes),
-        hashlib.sha256(raw_bytes).hexdigest(),
-    )
+class RedisManager(RecentContextStore):
+    """Memory-specific Redis specialization over the shared supplied client."""
 
-
-class RedisManager:
-    """Redis 操作管理器。"""
-
-    def __init__(self, connection_config: KomariMemoryConfigSchema) -> None:
-        """初始化 Redis 管理器。
-
-        Args:
-            connection_config: 仅用于建立连接的启动配置快照
-        """
-        self._connection_config = connection_config
-        self._redis: aioredis.Redis | None = None
+    def __init__(self, redis: aioredis.Redis) -> None:
+        """Use the client owned by komari_context; never create or close it."""
+        super().__init__(redis)
 
     @property
     def config(self) -> KomariMemoryConfigSchema:
-        """获取当前配置（支持热重载的访问器）。
-
-        Returns:
-            当前配置对象
-        """
+        """获取当前配置（支持热重载的访问器）。"""
         return get_config()
-
-    async def initialize(self) -> None:
-        """初始化 Redis 连接。"""
-        db_config = get_shared_redis_config()
-        client = aioredis.Redis(
-            host=db_config.redis_host,
-            port=db_config.redis_port,
-            db=self._connection_config.redis_db,
-            password=db_config.redis_password or None,
-            decode_responses=True,
-            encoding="utf-8",
-        )
-        try:
-            await cast("Any", client.ping())
-        except Exception:
-            await client.aclose()
-            raise
-        self._redis = client
-        logger.info("[KomariMemory] Redis 连接已建立")
-
-    async def close(self) -> None:
-        """关闭 Redis 连接。"""
-        if self._redis:
-            await self._redis.aclose()
-            self._redis = None
-            logger.info("[KomariMemory] Redis 连接已关闭")
-
-    @property
-    def redis(self) -> aioredis.Redis:
-        """获取 Redis 客户端实例。"""
-        if self._redis is None:
-            msg = "Redis 未初始化，请先调用 initialize()"
-            raise RuntimeError(msg)
-        return self._redis
 
     def _processing_snapshot_ttl(self) -> int:
         """生效的对话 processing 快照 TTL：不低于休眠安全下限（冻结跨休眠窗）。"""
@@ -347,96 +214,6 @@ class RedisManager:
             int(self.config.conversation_snapshot_ttl_seconds),
             _PROCESSING_SNAPSHOT_DORMANCY_TTL_SECONDS,
         )
-
-    async def push_message(
-        self,
-        group_id: str,
-        message: MessageSchema,
-    ) -> None:
-        """推入消息到缓冲区（连续追加，不再截断）。
-
-        Args:
-            group_id: 群组 ID
-            message: 消息对象
-        """
-        key = RedisKeys.buffer(group_id)
-        data = {
-            "user_id": message.user_id,
-            "user_nickname": message.user_nickname,
-            "group_id": message.group_id,
-            "content": message.content,
-            "timestamp": message.timestamp,
-            "message_id": message.message_id,
-            "is_bot": message.is_bot,
-        }
-
-        buffer_len = cast("int", await self.redis.execute_command("LLEN", key))
-        now = time.time()
-        pipe = self.redis.pipeline()
-        if buffer_len == 0:
-            pipe.set(RedisKeys.session_start(group_id), now)
-        pipe.rpush(key, json.dumps(data))
-        pipe.set(RedisKeys.last_message(group_id), now)
-        await pipe.execute()
-
-    async def push_message_once(
-        self,
-        group_id: str,
-        message: MessageSchema,
-        *,
-        operation_id: str,
-        dedupe_ttl_seconds: int | None = None,
-    ) -> bool:
-        """按聊天 operation ID 原子写入一次消息缓冲。
-
-        ``dedupe_ttl_seconds`` 为 None 时防重键持久保留，直到履约终态
-        清理显式删除；显式传秒数则沿用旧固定 TTL 语义（旧生产路径）。
-        """
-        data = {
-            "user_id": message.user_id,
-            "user_nickname": message.user_nickname,
-            "group_id": message.group_id,
-            "content": message.content,
-            "timestamp": message.timestamp,
-            "message_id": message.message_id,
-            "is_bot": message.is_bot,
-        }
-        result = await self.redis.execute_command(
-            "EVAL",
-            _CHAT_COMMIT_MESSAGE_ONCE_SCRIPT,
-            4,
-            RedisKeys.chat_commit_step(operation_id, "ai_history"),
-            RedisKeys.buffer(group_id),
-            RedisKeys.session_start(group_id),
-            RedisKeys.last_message(group_id),
-            json.dumps(data, ensure_ascii=False),
-            message.timestamp,
-            (max(1, dedupe_ttl_seconds) if dedupe_ttl_seconds is not None else 0),
-        )
-        return int(cast("int | str | bytes", result)) == 1
-
-    async def get_buffer(
-        self,
-        group_id: str,
-        limit: int = 100,
-    ) -> list[MessageSchema]:
-        """获取缓冲区消息。
-
-        Args:
-            group_id: 群组 ID
-            limit: 最大返回数量
-
-        Returns:
-            消息列表
-        """
-        if limit <= 0:
-            return []
-
-        key = RedisKeys.buffer(group_id)
-        # 读取尾部最近 N 条消息，Redis 会保持原有顺序返回。
-        raw_data = await self.redis.lrange(key, -limit, -1)  # type: ignore[arg-type]
-
-        return [self._deserialize_message(item) for item in raw_data]
 
     async def claim_conversation_buffer(
         self,
@@ -850,58 +627,6 @@ class RedisManager:
                 orphaned.append((group_id, processing_key))
         return orphaned
 
-    async def get_context_around_message(
-        self,
-        group_id: str,
-        message_id: str,
-        before: int = 5,
-        after: int = 5,
-    ) -> list[MessageSchema]:
-        """获取指定消息前后的上下文。
-
-        Args:
-            group_id: 群组 ID
-            message_id: 消息 ID
-            before: 获取前面的消息数量
-            after: 获取后面的消息数量
-
-        Returns:
-            消息列表（按时间排序）
-        """
-        key = RedisKeys.buffer(group_id)
-        # 获取所有缓冲区消息
-        raw_data = await self.redis.lrange(key, 0, -1)  # type: ignore[arg-type]
-
-        # 解析所有消息
-        all_messages = [self._deserialize_message(msg_item) for msg_item in raw_data]
-
-        # 找到目标消息的索引
-        target_index = -1
-        for i, msg in enumerate(all_messages):
-            if msg.message_id == message_id:
-                target_index = i
-                break
-
-        # 如果找不到目标消息，返回空列表
-        if target_index == -1:
-            return []
-
-        # 获取上下文范围
-        start = max(0, target_index - before)
-        end = min(len(all_messages), target_index + after + 1)
-
-        return all_messages[start:end]
-
-    async def get_last_message_time(self, group_id: str) -> float | None:
-        """获取群组最后一条消息的时间戳。"""
-        value = await self.redis.get(RedisKeys.last_message(group_id))
-        return float(value) if value else None
-
-    async def get_session_start_time(self, group_id: str) -> float | None:
-        """获取群组当前会话的开始时间戳。"""
-        value = await self.redis.get(RedisKeys.session_start(group_id))
-        return float(value) if value else None
-
     async def should_trigger_summary(
         self,
         group_id: str,
@@ -963,96 +688,6 @@ class RedisManager:
         """
         key = RedisKeys.last_summary(group_id)
         await self.redis.set(key, time.time())
-
-    async def push_global_interaction(
-        self,
-        user_id: str,
-        record: dict[str, Any] | list[dict[str, Any]],
-        trigger_size: int = 20,
-    ) -> None:
-        """写入跨群用户互动缓冲，达到阈值后加入待总结集合。"""
-        records = record if isinstance(record, list) else [record]
-        if not records:
-            return
-
-        key = RedisKeys.global_interaction(user_id)
-        payloads = [json.dumps(item, ensure_ascii=False) for item in records]
-        await self.redis.execute_command(
-            "EVAL",
-            _GLOBAL_INTERACTION_PUSH_SCRIPT,
-            2,
-            key,
-            RedisKeys.GLOBAL_INTERACTION_PENDING,
-            user_id,
-            max(1, trigger_size),
-            *payloads,
-        )
-
-    async def push_global_interaction_once(
-        self,
-        *,
-        user_id: str,
-        record: dict[str, Any],
-        trigger_size: int,
-        operation_id: str,
-        dedupe_ttl_seconds: int | None = None,
-    ) -> bool:
-        """按聊天 operation ID 原子写入一次互动事件缓冲。
-
-        ``dedupe_ttl_seconds`` 为 None 时防重键持久保留，直到履约终态
-        清理显式删除；显式传秒数则沿用旧固定 TTL 语义（旧生产路径）。
-        """
-        result = await self.redis.execute_command(
-            "EVAL",
-            _CHAT_COMMIT_INTERACTION_ONCE_SCRIPT,
-            3,
-            RedisKeys.chat_commit_step(operation_id, "interaction"),
-            RedisKeys.global_interaction(user_id),
-            RedisKeys.GLOBAL_INTERACTION_PENDING,
-            json.dumps(record, ensure_ascii=False),
-            user_id,
-            max(1, trigger_size),
-            (max(1, dedupe_ttl_seconds) if dedupe_ttl_seconds is not None else 0),
-        )
-        return int(cast("int | str | bytes", result)) == 1
-
-    async def delete_chat_commit_evidence(self, operation_id: str) -> int:
-        """幂等删除聊天履约的两个 Redis 防重证据键，返回删除数量。
-
-        只删除 ``ai_history`` 与 ``interaction`` 两个证据键，绝不触碰
-        实际消息/互动 buffer；未解决履约的证据在显式清理前持久保留。
-        """
-        pipeline = self.redis.pipeline()
-        pipeline.delete(RedisKeys.chat_commit_step(operation_id, "ai_history"))
-        pipeline.delete(RedisKeys.chat_commit_step(operation_id, "interaction"))
-        results = await pipeline.execute()
-        return sum(int(result) for result in results)
-
-    async def get_global_interaction_buffer(
-        self,
-        user_id: str,
-        limit: int = 10,
-    ) -> list[dict[str, Any]]:
-        """读取指定用户跨群互动原始缓冲尾部记录。"""
-        if limit <= 0:
-            return []
-
-        key = RedisKeys.global_interaction(user_id)
-        raw_items = await self.redis.lrange(key, -limit, -1)  # type: ignore[arg-type]
-        records: list[dict[str, Any]] = []
-        for raw_item in raw_items:
-            try:
-                parsed = json.loads(raw_item)
-            except (TypeError, ValueError):
-                _log_redis_json_error(
-                    context="global_interaction_buffer",
-                    key=key,
-                    raw_item=raw_item,
-                )
-                continue
-            if isinstance(parsed, dict):
-                records.append(parsed)
-        return records
 
     async def add_pending_interaction_summary(self, user_id: str) -> None:
         """加入跨群互动事件待总结集合。"""
@@ -1210,72 +845,6 @@ class RedisManager:
             if user_id and buffer_len > 0:
                 users.append(user_id)
         return users
-
-    async def delete_buffer(
-        self,
-        group_id: str,
-    ) -> None:
-        """清空消息缓冲区及相关元数据。
-
-        Args:
-            group_id: 群组 ID
-        """
-        pipe = self.redis.pipeline()
-        pipe.delete(RedisKeys.buffer(group_id))
-        pipe.delete(RedisKeys.last_message(group_id))
-        pipe.delete(RedisKeys.session_start(group_id))
-        await pipe.execute()
-
-    async def get_active_groups(self) -> list[str]:
-        """获取有活跃消息缓冲的群组列表。
-
-        Returns:
-            群组 ID 列表
-        """
-        pattern = RedisKeys.BUFFER_PATTERN
-        keys = []
-        excluded_keys = {RedisKeys.BUFFER_PROCESSING_DEAD_INDEX}
-        excluded_prefixes = (
-            f"{RedisKeys.PREFIX}:buffer:processing:",
-            f"{RedisKeys.PREFIX}:buffer:processing_current:",
-            f"{RedisKeys.PREFIX}:buffer:processing_lock:",
-            f"{RedisKeys.PREFIX}:buffer:processing_chunks:",
-            f"{RedisKeys.PREFIX}:buffer:processing_meta:",
-            f"{RedisKeys.PREFIX}:buffer:processing_dead:",
-        )
-        async for key in self.redis.scan_iter(match=pattern):
-            key_text = self._decode_redis_text(key)
-            if key_text in excluded_keys:
-                continue
-            if any(key_text.startswith(prefix) for prefix in excluded_prefixes):
-                continue
-            prefix = f"{RedisKeys.PREFIX}:buffer:"
-            if not key_text.startswith(prefix):
-                continue
-            group_id = key_text.removeprefix(prefix)
-            if group_id and ":" not in group_id:
-                keys.append(group_id)
-        return keys
-
-    @staticmethod
-    def _deserialize_message(raw_item: str) -> MessageSchema:
-        """将 Redis 中的 JSON 文本解析为消息对象。"""
-        data = json.loads(raw_item)
-        return MessageSchema(
-            user_id=data["user_id"],
-            user_nickname=data.get("user_nickname") or data["user_id"],
-            group_id=data["group_id"],
-            content=data["content"],
-            timestamp=data["timestamp"],
-            message_id=data["message_id"],
-            is_bot=data.get("is_bot", False),
-        )
-
-    @staticmethod
-    def _decode_redis_text(value: Any) -> str:
-        if isinstance(value, bytes):
-            return value.decode()
-        return str(value)
 
     @classmethod
     def _parse_conversation_claim(cls, value: object) -> ConversationSnapshotClaim:

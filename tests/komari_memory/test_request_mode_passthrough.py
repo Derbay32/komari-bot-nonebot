@@ -17,12 +17,12 @@ from typing import Any, cast
 import nonebot.plugin
 import pytest
 
+from komari_bot.context.redis_store import MessageSchema
 from komari_bot.plugins.komari_memory.config_schema import KomariMemoryConfigSchema
 from komari_bot.plugins.komari_memory.services import llm_service as llm_service_module
 from komari_bot.plugins.komari_memory.services.llm_service import (
     summarize_conversation,
 )
-from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
 
 
 def _make_config(**overrides: Any) -> KomariMemoryConfigSchema:

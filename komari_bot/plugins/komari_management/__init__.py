@@ -24,6 +24,9 @@ from komari_bot.plugins.komari_chat.config_schema import KomariChatConfigSchema
 from komari_bot.plugins.komari_chat.prompt_schema import (
     DISPLAY_NAME as KOMARI_CHAT_PROMPT_DISPLAY_NAME,
 )
+from komari_bot.plugins.komari_context.config_schema import (
+    KomariContextConfigSchema,
+)
 from komari_bot.plugins.komari_decision.config_schema import KomariDecisionConfigSchema
 from komari_bot.plugins.komari_decision.prompt_schema import (
     DISPLAY_NAME as KOMARI_DECISION_PROMPT_DISPLAY_NAME,
@@ -135,6 +138,14 @@ def _load_management_components() -> ManagementApiComponents:
                 resource_id="komari_management",
                 display_name="Komari Management",
                 manager_getter=lambda: config_manager,
+            ),
+            ManagedConfigResource(
+                resource_id="komari_context",
+                display_name="Komari Context",
+                manager_getter=lambda: config_manager_plugin.get_config_manager(
+                    "komari_context",
+                    KomariContextConfigSchema,
+                ),
             ),
             ManagedConfigResource(
                 resource_id="komari_memory",

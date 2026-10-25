@@ -19,7 +19,7 @@ from uuid import uuid4
 
 import pytest
 
-from komari_bot.plugins.komari_memory.core import retry as retry_module
+from komari_bot.core import retry as retry_module
 from komari_bot.plugins.komari_memory.services import (
     forgetting_service as forgetting_service_module,
 )

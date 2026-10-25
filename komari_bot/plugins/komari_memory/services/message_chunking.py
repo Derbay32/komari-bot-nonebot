@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 from komari_bot.llm.content_budget import estimate_text_tokens
 
 if TYPE_CHECKING:
-    from .redis_manager import MessageSchema
+    from komari_bot.context.redis_store import MessageSchema
 
 
 MEMORY_CHUNK_MAX_UTF8_BYTES = 18_000

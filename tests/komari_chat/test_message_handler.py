@@ -18,8 +18,8 @@ from nonebot.adapters.onebot.v11 import Message, MessageSegment
 from nonebot.adapters.onebot.v11.event import Reply, Sender
 
 import komari_bot.plugins as plugins_package
+from komari_bot.context.redis_store import MessageSchema
 from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
-from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
 
 if TYPE_CHECKING:
     from collections.abc import Callable

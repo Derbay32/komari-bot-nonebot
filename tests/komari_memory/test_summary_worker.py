@@ -27,6 +27,7 @@ from typing import Any
 import pytest
 from apscheduler.jobstores.base import JobLookupError
 
+from komari_bot.context.redis_store import MessageSchema
 from komari_bot.plugins.komari_memory.config_schema import KomariMemoryConfigSchema
 from komari_bot.plugins.komari_memory.handlers import (
     summary_worker as summary_worker_module,
@@ -43,7 +44,6 @@ from komari_bot.plugins.komari_memory.services.conversation_processing import (
 from komari_bot.plugins.komari_memory.services.conversation_processing_lifecycle import (
     ProcessingSession,
 )
-from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
 
 
 def _make_message(

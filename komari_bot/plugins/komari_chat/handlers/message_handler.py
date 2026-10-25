@@ -33,7 +33,7 @@ from komari_bot.onebot import (
     RedisFailureNotificationCooldown,
     image_failure_reason_code,
 )
-from komari_bot.plugins.komari_memory import MessageSchema, RedisManager
+from komari_bot.plugins.komari_context import MessageSchema, RecentContextStore
 from komari_bot.plugins.llm_provider.config_schema import DynamicConfigSchema
 
 from ..reply_fulfillment_domain import build_reply_fulfillment_id
@@ -247,7 +247,7 @@ class MessageHandler:
 
     def __init__(
         self,
-        redis: RedisManager,
+        redis: RecentContextStore,
         memory: MemoryService,
         reply_fulfillment: ReplyFulfillmentQueryProtocol,
         proactive_reservation: ProactiveReservationService,

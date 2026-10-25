@@ -10,15 +10,13 @@ from typing import Any, cast
 import pytest
 import redis.asyncio as aioredis
 
+from komari_bot.context.redis_store import MessageSchema
 from komari_bot.plugins.komari_memory.config_schema import KomariMemoryConfigSchema
 from komari_bot.plugins.komari_memory.services import (
     redis_manager as redis_manager_module,
 )
 from komari_bot.plugins.komari_memory.services.redis_keys import RedisKeys
-from komari_bot.plugins.komari_memory.services.redis_manager import (
-    MessageSchema,
-    RedisManager,
-)
+from komari_bot.plugins.komari_memory.services.redis_manager import RedisManager
 
 REDIS_SOCKET = os.getenv("KOMARI_TEST_REDIS_SOCKET", "")
 REDIS_URL = os.getenv("KOMARI_TEST_REDIS_URL", "")
@@ -65,10 +63,8 @@ def test_real_redis_conversation_owner_takeover(monkeypatch: Any) -> None:
                 ),
             ),
         )
-        first = RedisManager(config)
-        second = RedisManager(config)
-        first._redis = cast("Any", first_client)
-        second._redis = cast("Any", second_client)
+        first = RedisManager(cast("Any", first_client))
+        second = RedisManager(cast("Any", second_client))
         try:
             first_claim = await first.claim_conversation_buffer(
                 "g1", "owner-1", "snapshot-1"
@@ -135,8 +131,7 @@ def test_real_redis_conversation_dead_letter_requeue(monkeypatch: Any) -> None:
         monkeypatch.setattr(redis_manager_module, "get_config", lambda: config)
         client = _redis_client()
         await client.flushdb()
-        manager = RedisManager(config)
-        manager._redis = cast("Any", client)
+        manager = RedisManager(cast("Any", client))
         old_message = {
             "user_id": "u1",
             "user_nickname": "用户一",
@@ -224,8 +219,7 @@ def test_real_redis_chat_commit_steps_are_idempotent(monkeypatch: Any) -> None:
         monkeypatch.setattr(redis_manager_module, "get_config", lambda: config)
         client = _redis_client()
         await client.flushdb()
-        manager = RedisManager(config)
-        manager._redis = cast("Any", client)
+        manager = RedisManager(cast("Any", client))
         try:
             message = MessageSchema(
                 user_id="bot",

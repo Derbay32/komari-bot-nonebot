@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
+from komari_bot.context.redis_store import MessageSchema
 from tests.komari_chat.fulfillment_row_keys import PARENT_ROW_KEYS
 
 if TYPE_CHECKING:

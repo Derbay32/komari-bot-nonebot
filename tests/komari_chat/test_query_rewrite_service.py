@@ -7,7 +7,7 @@ from importlib import import_module
 from types import SimpleNamespace
 from typing import Any
 
-from komari_bot.plugins.komari_memory.core import retry as retry_module
+from komari_bot.core import retry as retry_module
 
 query_rewrite_module = import_module(
     "komari_bot.plugins.komari_chat.services.query_rewrite_service"

@@ -14,6 +14,7 @@ from nonebot import logger
 from nonebot.plugin import require
 from pydantic import BaseModel, Field, field_validator
 
+from komari_bot.core.retry import retry_async
 from komari_bot.llm.content_budget import estimate_text_tokens
 from komari_bot.llm.untrusted_context import (
     UntrustedContext,
@@ -21,7 +22,6 @@ from komari_bot.llm.untrusted_context import (
     render_untrusted_context,
 )
 from komari_bot.memory.profile_operations import profile_traits_to_list
-from komari_bot.plugins.komari_memory import KomariMemoryConfigSchema, retry_async
 from komari_bot.plugins.llm_provider.base_client import build_assistant_message
 
 from .admission_gate import effect_business_admitted
@@ -34,8 +34,12 @@ from .image_reading_session import (
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from komari_bot.context.redis_store import MessageSchema
     from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
-    from komari_bot.plugins.komari_memory import MemoryService, MessageSchema
+    from komari_bot.plugins.komari_memory import (
+        KomariMemoryConfigSchema,
+        MemoryService,
+    )
 
     from .image_reading_session import ImageReadingSessionProtocol
 

@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
@@ -13,6 +12,7 @@ import pytest
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+from komari_bot.context.redis_store import MessageSchema
 from komari_bot.plugins.komari_memory.config_schema import KomariMemoryConfigSchema
 from komari_bot.plugins.komari_memory.services import (
     redis_manager as redis_manager_module,
@@ -21,10 +21,7 @@ from komari_bot.plugins.komari_memory.services.conversation_processing import (
     ConversationChunkStateMismatchError,
 )
 from komari_bot.plugins.komari_memory.services.redis_keys import RedisKeys
-from komari_bot.plugins.komari_memory.services.redis_manager import (
-    MessageSchema,
-    RedisManager,
-)
+from komari_bot.plugins.komari_memory.services.redis_manager import RedisManager
 
 
 def _redis_range(items: list[str], start: int, stop: int) -> list[str]:
@@ -728,135 +725,49 @@ def _build_message(index: int) -> MessageSchema:
 
 
 def _build_manager(monkeypatch: Any) -> RedisManager:
-    config = KomariMemoryConfigSchema.model_construct()
+    config = KomariMemoryConfigSchema()
     monkeypatch.setattr(
         redis_manager_module,
         "get_config",
         lambda: config,
     )
-    manager = RedisManager(config)
-    manager._redis = cast("Any", _FakeRedis())
-    return manager
+    return RedisManager(cast("Any", _FakeRedis()))
 
 
 def _build_second_manager(
     monkeypatch: Any,
     shared_redis: _FakeRedis,
 ) -> RedisManager:
-    config = KomariMemoryConfigSchema.model_construct()
+    config = KomariMemoryConfigSchema()
     monkeypatch.setattr(redis_manager_module, "get_config", lambda: config)
-    manager = RedisManager(config)
-    manager._redis = cast("Any", shared_redis)
-    return manager
+    return RedisManager(cast("Any", shared_redis))
 
 
 def _get_fake_redis(manager: RedisManager) -> _FakeRedis:
-    return cast("_FakeRedis", manager._redis)
+    return cast("_FakeRedis", manager.redis)
 
 
 def _capture_warning_logs(monkeypatch: Any) -> list[str]:
+    from komari_bot.context import redis_store as context_store_module
+
     logs: list[str] = []
 
     def _warning(message: str, *args: object) -> None:
         logs.append(message.format(*args))
 
+    monkeypatch.setattr(context_store_module.logger, "warning", _warning)
     monkeypatch.setattr(redis_manager_module.logger, "warning", _warning)
     return logs
 
 
-def test_initialize_uses_structured_redis_connection_parameters(
-    monkeypatch: Any,
-) -> None:
-    captured_kwargs: dict[str, object] = {}
+def test_redis_manager_uses_only_the_supplied_client_and_has_no_lifecycle() -> None:
+    """TSK-192：记忆管理器只借用 context 客户端，不拥有初始化/关闭生命周期。"""
+    fake = _FakeRedis()
+    manager = RedisManager(cast("Any", fake))
 
-    class _Connection:
-        def __init__(self, **kwargs: object) -> None:
-            captured_kwargs.update(kwargs)
-            self.pinged = False
-            self.closed = False
-
-        async def ping(self) -> bool:
-            self.pinged = True
-            return True
-
-        async def aclose(self) -> None:
-            self.closed = True
-
-    connections: list[_Connection] = []
-
-    def _connection_factory(**kwargs: object) -> _Connection:
-        connection = _Connection(**kwargs)
-        connections.append(connection)
-        return connection
-
-    monkeypatch.setattr(
-        redis_manager_module,
-        "get_shared_redis_config",
-        lambda: SimpleNamespace(
-            redis_host="redis.internal",
-            redis_port=6380,
-            redis_password="p@ss:/?#word",
-        ),
-    )
-    monkeypatch.setattr(
-        redis_manager_module.aioredis,
-        "Redis",
-        _connection_factory,
-    )
-    manager = RedisManager(KomariMemoryConfigSchema(redis_db=6))
-
-    asyncio.run(manager.initialize())
-
-    connection = connections[0]
-    assert connection.pinged is True
-    assert captured_kwargs == {
-        "host": "redis.internal",
-        "port": 6380,
-        "db": 6,
-        "password": "p@ss:/?#word",
-        "decode_responses": True,
-        "encoding": "utf-8",
-    }
-    assert manager.redis is connection
-
-    asyncio.run(manager.close())
-    assert connection.closed is True
-
-
-def test_initialize_closes_redis_client_when_ping_fails(monkeypatch: Any) -> None:
-    class _Connection:
-        def __init__(self) -> None:
-            self.closed = False
-
-        async def ping(self) -> bool:
-            msg = "连接失败"
-            raise ConnectionError(msg)
-
-        async def aclose(self) -> None:
-            self.closed = True
-
-    connection = _Connection()
-    monkeypatch.setattr(
-        redis_manager_module,
-        "get_shared_redis_config",
-        lambda: SimpleNamespace(
-            redis_host="redis.internal",
-            redis_port=6380,
-            redis_password="secret",
-        ),
-    )
-    monkeypatch.setattr(
-        redis_manager_module.aioredis,
-        "Redis",
-        lambda **_kwargs: connection,
-    )
-    manager = RedisManager(KomariMemoryConfigSchema(redis_db=6))
-
-    with pytest.raises(ConnectionError, match="连接失败"):
-        asyncio.run(manager.initialize())
-
-    assert connection.closed is True
-    assert manager._redis is None
+    assert manager.redis is fake
+    assert not hasattr(manager, "initialize")
+    assert not hasattr(manager, "close")
 
 
 def test_redis_manager_no_longer_hosts_proactive_reservation() -> None:

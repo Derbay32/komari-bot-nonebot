@@ -1,4 +1,4 @@
-"""异步重试装饰器。"""
+"""共享异步重试装饰器。"""
 
 import asyncio
 import functools

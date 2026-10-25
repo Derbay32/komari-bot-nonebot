@@ -10,6 +10,7 @@ from typing import ClassVar
 
 import pytest
 
+from komari_bot.context.redis_store import MessageSchema
 from komari_bot.onebot import (
     GroupTaskFailureNotification,
     ImageFailureDiagnostic,
@@ -793,10 +794,7 @@ def test_normal_reservation_control_flow_is_not_a_failure(
         "get_memory_config",
         lambda: SimpleNamespace(),
     )
-    message_schema = import_module(
-        "komari_bot.plugins.komari_memory"
-    ).MessageSchema
-    message = message_schema(
+    message = MessageSchema(
         user_id="10000",
         user_nickname="测试用户",
         group_id="12345",

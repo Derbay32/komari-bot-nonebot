@@ -79,6 +79,7 @@ def _ensure_package_shim(plugin_name: str) -> None:
     sys.modules[package_name] = shim
 
 
+_ensure_package_shim("komari_context")
 _ensure_package_shim("komari_memory")
 _ensure_package_shim("komari_knowledge")
 _ensure_package_shim("llm_provider")
@@ -266,6 +267,20 @@ class _DummyMemoryPlugin:
     def get_plugin_manager() -> object | None:
         return None
 
+    @staticmethod
+    def get_memory_service() -> object | None:
+        return None
+
+    @staticmethod
+    def get_redis_manager() -> object | None:
+        return None
+
+
+class _DummyContextPlugin:
+    @staticmethod
+    def get_context_store() -> object | None:
+        return None
+
 
 class _DummyKnowledgePlugin:
     @staticmethod
@@ -440,6 +455,7 @@ _REQUIRE_REGISTRY: dict[str, object] = {
     "embedding_provider": _DummyEmbeddingPlugin(),
     "user_data": _DummyUserDataPlugin(),
     "user_ban": _DummyUserBanPlugin(),
+    "komari_context": _DummyContextPlugin(),
     "komari_memory": _DummyMemoryPlugin(),
     "komari_knowledge": _DummyKnowledgePlugin(),
     "character_binding": _DummyCharacterBindingPlugin(),
@@ -532,23 +548,26 @@ _inject_package_exports(
 # KOMARIBOT-12：komari_memory 顶层暴露面符号（ADR-0006 边界）同步注入
 # shim；符号取真实实现（shim 下子模块仍按真实路径加载），保证
 # komari_chat 经顶层包导入后测试中的构造与调用语义不变
+from komari_bot.context.redis_store import MessageSchema, RecentContextStore
 from komari_bot.plugins.komari_memory.config_schema import KomariMemoryConfigSchema
-from komari_bot.plugins.komari_memory.core.retry import retry_async
 from komari_bot.plugins.komari_memory.services.memory_service import MemoryService
-from komari_bot.plugins.komari_memory.services.redis_manager import (
-    MessageSchema,
-    RedisManager,
-)
 
+_inject_package_exports(
+    "komari_context",
+    {
+        "MessageSchema": MessageSchema,
+        "RecentContextStore": RecentContextStore,
+        "get_context_store": _DummyContextPlugin.get_context_store,
+    },
+)
 _inject_package_exports(
     "komari_memory",
     {
         "get_plugin_manager": _DummyMemoryPlugin.get_plugin_manager,
+        "get_memory_service": _DummyMemoryPlugin.get_memory_service,
+        "get_redis_manager": _DummyMemoryPlugin.get_redis_manager,
         "KomariMemoryConfigSchema": KomariMemoryConfigSchema,
         "MemoryService": MemoryService,
-        "MessageSchema": MessageSchema,
-        "RedisManager": RedisManager,
-        "retry_async": retry_async,
     },
 )
 _inject_package_exports(

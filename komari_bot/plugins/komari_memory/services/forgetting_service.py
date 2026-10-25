@@ -13,6 +13,7 @@ from uuid import uuid4
 from nonebot import logger
 from nonebot.plugin import require
 
+from komari_bot.core.retry import retry_async
 from komari_bot.llm.content_budget import (
     ContentValidationError,
     TextBudget,
@@ -24,7 +25,6 @@ from komari_bot.llm.untrusted_context import (
     render_untrusted_context,
 )
 
-from ..core.retry import retry_async
 from ..repositories.forgetting_job_repository import (
     ForgettingJobLeaseLostError,
     ForgettingJobRepository,

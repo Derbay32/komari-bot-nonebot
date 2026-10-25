@@ -30,8 +30,8 @@ from typing import Any
 import pytest
 
 import komari_bot.plugins as plugins_package
+from komari_bot.context.redis_store import MessageSchema
 from komari_bot.plugins.agent_run_logger.diagnostic import AgentRunCollector
-from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
 from komari_bot.plugins.llm_provider.base_client import (
     LLMCompletionResultSchema,
     LLMProviderContinuationSchema,
@@ -39,7 +39,7 @@ from komari_bot.plugins.llm_provider.base_client import (
     LLMToolCallSchema,
 )
 
-retry_module = import_module("komari_bot.plugins.komari_memory.core.retry")
+retry_module = import_module("komari_bot.core.retry")
 agent_budget_module = import_module(
     "komari_bot.plugins.komari_chat.services.agent_budget"
 )
