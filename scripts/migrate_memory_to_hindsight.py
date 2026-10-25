@@ -1474,7 +1474,7 @@ async def _require_bank(
     request_timeout: float,
 ) -> None:
     try:
-        profile = await client.banks.get_bank_profile(
+        bank_config = await client.banks.get_bank_config(
             target.bank_id,
             _request_timeout=request_timeout,
         )
@@ -1488,7 +1488,7 @@ async def _require_bank(
             ERROR_TARGET_BANK_CHECK_FAILED,
             "target Hindsight bank could not be verified",
         ) from exc
-    returned_bank_id = _read_field(profile, "bank_id")
+    returned_bank_id = _read_field(bank_config, "bank_id")
     if not isinstance(returned_bank_id, str) or returned_bank_id != target.bank_id:
         raise MigrationError(
             ERROR_TARGET_BANK_CHECK_FAILED,
