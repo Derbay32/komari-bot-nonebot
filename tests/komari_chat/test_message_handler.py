@@ -53,8 +53,17 @@ def _patch_both_configs(
 
 from tests.komari_chat.hindsight_recall_support import (
     FakeHindsightMemory,
+    FakeRecallSession,
+    fake_recall_session,
     recall_response,
 )
+
+
+def _attempt_recall_session(handler: object) -> FakeRecallSession:
+    memory = getattr(handler, "hindsight_memory", None)
+    if isinstance(memory, FakeHindsightMemory):
+        return fake_recall_session(memory)
+    return fake_recall_session(FakeHindsightMemory())
 
 
 class _FakeEvent:
@@ -450,6 +459,7 @@ def test_attempt_reply_only_rewrites_current_message(
             reply_context_refetched=False,
             force_reply=True,
             reason="platform_summon",
+            recall_session=_attempt_recall_session(handler),
             store_current=True,
         )
     )
@@ -641,6 +651,7 @@ def _run_reaction_sent_attempt(handler: Any, message: MessageSchema) -> Any:
             reply_context_refetched=False,
             force_reply=True,
             reason="platform_summon",
+            recall_session=_attempt_recall_session(handler),
             store_current=True,
             on_reply_triggered=_dummy_reaction,
         )
@@ -1519,6 +1530,7 @@ def test_normal_attempt_reply_defers_side_effects_until_delivery(
             reply_context_refetched=False,
             force_reply=True,
             reason="platform_summon",
+            recall_session=_attempt_recall_session(handler),
             store_current=True,
         )
     )
@@ -1598,6 +1610,7 @@ def test_proactive_attempt_returns_pending_reply_carrying_handoff(
             reply_context_refetched=False,
             force_reply=False,
             reason="score",
+            recall_session=_attempt_recall_session(handler),
             store_current=True,
         )
     )
@@ -1672,6 +1685,7 @@ def test_proactive_generation_failure_returns_failure_and_lease_exit_releases(
             reply_context_refetched=False,
             force_reply=False,
             reason="score",
+            recall_session=_attempt_recall_session(handler),
             store_current=True,
         )
     )
@@ -1734,6 +1748,7 @@ def test_normal_attempt_reply_gracefully_handles_favorability_read_failure(
             reply_context_refetched=False,
             force_reply=True,
             reason="platform_summon",
+            recall_session=_attempt_recall_session(handler),
             store_current=True,
         )
     )
@@ -1916,6 +1931,7 @@ def test_reaction_scheduled_before_generate_core(
             reply_context_refetched=False,
             force_reply=True,
             reason="platform_summon",
+            recall_session=_attempt_recall_session(handler),
             store_current=True,
             on_reply_triggered=_fake_reaction,
         )
@@ -2018,6 +2034,7 @@ def test_reaction_not_scheduled_when_disabled(
             reply_context_refetched=False,
             force_reply=True,
             reason="platform_summon",
+            recall_session=_attempt_recall_session(handler),
             store_current=True,
             on_reply_triggered=_fake_reaction,
         )
@@ -2118,6 +2135,7 @@ def test_reaction_sent_then_empty_reply_returns_failure_with_reaction_sent_true(
             reply_context_refetched=False,
             force_reply=True,
             reason="platform_summon",
+            recall_session=_attempt_recall_session(handler),
             store_current=True,
             on_reply_triggered=_dummy_reaction_empty,
         )
@@ -2217,6 +2235,7 @@ def test_reaction_sent_then_delta_missing_returns_failure_with_reaction_sent_tru
             reply_context_refetched=False,
             force_reply=True,
             reason="platform_summon",
+            recall_session=_attempt_recall_session(handler),
             store_current=True,
             on_reply_triggered=_dummy_reaction_delta,
         )
@@ -2288,6 +2307,7 @@ def test_reserve_failure_returns_failure_with_reaction_sent_false(
             reply_context_refetched=False,
             force_reply=False,
             reason="score",
+            recall_session=_attempt_recall_session(handler),
             store_current=True,
             on_reply_triggered=_fake_reaction,
         )
@@ -2373,6 +2393,7 @@ def test_proactive_denied_reason_records_branch_telemetry_and_returns_no_reply(
             reply_context_refetched=False,
             force_reply=False,
             reason="score",
+            recall_session=_attempt_recall_session(handler),
             store_current=True,
         )
     )
@@ -2464,6 +2485,7 @@ def test_proactive_handoff_lost_returns_generate_failure_with_reaction_sent_true
             reply_context_refetched=False,
             force_reply=False,
             reason="score",
+            recall_session=_attempt_recall_session(handler),
             store_current=True,
             on_reply_triggered=_fake_reaction,
         )
@@ -2565,6 +2587,7 @@ def test_pending_reply_does_not_retain_reaction_callback(
             reply_context_refetched=False,
             force_reply=True,
             reason="platform_summon",
+            recall_session=_attempt_recall_session(handler),
             store_current=True,
         )
     )
@@ -2628,6 +2651,7 @@ def test_read_buffers_failure_returns_failure_with_reaction_sent_false(
             reply_context_refetched=False,
             force_reply=True,
             reason="platform_summon",
+            recall_session=_attempt_recall_session(handler),
             store_current=True,
         )
     )

@@ -65,6 +65,7 @@ EXPECTED_EFFECT_CASE_IDS = {
     "group_admission.effect.chat.vision_completion",
     "group_admission.effect.chat.image_download",
     "group_admission.effect.chat.recall",
+    "group_admission.effect.chat.memory_candidate",
     "group_admission.effect.chat.group_read",
     "group_admission.effect.chat.reaction",
     "group_admission.effect.chat.reply_send",

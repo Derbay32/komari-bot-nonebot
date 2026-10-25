@@ -572,6 +572,19 @@ ADMISSION_EFFECT_CASES += (
 
 ADMISSION_EFFECT_CASES += (
     AdmissionEffectCase(
+        effect_id="group_admission.effect.chat.memory_candidate",
+        owner_module="komari_bot.plugins.komari_chat",
+        source_symbol="MessageHandler._retain_candidate",
+        sink_kind="hindsight_retain_http",
+        intent="business",
+        attribution_source="komari_chat_message_group_id",
+        work_category="transient_interaction",
+        acceptance_anchor=(
+            "tests/group_admission/test_chat_effect_admission.py"
+            "::test_memory_candidate_restricted_blocks_retain"
+        ),
+    ),
+    AdmissionEffectCase(
         effect_id="group_admission.effect.chat.group_read",
         owner_module="komari_bot.plugins.komari_chat",
         source_symbol="MessageHandler._refetch_reply",

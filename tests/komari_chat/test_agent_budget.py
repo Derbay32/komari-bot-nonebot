@@ -51,7 +51,10 @@ prompt_builder_module = import_module(
 )
 
 from tests.config.prompt_field_contract import prompt_marker_values
-from tests.komari_chat.hindsight_recall_support import FakeHindsightMemory
+from tests.komari_chat.hindsight_recall_support import (
+    FakeHindsightMemory,
+    fake_recall_session,
+)
 
 # ── 基础替身 ────────────────────────────────────────────────────────────
 
@@ -370,6 +373,7 @@ def test_normal_entry_uses_configured_budget(monkeypatch: pytest.MonkeyPatch) ->
             reply_context_refetched=False,
             force_reply=True,
             reason="platform_summon",
+            recall_session=fake_recall_session(handler.hindsight_memory),
             store_current=True,
         )
     )
@@ -538,6 +542,7 @@ def test_normal_entry_freezes_budget_snapshot_across_rounds(
             reply_context_refetched=False,
             force_reply=True,
             reason="platform_summon",
+            recall_session=fake_recall_session(handler.hindsight_memory),
             store_current=True,
         )
     )
@@ -1157,6 +1162,7 @@ def test_prompt_guided_normal_and_debug_entries_match_simple_entry(
                 reply_context_refetched=False,
                 force_reply=True,
                 reason="platform_summon",
+                recall_session=fake_recall_session(handler.hindsight_memory),
                 store_current=True,
             )
         )
@@ -1304,6 +1310,7 @@ def test_handler_reports_incompatible_provider_rejection_as_reply_failure(
             reply_context_refetched=False,
             force_reply=True,
             reason="platform_summon",
+            recall_session=fake_recall_session(handler.hindsight_memory),
             store_current=True,
         )
     )

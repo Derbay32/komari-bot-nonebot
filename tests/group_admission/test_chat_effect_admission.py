@@ -400,3 +400,44 @@ async def test_fixed_failure_text_restricted_not_notified(
     assert notify_calls == [], (
         "chat.fixed_failure_text 在受限准入下仍触发群内固定错误文本/通知"
     )
+
+
+# ---------------------------------------------------------------------------
+# 记忆候选写入（chat.memory_candidate）
+# ---------------------------------------------------------------------------
+
+
+class _GuardOnlyRetainSession:
+    """只暴露 chat 编排传入的同步 BUSINESS guard，不触达 SDK。"""
+
+    target_fingerprint = "a" * 64
+
+    def __init__(self) -> None:
+        self.guard_results: list[bool] = []
+        self.source_ids: list[str] = []
+
+    async def retain(self, request: Any, *, submission_guard: Any) -> None:
+        self.source_ids.append(request.source_id)
+        self.guard_results.append(submission_guard())
+
+
+async def test_memory_candidate_restricted_blocks_retain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """chat.memory_candidate：受限时 retain 前只得到 False BUSINESS guard。"""
+    from tests.komari_decision.jev_test_support import make_request
+
+    scripted = ScriptedAdjudicate("restricted")
+    install_scripted_adjudicate(monkeypatch, scripted)
+    session = _GuardOnlyRetainSession()
+    handler = message_handler_module.MessageHandler.__new__(
+        message_handler_module.MessageHandler
+    )
+
+    await handler._retain_candidate(make_request(), cast("Any", session))
+
+    assert scripted.calls != [], "chat.memory_candidate 前未调用 adjudicate"
+    assert session.guard_results == [False], (
+        "chat.memory_candidate 在受限准入下仍提交了 retain"
+    )
+    assert session.source_ids and session.source_ids[0].startswith("candidate:")

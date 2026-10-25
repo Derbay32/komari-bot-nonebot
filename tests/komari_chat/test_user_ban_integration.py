@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from importlib import import_module
 from types import SimpleNamespace
 from typing import Any
@@ -10,8 +11,14 @@ import pytest
 from nonebot.adapters.onebot.v11 import Message
 from nonebot.adapters.onebot.v11.event import Sender
 
-from komari_bot.decision.jev import DecisionResult
+from komari_bot.decision.jev import (
+    DecisionMessage,
+    DecisionRequest,
+    DecisionResult,
+    EventIdentity,
+)
 from komari_bot.plugins.komari_chat.handlers.message_handler import MessageHandler
+from tests.komari_chat.hindsight_recall_support import FakeHindsightMemory
 
 message_handler_module = import_module(
     "komari_bot.plugins.komari_chat.handlers.message_handler"
@@ -33,9 +40,21 @@ class _Dispatch:
     """本次分发的共享载体替身：required 聊天路由，交接必须不被调用。"""
 
     def __init__(self) -> None:
-        self.request = SimpleNamespace(
-            target=SimpleNamespace(text="@小鞠 你好"),
-            platform_summoned=True,
+        self.request = DecisionRequest(
+            event=EventIdentity(
+                protocol="onebot_v11",
+                account_id=str(_Event.self_id),
+                group_id=str(_Event.group_id),
+                message_id=str(_Event.message_id),
+            ),
+            target=DecisionMessage(
+                message_id=str(_Event.message_id),
+                group_id=str(_Event.group_id),
+                sender_id=str(_Event.user_id),
+                text="@小鞠 你好",
+                timestamp=datetime.now(UTC),
+            ),
+            received_at=datetime.now(UTC),
         )
         self.result = DecisionResult(
             decision_id="decision-ban",
@@ -84,7 +103,8 @@ async def test_chat_ban_stores_message_without_attempting_reply(
     handler = MessageHandler.__new__(MessageHandler)
     redis = _Redis()
     handler.redis = redis  # type: ignore[assignment]
-    handler.memory = SimpleNamespace()  # type: ignore[assignment]
+    memory = FakeHindsightMemory()
+    handler.hindsight_memory = memory  # type: ignore[assignment]
     handler.decision_engine = SimpleNamespace()  # type: ignore[assignment]
     decisions: list[dict[str, object]] = []
 
@@ -113,7 +133,8 @@ async def test_chat_ban_stores_message_without_attempting_reply(
 
     assert result is None
     assert len(redis.pushed_messages) == 1
-    # 分类与合格原文保存继续；原始正文（未剥离称呼）进入既有存储路径。
+    # 分类与合格原文保存继续；聊天封禁仍提交一次候选，但绝不生成或交接。
+    assert len(memory.retain_calls) == 1
     assert redis.pushed_messages[0].content == "@小鞠 你好"
     assert decisions[0]["reply_action"] == "blocked_by_user_ban"
     assert decisions[0]["status"] == "success"

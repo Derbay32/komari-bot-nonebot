@@ -66,6 +66,12 @@ CHAT_EFFECT_CENSUS: tuple[ChatEffectRow, ...] = (
         "komari_chat/handlers/message_handler.py",
     ),
     _E(
+        "group_admission.effect.chat.memory_candidate",
+        "MessageHandler._retain_candidate",
+        "hindsight_retain_http",
+        "komari_chat/handlers/message_handler.py",
+    ),
+    _E(
         "group_admission.effect.chat.group_read",
         "MessageHandler._refetch_reply",
         "onebot_get_msg",

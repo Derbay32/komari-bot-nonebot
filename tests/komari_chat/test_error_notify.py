@@ -16,6 +16,10 @@ from komari_bot.onebot import (
     ImageFailureDiagnostic,
     image_failure_reason_code,
 )
+from tests.komari_chat.hindsight_recall_support import (
+    FakeHindsightMemory,
+    fake_recall_session,
+)
 
 image_reading_session_module = import_module(
     "komari_bot.plugins.komari_chat.services.image_reading_session"
@@ -109,6 +113,7 @@ class _FakeRedisManager:
 def _build_handler(redis: _FakeRedis | None = None) -> MessageHandler:
     handler = MessageHandler.__new__(MessageHandler)
     handler.redis = _FakeRedisManager(redis or _FakeRedis())
+    handler.hindsight_memory = FakeHindsightMemory()
     return handler
 
 
@@ -683,6 +688,7 @@ async def test_process_message_success_with_image_failures_notifies_once(
     )
 
     assert result is not None
+    assert len(handler.hindsight_memory.retain_calls) == 1
     assert len(notifications) == 1
     notification = notifications[0]
     assert notification.group_text is None
@@ -719,13 +725,45 @@ class _ProcessEvent:
 
 def _forced_dispatch() -> SimpleNamespace:
     """本次分发的共享载体替身：强制回复、已领取一次聊天交接。"""
-    from komari_bot.decision.jev import DecisionResult
+    from datetime import UTC, datetime, timedelta
+
+    from komari_bot.decision.jev import (
+        DecisionMessage,
+        DecisionRequest,
+        DecisionResult,
+        EventIdentity,
+    )
+
+    platform_time = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
+    identity = EventIdentity(
+        protocol="onebot_v11",
+        account_id="bot-1",
+        group_id="12345",
+        message_id="99999",
+    )
+    reference = DecisionMessage(
+        message_id="88888",
+        group_id="12345",
+        sender_id="20000",
+        text="被引用的原文",
+        timestamp=platform_time,
+    )
 
     class _Dispatch:
         def __init__(self) -> None:
-            self.request = SimpleNamespace(
-                target=SimpleNamespace(text="看图"),
-                platform_summoned=False,
+            self.request = DecisionRequest(
+                event=identity,
+                target=DecisionMessage(
+                    message_id="99999",
+                    group_id="12345",
+                    sender_id="10000",
+                    text="看图",
+                    timestamp=platform_time,
+                    reference_ids=("88888",),
+                ),
+                received_at=platform_time + timedelta(seconds=1),
+                dispatch_id="dispatch-image",
+                known_references=(reference,),
             )
             self.result = DecisionResult(
                 decision_id="decision-img",
@@ -810,6 +848,7 @@ def test_normal_reservation_control_flow_is_not_a_failure(
             reply_context_refetched=False,
             force_reply=False,
             reason="score",
+            recall_session=fake_recall_session(FakeHindsightMemory()),
             store_current=False,
         )
     )

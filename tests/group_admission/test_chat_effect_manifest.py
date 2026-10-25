@@ -97,6 +97,12 @@ def test_recall_effect_registered() -> None:
     assert case.sink_kind == "hindsight_recall_http"
 
 
+def test_memory_candidate_effect_registered() -> None:
+    case = _require_chat_effect("group_admission.effect.chat.memory_candidate")
+    _assert_row_stable(case)
+    assert case.sink_kind == "hindsight_retain_http"
+
+
 def test_reply_send_effect_registered() -> None:
     case = _require_chat_effect("group_admission.effect.chat.reply_send")
     _assert_row_stable(case)

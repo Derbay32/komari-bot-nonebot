@@ -42,6 +42,7 @@ from komari_bot.plugins.komari_chat.handlers.message_handler import (
     ReplyResult,
 )
 from komari_bot.plugins.komari_decision.services import jev_dispatch
+from tests.komari_chat.hindsight_recall_support import FakeHindsightMemory
 from tests.komari_decision.jev_test_support import (
     DecisionHarness,
     HarnessOptions,
@@ -321,6 +322,7 @@ class _World:
         self.reservation = _Reservation()
         self.summary_executions: list[dict[str, object]] = []
         self.generation_kwargs: list[dict[str, Any]] = []
+        self.memory = FakeHindsightMemory()
         self.next_message_id = 900_000
         self.memory_config: SimpleNamespace | None = None
         self.superusers: set[str] = set()
@@ -431,7 +433,7 @@ async def _world(
         entry = world.entry
         handler = MessageHandler(
             redis=cast("Any", world.redis),
-            hindsight_memory=cast("Any", SimpleNamespace()),
+            hindsight_memory=cast("Any", world.memory),
             reply_fulfillment=cast("Any", world.fulfillment),
             proactive_reservation=cast("Any", world.reservation),
             decision_engine=harness.decision,
@@ -561,6 +563,7 @@ async def test_normal_message_requests_two_choices_once(
         assert len(harness.transport.requests) == 1
         assert len(world.fulfillment.pending) == 1
         assert world.fulfillment.pending[0].reason == "required"
+        assert len(world.memory.retain_calls) == 1
         row = await _dispatch_row(harness, world, event)
         assert row is not None
         assert row["business_route"] == "chat"
@@ -900,6 +903,7 @@ async def test_ban_classifies_and_stores_but_never_hands_off(
 
         assert _questions(harness) == ["reply_eligibility", "retention_purpose"]
         assert len(world.redis.pushed) == 1
+        assert len(world.memory.retain_calls) == 1
         assert world.fulfillment.pending == []
         assert world.reservation.calls == []
         row = await _dispatch_row(harness, world, event)
@@ -927,6 +931,7 @@ async def test_optional_silent_retains_message_without_reply(
 
         assert harness.random_draws == 1
         assert len(world.redis.pushed) == 1
+        assert len(world.memory.retain_calls) == 1
         assert world.fulfillment.pending == []
         assert world.reservation.calls == []
         row = await _dispatch_row(harness, world, event)
@@ -950,6 +955,7 @@ async def test_ordinary_technical_failure_preserves_original_message(
 
         assert len(harness.transport.requests) == 1
         assert len(world.redis.pushed) == 1
+        assert world.memory.retain_calls == []
         assert world.fulfillment.pending == []
         assert world.bot.sent == []
 
@@ -1179,6 +1185,7 @@ async def test_refused_handoff_never_makes_generation_context_get_msg_calls(
         )
         await _dispatch(world, warmup)
         assert len(world.get_msg_calls) == 1
+        assert len(world.memory.retain_calls) == 1
 
         # 判定已完成、既有履约重复检查之后撤权：交接必然被拒。
         def _revoke_after_evaluation() -> None:
@@ -1193,6 +1200,7 @@ async def test_refused_handoff_never_makes_generation_context_get_msg_calls(
         await _dispatch(world, refused)
 
         assert len(world.get_msg_calls) == 1, "交接被拒后仍补取了生成上下文"
+        assert len(world.memory.retain_calls) == 1
         assert len(world.fulfillment.pending) == 1
         assert len(world.generation_kwargs) == 1
         row = await _dispatch_row(harness, world, refused)
