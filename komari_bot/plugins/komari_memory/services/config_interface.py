@@ -4,8 +4,8 @@
 为插件内部提供统一的配置访问接口。
 
 使用示例：
-    from .config_interface import get_config
-    config = get_config()
+    from .config_interface import get_config_async
+    config = await get_config_async()
 """
 
 from typing import cast
@@ -26,18 +26,9 @@ _config_manager = config_manager_plugin.get_config_manager(
 )
 
 
-def get_config() -> KomariMemoryConfigSchema:
-    """获取当前配置（自动检测文件变化）。
-
-    Returns:
-        当前配置对象
-    """
-    return cast("KomariMemoryConfigSchema", _config_manager.get())
-
-
 async def get_config_async() -> KomariMemoryConfigSchema:
     """在事件循环内异步获取当前配置。"""
     return cast("KomariMemoryConfigSchema", await _config_manager.get_async())
 
 
-__all__ = ["get_config", "get_config_async"]
+__all__ = ["get_config_async"]

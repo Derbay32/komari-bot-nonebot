@@ -7,12 +7,11 @@
 - ``output_instruction`` 是被删除字段；
 - ``tool_call_instruction`` / ``image_read_instruction`` 是 TSK-188
   实现决策 26 明确点名的字段名，按精确名称断言；
-- 其余职责（画像读取、联网搜索、网页抓取、委托图片理解、视觉描述）
+- 其余职责（联网搜索、网页抓取、委托图片理解、视觉描述）
   只按字段名关键词断言“存在独立行为字段”，不锁定完整命名；
 - seed 资产的聊天 Prompt 块定位约定：``find_chat_prompt_mapping``
   查找包含 ``system_prompt`` 且不含 ``planning_system_prompt`` 的映射
-  （后者是 group_history_summary 的判别键；komari_memory_summary 无
-  ``system_prompt``），除此之外不锁定 YAML 布局。
+  （后者是 group_history_summary 的判别键），除此之外不锁定 YAML 布局。
 """
 
 from __future__ import annotations
@@ -36,7 +35,6 @@ REQUIRED_EXACT_FIELDS: tuple[str, ...] = (
 #: 每个职责必须命中至少一个字段，且各职责命中的字段互不相同
 #: （"独立行为字段"，TSK-190 验收标准 2）。
 BEHAVIOR_RESPONSIBILITIES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("画像读取", ("profile",)),
     ("联网搜索", ("search",)),
     ("网页抓取", ("fetch",)),
     ("委托图片理解/图片理解引导", ("delegat",)),

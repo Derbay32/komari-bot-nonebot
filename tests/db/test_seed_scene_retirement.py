@@ -189,8 +189,8 @@ async def test_prompt_only_seed_initializes_at_head_without_retired_tables() -> 
         result = run_seed(url)
         output = f"{result.stdout}\n{result.stderr}"
         assert result.returncode == 0, output
-        assert "新建 4 行" in output, (
-            f"播种报告必须确认三项必需 Prompt 与可选判定 Prompt 均新建单行: {output}"
+        assert "新建 3 行" in output, (
+            f"播种报告必须确认两项必需 Prompt 与可选判定 Prompt 均新建单行: {output}"
         )
 
         connection = await asyncpg.connect(**scratch)

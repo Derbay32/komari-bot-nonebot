@@ -90,12 +90,9 @@ async def test_context_migration_moves_only_redis_db_and_preserves_memory() -> N
         finally:
             await connection.close()
 
-        result = run_bootstrap(db_url, "upgrade", "head")
+        # Historical invariant at 0026's intended revision.
+        result = run_bootstrap(db_url, "upgrade", "0026")
         assert result.returncode == 0, result.stderr
-
-        check = run_bootstrap(db_url, "check")
-        assert check.returncode == 0, f"{check.stdout}\n{check.stderr}"
-
         connection = await asyncpg.connect(**scratch)
         try:
             context_row = await connection.fetchrow(
@@ -114,10 +111,13 @@ async def test_context_migration_moves_only_redis_db_and_preserves_memory() -> N
                 )
             }
             assert "redis_db" not in memory_columns
-            summary = await connection.fetchval(
-                "SELECT summary FROM komari_memory_conversations WHERE group_id = 'g1'"
+            assert (
+                await connection.fetchval(
+                    "SELECT summary FROM komari_memory_conversations "
+                    "WHERE group_id = 'g1'"
+                )
+                == "formal memory canary"
             )
-            assert summary == "formal memory canary"
         finally:
             await connection.close()
 
@@ -130,6 +130,37 @@ async def test_context_migration_moves_only_redis_db_and_preserves_memory() -> N
             ) == 7
             assert await connection.fetchval(
                 "SELECT to_regclass($1) IS NULL", _CONTEXT_TABLE
+            )
+        finally:
+            await connection.close()
+
+        # Advance to the current head: 0030 keeps the live redis_db owner and
+        # the formal source row while retiring legacy memory columns.
+        result = run_bootstrap(db_url, "upgrade", "head")
+        assert result.returncode == 0, result.stderr
+        check = run_bootstrap(db_url, "check")
+        assert check.returncode == 0, f"{check.stdout}\n{check.stderr}"
+        connection = await asyncpg.connect(**scratch)
+        try:
+            assert await connection.fetchval(
+                f"SELECT redis_db FROM {_CONTEXT_TABLE} WHERE id = 1"
+            ) == 7
+            memory_columns = {
+                str(row["column_name"])
+                for row in await connection.fetch(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = $1",
+                    _MEMORY_TABLE,
+                )
+            }
+            assert "redis_db" not in memory_columns
+            assert "llm_model_summary" not in memory_columns
+            assert (
+                await connection.fetchval(
+                    "SELECT summary FROM komari_memory_conversations "
+                    "WHERE group_id = 'g1'"
+                )
+                == "formal memory canary"
             )
         finally:
             await connection.close()

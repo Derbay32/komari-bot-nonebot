@@ -342,16 +342,25 @@ async def test_populated_0024_upgrade_retires_only_scene_storage() -> None:
             )
             # 1. 四张退役表消失；0026 新增的 context 表属于后续契约。
             after_tables = await _public_tables(connection)
-            assert after_tables == (before_tables - set(RETIRED_TABLES)) | {
-                "komari_context_config"
-            }
+            assert after_tables == (
+                before_tables
+                - set(RETIRED_TABLES)
+                - {"komari_prompt_memory_summary"}
+            ) | {"komari_context_config"}
             # 2. 历史表逐列不变；chat 既有列前缀不变并允许 0027 追加列。
             after_schema = await _schema_snapshot(connection)
             expected_schema = {
                 table: definition
                 for table, definition in before_schema.items()
                 if table not in RETIRED_TABLES
+                and table != "komari_prompt_memory_summary"
             }
+            # 0030 drops the dead chat profile-read prompt column.
+            expected_schema["komari_prompt_komari_chat"] = tuple(
+                definition
+                for definition in before_schema["komari_prompt_komari_chat"]
+                if definition[0] != "profile_read_instruction"
+            )
             expected_schema[DECISION_CONFIG_TABLE] = tuple(
                 definition
                 for definition in before_schema[DECISION_CONFIG_TABLE]
@@ -473,7 +482,7 @@ async def test_downgrade_from_0025_is_rejected_without_restoring_storage() -> No
     scratch = await recreate_scratch_database(_scratch_name("tsk190down"))
     database_url = scratch_url(str(scratch["database"]))
     try:
-        upgraded = run_bootstrap(database_url, "upgrade", "head")
+        upgraded = run_bootstrap(database_url, "upgrade", "0025")
         assert upgraded.returncode == 0, upgraded.stdout + upgraded.stderr
         downgraded = run_bootstrap(database_url, "downgrade", "0024")
         assert downgraded.returncode != 0, (
@@ -487,7 +496,7 @@ async def test_downgrade_from_0025_is_rejected_without_restoring_storage() -> No
             # 拒绝回退后仍停在 0025，且没有表/数据被“恢复”
             assert (
                 await connection.fetchval("SELECT version_num FROM alembic_version")
-                == HEAD_REVISION
+                == "0025"
             )
             tables = await _public_tables(connection)
             assert not set(RETIRED_TABLES) & tables

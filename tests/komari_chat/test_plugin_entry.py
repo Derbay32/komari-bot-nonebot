@@ -49,7 +49,6 @@ def _install_allowed_entry_dependencies(
             return False
 
     monkeypatch.setattr(chat_module, "get_config", lambda: config)
-    monkeypatch.setattr(chat_module, "get_context_config", lambda: config)
     monkeypatch.setattr(chat_module, "_get_or_build_handler", lambda: handler)
     monkeypatch.setattr(
         chat_module,
@@ -197,7 +196,6 @@ async def test_admission_gate_controls_group_message_processing(
             calls.dispatch = kwargs.get("decision_dispatch")
 
     monkeypatch.setattr(chat_module, "get_config", lambda: config)
-    monkeypatch.setattr(chat_module, "get_context_config", lambda: config)
     monkeypatch.setattr(chat_module, "_get_or_build_handler", lambda: _Handler())
     monkeypatch.setattr(chat_module, "adjudicate", _adjudicate_allowed)
     monkeypatch.setattr(chat_module, "user_ban_plugin", _BanPlugin())
@@ -891,32 +889,25 @@ async def test_worker_rethrows_cancelled_error_from_handler(
     assert errors_logged == []
 
 
-def test_fulfillment_config_reads_global_controls_from_context(
+def test_fulfillment_config_reads_only_the_chat_config_owner(
     chat_module: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """TSK-192 phase B: fulfillment construction never reads memory config."""
+    """TSK-192 phase B / TSK-197: fulfillment never reads retired context controls."""
     from komari_bot.plugins.komari_chat.config_schema import (
         KomariChatConfigSchema,
-    )
-    from komari_bot.plugins.komari_context.config_schema import (
-        KomariContextConfigSchema,
     )
 
     chat_config = KomariChatConfigSchema(
         proactive_cooldown=44,
         reply_fulfillment_batch_size=17,
     )
-    context_config = KomariContextConfigSchema(
-        global_interaction_enabled=False,
-        global_interaction_trigger_size=9,
-    )
     monkeypatch.setattr(chat_module, "get_config", lambda: chat_config)
-    monkeypatch.setattr(chat_module, "get_context_config", lambda: context_config)
 
     fulfillment_config = chat_module._get_reply_fulfillment_config()
 
     assert fulfillment_config.proactive_cooldown == 44
     assert fulfillment_config.reply_fulfillment_batch_size == 17
-    assert fulfillment_config.global_interaction_enabled is False
-    assert fulfillment_config.global_interaction_trigger_size == 9
+    assert not hasattr(fulfillment_config, "global_interaction_enabled")
+    assert not hasattr(fulfillment_config, "global_interaction_trigger_size")
+    assert not hasattr(chat_module, "get_context_config")

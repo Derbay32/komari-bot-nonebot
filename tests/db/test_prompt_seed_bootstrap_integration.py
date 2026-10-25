@@ -9,7 +9,7 @@
 版本与数据不受影响。门控用户需要 CREATEDB 权限。
 
 覆盖清单（对应验收标准）：
-- 全新数据库：seed 把三个 Prompt 资源（chat / memory summary / group
+- 全新数据库：seed 把两个必需 Prompt 资源（chat / group
   history summary）的完整初始值写入 PostgreSQL，字段与强类型 Schema 一致，
   重复执行幂等（TSK-190/191 AC1/AC6/AC9）；
 - 部分已有：只补空字段（含纯空白）、绝不覆盖非空自定义值，重复执行幂等
@@ -218,7 +218,7 @@ async def _fetch_prompt_row(
 
 
 async def test_fresh_db_seed_writes_complete_prompt_rows_and_is_idempotent() -> None:
-    """AC1/AC6/AC9-新库：seed 写入三个资源完整 Prompt 行；重跑零变化。"""
+    """AC1/AC6/AC9-新库：seed 写入两个必需资源完整 Prompt 行；重跑零变化。"""
     if not _same_database(POSTGRES_URL, SQLALCHEMY_URL):
         pytest.skip("KOMARI_TEST_POSTGRES_URL 与 SQLALCHEMY_DATABASE_URL 不一致")
 
@@ -338,7 +338,7 @@ async def test_seed_fills_empty_fields_and_keeps_custom_values() -> None:
 
 
 async def test_seed_never_touches_fully_custom_rows() -> None:
-    """AC6：三个资源全部字段已有非空自定义值时，seed 一次也不写入。"""
+    """AC6：两个必需资源全部字段已有非空自定义值时，seed 一次也不写入。"""
     if not _same_database(POSTGRES_URL, SQLALCHEMY_URL):
         pytest.skip("KOMARI_TEST_POSTGRES_URL 与 SQLALCHEMY_DATABASE_URL 不一致")
 

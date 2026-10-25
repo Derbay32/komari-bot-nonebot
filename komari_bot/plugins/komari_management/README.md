@@ -294,8 +294,8 @@ Base path：`/api/v2/komari-management-prompt`
 
 ```text
 komari_chat
-komari_memory_summary
 group_history_summary
+komari_decision
 ```
 
 所有 Prompt 写操作除审计请求头外，还必须发送当前详情响应里的 `revision`：
@@ -542,7 +542,7 @@ Base path：`/api/v2/komari-search`
 ## 11. 后端运行说明
 
 - 动态配置存储于 PostgreSQL 强类型单行表 `komari_<插件>_config`（14 张，迁移 0002 建表），旧 JSONB KV 表 `komari_plugin_configs` 仅保留存量数据、运行时不读写；
-- Prompt 存储于 3 张强类型单行表（`komari_prompt_komari_chat` / `komari_prompt_memory_summary` / `komari_prompt_group_history_summary`，迁移 0003 建表），旧 YAML 不是运行时来源；
+- Prompt 存储于强类型单行表（两个必需资源 `komari_prompt_komari_chat` / `komari_prompt_group_history_summary`，以及可选的 `komari_prompt_komari_decision`），旧 YAML 不是运行时来源；
 - 业务插件自己的管理 API 挂载逻辑已经移除，统一由本插件注册；
-- 知识库、帮助库、记忆库或 Agent Run 日志依赖未初始化时，对应接口可能返回 `503`；
+- 知识库、帮助库或 Agent Run 日志依赖未初始化时，对应接口可能返回 `503`；
 - FastAPI OpenAPI 是字段级类型、格式和长度限制的最终机器可读契约，前端类型应优先从 OpenAPI 生成或定期校对。

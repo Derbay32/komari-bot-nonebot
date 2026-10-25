@@ -1,8 +1,8 @@
-"""TSK-192 phase A: komari_context owns the shared recent-context Redis client.
+"""TSK-192 phase A / TSK-197: komari_context owns the shared Redis resource.
 
-These are the RED acceptance tests for the new independent resource slice.  They
-exercise the registered plugin lifecycle (not a test-only factory) and the
-neutral store through its public seam.
+These cases exercise the registered plugin lifecycle (not a test-only factory)
+and the neutral store's ownership boundary.  Behavioral append/trim coverage
+against a real Redis lives in ``test_context_redis_real.py``.
 """
 
 from __future__ import annotations
@@ -67,12 +67,7 @@ class _ConfigManager:
 
 @asynccontextmanager
 async def _loaded_plugin(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[Any]:
-    """Execute the real plugin entry and expose the hooks it registers.
-
-    The suite shim for this package is temporarily replaced, so the production
-    module body (require + driver hook registration + config manager creation)
-    really runs.  All external boundaries are doubled below.
-    """
+    """Execute the real plugin entry and expose the hooks it registers."""
     from nonebot import get_driver
 
     lifespan = get_driver()._lifespan
@@ -94,7 +89,7 @@ async def _loaded_plugin(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[Any]:
         assert name == "komari_context"
         return config_manager
 
-    import komari_bot.plugins.config_manager as config_manager_package
+    from komari_bot.plugins import config_manager as config_manager_package
 
     monkeypatch.setattr(
         config_manager_package,
@@ -139,83 +134,46 @@ async def _loaded_plugin(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[Any]:
             sys.modules[f"{PACKAGE}.config_schema"] = saved_schema
 
 
-def test_context_key_strings_are_preserved_and_memory_keys_extend_them() -> None:
-    """Active fulfillment key identity must not change with the move."""
-    from komari_bot.plugins.komari_memory.services.redis_keys import (
-        RedisKeys as MemoryRedisKeys,
-    )
-
+def test_context_key_strings_are_preserved() -> None:
+    """Active buffer and fulfillment key identity must not change."""
     assert RedisKeys.PREFIX == "komari_memory"
     assert RedisKeys.buffer("g1") == "komari_memory:buffer:g1"
-    assert RedisKeys.last_message("g1") == "komari_memory:last_message:g1"
-    assert RedisKeys.session_start("g1") == "komari_memory:session_start:g1"
     assert (
         RedisKeys.chat_commit_step("op-1", "ai_history")
         == "komari_memory:chat_commit:op-1:ai_history"
     )
-    assert RedisKeys.global_interaction("u1") == "komari_memory:global_interaction:u1"
-    assert issubclass(MemoryRedisKeys, RedisKeys)
-    assert (
-        MemoryRedisKeys.buffer_processing("g1", "snapshot")
-        == "komari_memory:buffer:processing:g1:snapshot"
-    )
+    # Retired legacy interaction namespaces and dead session metadata are gone.
+    for name in (
+        "GLOBAL_INTERACTION",
+        "GLOBAL_INTERACTION_PATTERN",
+        "GLOBAL_INTERACTION_PENDING",
+        "LAST_MESSAGE",
+        "SESSION_START",
+    ):
+        assert not hasattr(RedisKeys, name), name
+    for name in ("global_interaction", "last_message", "session_start"):
+        assert not hasattr(RedisKeys, name), name
 
 
 def test_recent_context_store_uses_only_the_supplied_client() -> None:
-    from tests.komari_memory.test_redis_manager import _FakeRedis
+    supplied = SimpleNamespace()
+    store = RecentContextStore(cast("Any", supplied))
 
-    fake = _FakeRedis()
-    store = RecentContextStore(cast("Any", fake))
-
-    assert store.redis is fake
+    assert store.redis is supplied
     assert not hasattr(store, "initialize")
     assert not hasattr(store, "close")
-
-
-def test_recent_context_store_preserves_once_only_evidence_and_reads() -> None:
-    from tests.komari_memory.test_redis_manager import _FakeRedis
-
-    fake = _FakeRedis()
-    store = RecentContextStore(cast("Any", fake))
-    first = MessageSchema(
-        user_id="bot",
-        user_nickname="小鞠",
-        group_id="g1",
-        content="只写一次",
-        timestamp=1.5,
-        message_id="m1",
-        is_bot=True,
-    )
-
-    assert _run(store.push_message_once("g1", first, operation_id="op-1")) is True
-    assert _run(store.push_message_once("g1", first, operation_id="op-1")) is False
-    assert _run(store.push_global_interaction_once(
-        user_id="u1",
-        record={"event": "e", "result": "r", "emotion": "m"},
-        trigger_size=1,
-        operation_id="op-1",
-    )) is True
-    assert _run(store.push_global_interaction_once(
-        user_id="u1",
-        record={"event": "e", "result": "r", "emotion": "m"},
-        trigger_size=1,
-        operation_id="op-1",
-    )) is False
-
-    messages = _run(store.get_buffer("g1"))
-    assert [message.message_id for message in messages] == ["m1"]
-    assert _run(store.get_context_around_message("g1", "m1"))[0].content == "只写一次"
-    assert _run(store.get_last_message_time("g1")) is not None
-    assert _run(store.get_session_start_time("g1")) is not None
-    assert _run(store.get_active_groups()) == ["g1"]
-    assert _run(store.delete_chat_commit_evidence("op-1")) == 2
-    assert _run(store.delete_chat_commit_evidence("op-1")) == 0
-
-
-def _run(coroutine: Any) -> Any:
-    import asyncio
-
-    return asyncio.run(coroutine)
+    # Retired legacy surfaces are gone.
+    for method in (
+        "push_global_interaction",
+        "push_global_interaction_once",
+        "get_global_interaction_buffer",
+        "get_last_message_time",
+        "get_session_start_time",
+        "get_active_groups",
+        "delete_buffer",
+        "get_context_around_message",
+    ):
+        assert not hasattr(store, method), method
 
 
 @pytest.mark.asyncio
@@ -288,3 +246,16 @@ async def test_failed_context_startup_cleans_only_its_new_client(
         assert failing.pinged is True
         assert failing.closed == 1
         assert module.get_context_store() is None
+
+
+def test_message_schema_shape_is_unchanged() -> None:
+    message = MessageSchema(
+        user_id="u1",
+        user_nickname="用户",
+        group_id="g1",
+        content="正文",
+        timestamp=1.5,
+        message_id="m1",
+        is_bot=True,
+    )
+    assert message.is_bot is True

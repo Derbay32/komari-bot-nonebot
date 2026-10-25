@@ -6,8 +6,8 @@
         [--decision-seed-file PATH]
 
 必需 manifest（``--seed-file``，默认
-``komari_bot/db/initial_data/scenes.yaml``）只携带三个必需 Prompt 资源
-（chat / memory summary / group history summary）的初始数据；
+``komari_bot/db/initial_data/scenes.yaml``）只携带两个必需 Prompt 资源
+（chat / group history summary）的初始数据；
 ``--decision-seed-file``（默认
 ``komari_bot/db/initial_data/decision_prompt.yaml``）是**可选**的判定 Prompt
 初始数据资产：它独立解析与校验，避免可选资产的格式错误影响必需资源的校验；
@@ -25,14 +25,14 @@ TSK-190 起判定场景初始化退役（依据 TSK-180 与 TSK-159 最终决议
 1. **seed 文件校验先于数据库访问**：默认读取
    ``komari_bot/db/initial_data/scenes.yaml``（可经 ``--seed-file`` 覆盖），
    校验 version，并在 YAML 解析阶段拒绝 mapping 重复键（PyYAML 默认静默
-   覆盖）；同时校验三个必需 Prompt 资源的初始数据块：字段集合与各自强类型
+   覆盖）；同时校验两个必需 Prompt 资源的初始数据块：字段集合与各自强类型
    Schema 一一对应、全部非空字符串且共享内容预算通过，缺块/缺字段/违规在
    数据库访问前即失败，任何格式或约束不满足都以非零退出码结束并指明出错的
    seed 文件。
-2. **只插缺失、绝不覆盖**：三个 Prompt 资源只新建缺失单行（id=1）并补齐空
+2. **只插缺失、绝不覆盖**：两个 Prompt 资源只新建缺失单行（id=1）并补齐空
    字段（``None``、空字符串与纯空白字符串均视为空），非空自定义值绝不覆盖；
    重复执行幂等（TSK-190/191 验收标准 6）。
-3. **写入后验证最终数据库状态足以冷启动**：校验 PostgreSQL 中三个 Prompt
+3. **写入后验证最终数据库状态足以冷启动**：校验 PostgreSQL 中两个 Prompt
    资源单行全部字段非空；不满足则命令失败，容器 prestart 的 ``set -e`` 会
    随之中止应用启动（fail fast）。
 4. **运行时从不读取本文件**：初始化数据只是 bootstrap seed，运行时的 Prompt
@@ -92,10 +92,10 @@ _PROMPT_STORAGE_FIELDS: frozenset[str] = frozenset(
     {"id", "revision", "updated_at"}
 )
 
-#: TSK-191：seed 资产必须为三个 Prompt 资源全部提供完整初始数据块。
+#: TSK-191：seed 资产必须为两个必需 Prompt 资源全部提供完整初始数据块。
+#: TSK-197 退役记忆总结 Prompt 后不再包含 ``komari_memory_summary``。
 _PROMPT_RESOURCE_IDS: tuple[str, ...] = (
     "komari_chat",
-    "komari_memory_summary",
     "group_history_summary",
 )
 
@@ -174,15 +174,14 @@ class SeedPayload:
     """校验通过的版本化初始数据载荷。"""
 
     version: str
-    #: 三个 Prompt 资源（chat / memory summary / group history summary）
-    #: 的完整初始值（TSK-191）；文件缺块时键缺失，由 CLI 层按冷启动
-    #: 要求拒绝。
+    #: 两个必需 Prompt 资源（chat / group history summary）的完整初始值
+    #: （TSK-191）；文件缺块时键缺失，由 CLI 层按冷启动要求拒绝。
     prompts: dict[str, dict[str, str]]
 
 
 @dataclass(frozen=True)
 class SeedReport:
-    """播种结果：三个必需 Prompt 资源新建行 / 补齐字段数。"""
+    """播种结果：两个必需 Prompt 资源新建行 / 补齐字段数。"""
 
     prompt_rows_inserted: int
     prompt_fields_filled: int
@@ -193,8 +192,7 @@ def _find_prompt_mapping(raw: object, resource_id: str) -> dict[str, Any] | None
 
     判别键：komari_chat = 包含 ``system_prompt`` 且不含
     ``planning_system_prompt``；group_history_summary = 包含
-    ``planning_system_prompt``；komari_memory_summary = 包含
-    ``memory_summary_common_system``。遍历不修改原文档，找不到返回 ``None``。
+    ``planning_system_prompt``。遍历不修改原文档，找不到返回 ``None``。
     """
     if resource_id == "komari_chat":
 
@@ -208,11 +206,6 @@ def _find_prompt_mapping(raw: object, resource_id: str) -> dict[str, Any] | None
 
         def predicate(node: dict[str, Any]) -> bool:
             return "planning_system_prompt" in node
-
-    elif resource_id == "komari_memory_summary":
-
-        def predicate(node: dict[str, Any]) -> bool:
-            return "memory_summary_common_system" in node
 
     else:
         msg = f"未知 Prompt 资源: {resource_id}"
@@ -404,7 +397,7 @@ def _load_yaml_document(path: Path) -> dict[str, Any]:
 def load_seed_file(path: Path) -> SeedPayload:
     """读取并校验版本化 seed 文件，返回归一化 Prompt 载荷。
 
-    只校验 version 与三个必需 Prompt 资源的初始数据块；旧场景键属于无关
+    只校验 version 与两个必需 Prompt 资源的初始数据块；旧场景键属于无关
     顶层键，既不校验也不据此新增拒绝规则。校验失败抛出
     :class:`SeedValidationError`，消息始终指明出错的 seed 文件路径，并在
     缺键 / 重复键情形点名具体键。
@@ -587,7 +580,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="python -m komari_bot.db.seed_bootstrap",
         description=(
-            "版本化初始数据播种：校验 seed 文件后只为三个必需 Prompt 资源"
+            "版本化初始数据播种：校验 seed 文件后只为两个必需 Prompt 资源"
             "补插缺失单行或补齐空字段，并在写入后验证数据库最终状态足以冷启动。"
         ),
     )

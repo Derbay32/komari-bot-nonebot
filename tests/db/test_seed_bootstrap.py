@@ -4,11 +4,11 @@
 外部行为；本文件直接锁定契约未完全覆盖的生产语义：
 
 - 文件校验细节：version 缺失、根节点非对象、YAML 解析失败；
-- 版本化 manifest 只要求三个 Prompt 资源块：完全不含场景块的 manifest
+- 版本化 manifest 只要求两个 Prompt 资源块：完全不含场景块的 manifest
   必须校验通过（TSK-190 退役场景初始化）；
 - 旧场景键是**无关顶层键**：校验层不因此新增拒绝规则，读取时直接忽略；
 - 载荷与报告只统计 Prompt：不再携带场景条目或场景计数；
-- 默认版本化资产只携带三个 Prompt 资源块，不再携带 ``fixed_candidates`` /
+- 默认版本化资产只携带两个 Prompt 资源块，不再携带 ``fixed_candidates`` /
   ``general_scenes``。
 
 测试数据只使用测试自有的 marker，Prompt 字段名一律从
@@ -39,10 +39,9 @@ from tests.config.prompt_field_contract import (
 if TYPE_CHECKING:
     from pathlib import Path
 
-#: 三个 Prompt 资源块在 manifest 中的节名（只影响可读性，不参与定位）。
+#: 两个必需 Prompt 资源块在 manifest 中的节名（只影响可读性，不参与定位）。
 _SECTION_BY_RESOURCE: dict[str, str] = {
     "komari_chat": "chat_prompt",
-    "komari_memory_summary": "memory_summary_prompt",
     "group_history_summary": "group_history_summary_prompt",
 }
 
@@ -84,7 +83,7 @@ def _write(tmp_path: Path, name: str, body: str) -> Path:
 
 
 def test_load_seed_file_accepts_prompt_only_seed(tmp_path: Path) -> None:
-    """场景块退役后，只带三个 Prompt 块的 manifest 是完整合法载荷。"""
+    """场景块退役后，只带两个必需 Prompt 块的 manifest 是完整合法载荷。"""
     path = _write(tmp_path, "prompt-only.yaml", _prompt_seed_text())
 
     payload = load_seed_file(path)

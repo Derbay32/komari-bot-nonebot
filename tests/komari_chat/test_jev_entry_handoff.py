@@ -483,7 +483,6 @@ async def _world(
         )
         monkeypatch.setattr(entry, "user_ban_plugin", _BanPlugin(ban))
         monkeypatch.setattr(entry, "adjudicate", _admit_all)
-        monkeypatch.setattr(entry, "get_context_config", lambda: memory_config)
         monkeypatch.setattr(entry, "get_config", lambda: chat_config)
         monkeypatch.setattr(handler_module, "get_context_config", lambda: memory_config)
         monkeypatch.setattr(handler_module, "get_config", lambda: chat_config)

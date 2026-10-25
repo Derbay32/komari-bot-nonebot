@@ -363,6 +363,55 @@ def test_read_buffers_uses_context_limit_instead_of_summary_limit(
     assert stored is False
 
 
+def test_read_buffers_excludes_chat_trigger_from_its_own_prompt_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Chat trigger is stored after reading, so it never appears in its own context."""
+    history = [
+        MessageSchema(
+            user_id="u1",
+            user_nickname="用户",
+            group_id="g1",
+            content="更早的消息",
+            timestamp=1.0,
+            message_id="m1",
+        )
+    ]
+    redis = _FakeRedis(history)
+    handler = message_handler_module.MessageHandler.__new__(
+        message_handler_module.MessageHandler
+    )
+    handler.redis = redis
+    _patch_both_configs(
+        monkeypatch,
+        lambda: SimpleNamespace(
+            context_messages_limit=10,
+            context_max_utf8_bytes=24_000,
+            context_max_estimated_tokens=6_000,
+        ),
+    )
+    current = MessageSchema(
+        user_id="u2",
+        user_nickname="当前用户",
+        group_id="g1",
+        content="当前触发消息",
+        timestamp=2.0,
+        message_id="current",
+    )
+
+    recent, stored = asyncio.run(
+        handler._read_buffers(
+            group_id="g1",
+            message=current,
+            store_current=True,
+        )
+    )
+
+    assert stored is True
+    assert [message.message_id for message in recent] == ["m1"]
+    assert [message.message_id for message in redis.pushed_messages] == ["current"]
+
+
 def test_attempt_reply_only_rewrites_current_message(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

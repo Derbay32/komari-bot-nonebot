@@ -56,17 +56,13 @@ from komari_bot.plugins.group_admission import (
     adjudicate,
 )
 from komari_bot.plugins.komari_chat.services.config_interface import get_config
-from komari_bot.plugins.komari_context import get_context_config
 
 
 def _get_reply_fulfillment_config() -> Any:
-    """Read fulfillment policy from its actual chat/context owners."""
+    """Read fulfillment policy from its chat config owner."""
     config = get_config()
-    context_config = get_context_config()
     return SimpleNamespace(
         proactive_cooldown=config.proactive_cooldown,
-        global_interaction_enabled=context_config.global_interaction_enabled,
-        global_interaction_trigger_size=context_config.global_interaction_trigger_size,
         reply_fulfillment_lease_seconds=config.reply_fulfillment_lease_seconds,
         reply_fulfillment_max_attempts=config.reply_fulfillment_max_attempts,
         reply_fulfillment_retry_base_seconds=config.reply_fulfillment_retry_base_seconds,

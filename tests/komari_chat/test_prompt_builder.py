@@ -632,7 +632,7 @@ def test_build_prompt_reads_behavior_fields_from_snapshot_and_drops_old_instruct
 ) -> None:
     """AC5：builder 从模板快照注入各可调行为 Prompt，不再注入 output_instruction。
 
-    主回复 builder 必须注入角色、tool_call、image_read、profile/search/
+    主回复 builder 必须注入角色、tool_call、image_read、search/
     fetch/delegated image 行为字段；视觉描述职责字段
     （``vision_description_prompt``）只供 vision_service 子调用消费，
     必须明确断言其 marker 不出现在主 Agent messages。
@@ -661,7 +661,6 @@ def test_build_prompt_reads_behavior_fields_from_snapshot_and_drops_old_instruct
     joined = "\n".join(str(message["content"]) for message in messages)
     resolved = resolve_behavior_field_names(chat_prompt_field_names())
     vision_field = resolved["视觉描述"]
-    profile_field = resolved["画像读取"]
     expected_markers = [
         "SYS-ROLE",
         "TOOL-CALL-INSTR",
@@ -669,16 +668,13 @@ def test_build_prompt_reads_behavior_fields_from_snapshot_and_drops_old_instruct
         *(
             f"DB-{field.upper()}"
             for field in resolved.values()
-            if field not in {vision_field, profile_field}
+            if field != vision_field
         ),
     ]
     for marker in expected_markers:
         assert marker in joined, f"builder 未注入 DB 快照行为字段: {marker}"
     assert f"DB-{vision_field.upper()}" not in joined, (
         "视觉描述职责字段只供 vision_service 子调用消费，不得注入主回复 Agent messages"
-    )
-    assert f"DB-{profile_field.upper()}" not in joined, (
-        "TSK-193 起 read_profile 工具及其画像提示已移除"
     )
     assert "OLD-OUTPUT-SENTINEL" not in joined, (
         "builder 不得再注入已删除的 output_instruction 内容"

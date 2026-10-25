@@ -9,7 +9,7 @@
 - 容器 prestart 在 ``upgrade head`` 之后调用同一命令，``set -e`` 使任一步
   失败即中止容器启动（fail fast）。
 
-TSK-190 起场景初始化退役：默认资产只携带三个 Prompt 资源块，manifest 不再
+TSK-190 起场景初始化退役：默认资产只携带必需 Prompt 资源块，manifest 不再
 要求任何场景键（``fixed_candidates`` / ``general_scenes``）。旧场景键按无关
 顶层键忽略，校验层不新增拒绝规则；YAML 重复键拒绝仍是通用规则，覆盖根键与
 Prompt 映射键。
@@ -54,10 +54,9 @@ UNREACHABLE_DB_URL = (
     "postgresql+asyncpg://seed_test:seed_test@seed-unreachable.invalid:1/seed_test"
 )
 
-#: 三个 Prompt 资源块在 manifest 中的节名（只影响可读性，不参与定位）。
+#: 必需 Prompt 资源块在 manifest 中的节名（只影响可读性，不参与定位）。
 _SECTION_BY_RESOURCE: dict[str, str] = {
     "komari_chat": "chat_prompt",
-    "komari_memory_summary": "memory_summary_prompt",
     "group_history_summary": "group_history_summary_prompt",
 }
 
@@ -152,7 +151,7 @@ def _prompt_manifest_text(*, duplicate_chat_field: str | None = None) -> str:
 
 
 def test_versioned_seed_file_carries_prompt_blocks_without_scene_blocks() -> None:
-    """默认资产只带三个 Prompt 资源块，不再携带退役场景块。"""
+    """默认资产只带必需 Prompt 资源块，不再携带退役场景块。"""
     assert DEFAULT_SEED_FILE.is_file(), (
         f"缺少版本化初始数据文件: {DEFAULT_SEED_FILE}"
     )

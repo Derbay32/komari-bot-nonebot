@@ -432,7 +432,7 @@ async def test_real_lifespan_runs_later_startup_hooks_after_isolated_failure(
 async def test_memory_config_failure_does_not_block_chat_config_warmup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """TSK-192 phase B: old-memory config is optional; chat stays required."""
+    """TSK-192/TSK-197: memory config is optional; chat stays required."""
     memory_schema = _schema("komari_memory")
     chat_schema = _schema("komari_chat")
     context_schema = _schema("komari_context")
@@ -454,7 +454,7 @@ async def test_memory_config_failure_does_not_block_chat_config_warmup(
             ),
             "komari_memory": _stored(
                 "komari_memory",
-                {"llm_temperature_summary": 99.0},
+                {"hindsight_request_timeout_seconds": "not-a-number"},
                 8,
             ),
         }
