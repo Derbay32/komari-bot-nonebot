@@ -22,7 +22,6 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import os
-import sys
 import types
 from importlib import import_module
 from types import SimpleNamespace
@@ -30,7 +29,6 @@ from typing import Any
 
 import pytest
 
-import komari_bot.plugins as plugins_package
 from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
 from komari_bot.plugins.komari_chat.services.reply_context import ReplyContext
 
@@ -45,7 +43,9 @@ message_handler_module = import_module(
 )
 base_client_module = import_module("komari_bot.plugins.llm_provider.base_client")
 
-ImageUnderstandingFailureError = image_reading_session_module.ImageUnderstandingFailureError
+ImageUnderstandingFailureError = (
+    image_reading_session_module.ImageUnderstandingFailureError
+)
 
 #: 可区分 canary：URL path/query、data URI、base64 payload、视觉描述。
 _CANARY_PATH_QUERY = "/tsk196/canary/photo.png?token=supersecret#frag"
@@ -150,6 +150,36 @@ def _render_frame_locals(frame: types.FrameType) -> str:
     return "".join(parts)
 
 
+def _core_frames(
+    frames: list[types.FrameType],
+) -> tuple[types.FrameType, types.FrameType]:
+    """Return the known TSK-193 wrapper and real generation core frames."""
+    wrapper = next(
+        (frame for frame in frames if frame.f_code.co_name == "_generate_reply_core"),
+        None,
+    )
+    core = next(
+        (
+            frame
+            for frame in frames
+            if frame.f_code.co_name == "_generate_reply_with_session"
+        ),
+        None,
+    )
+    assert wrapper is not None, "最终异常 traceback 缺少 _generate_reply_core 包装帧"
+    assert core is not None, (
+        "最终异常 traceback 缺少 _generate_reply_with_session 核心帧"
+    )
+    return wrapper, core
+
+
+def _assert_wrapper_clean(wrapper: types.FrameType) -> None:
+    wrapper_locals = wrapper.f_locals
+    assert wrapper_locals.get("image_urls") is None
+    assert wrapper_locals.get("reply_context") is None
+    assert wrapper_locals.get("collector") is None
+
+
 def _assert_frames_safe(exc: BaseException) -> None:
     """断言最终异常 traceback 的 komari_chat 帧递归投影不含任何 canary。"""
     frames = _iter_komari_chat_frames(exc)
@@ -168,6 +198,8 @@ def _assert_frames_safe(exc: BaseException) -> None:
 
 # ── 通用替身（与 test_tsk196_native_image_failure.py 同风格）─────────────
 
+from tests.komari_chat.hindsight_recall_support import FakeHindsightMemory
+
 
 class _FakeRedis:
     async def get_buffer(self, _group_id: str, limit: int = 100) -> list[object]:
@@ -184,30 +216,9 @@ class _FakeRedis:
         return []
 
 
-class _FakeMemory:
-    async def search_conversations(self, **_kwargs: object) -> list[dict[str, object]]:
-        return []
-
-    async def search_interaction_events(
-        self, **_kwargs: object
-    ) -> list[dict[str, object]]:
-        return []
-
-    async def get_user_profile(
-        self, *, user_id: str, group_id: str
-    ) -> dict[str, object]:
-        del user_id, group_id
-        return {"display_name": "测试用户", "traits": {}}
-
-
 class _FakeQueryRewrite:
     async def rewrite_query(self, current_query: str, **_kwargs: object) -> str:
         return current_query
-
-
-class _FakeEmbeddingProvider:
-    async def embed(self, _text: str) -> list[float]:
-        return [0.1, 0.2]
 
 
 class _FakeUserData:
@@ -282,23 +293,13 @@ def _vision_stub() -> SimpleNamespace:
     )
 
 
-def _patch_embedding(monkeypatch: pytest.MonkeyPatch) -> None:
-    embedding_package_name = "komari_bot.plugins.embedding_provider"
-    embedding_fake = types.ModuleType(embedding_package_name)
-    embedding_fake.embed = _FakeEmbeddingProvider().embed  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, embedding_package_name, embedding_fake)
-    monkeypatch.setattr(
-        plugins_package, "embedding_provider", embedding_fake, raising=False
-    )
-
-
 def _base_wire(monkeypatch: pytest.MonkeyPatch, config: SimpleNamespace) -> Any:
     """布设 handler 与模块级替身（两种模式共用的公共部分）。"""
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
     )
     handler.redis = _FakeRedis()
-    handler.memory = _FakeMemory()
+    handler.hindsight_memory = FakeHindsightMemory()
     handler.query_rewrite = _FakeQueryRewrite()
     monkeypatch.setattr(message_handler_module, "get_config", lambda: config)
     monkeypatch.setattr(message_handler_module, "get_context_config", lambda: config)
@@ -316,7 +317,6 @@ def _base_wire(monkeypatch: pytest.MonkeyPatch, config: SimpleNamespace) -> Any:
             is_fetch_available=lambda **_kwargs: False,
         ),
     )
-    _patch_embedding(monkeypatch)
     return handler
 
 
@@ -364,9 +364,7 @@ def _wire_native_core(
             message_handler_module, "generate_reply_with_tools", _fake_generate
         )
 
-    async def _download_images(
-        urls: list[str], _policy: object
-    ) -> list[str | None]:
+    async def _download_images(urls: list[str], _policy: object) -> list[str | None]:
         del urls
         return list(download_results)
 
@@ -550,8 +548,8 @@ def test_native_provider_failure_core_frame_locals_are_cleared(
     assert excinfo.value.__context__ is None
 
     frames = _iter_komari_chat_frames(excinfo.value)
-    assert any(f.f_code.co_name == "_generate_reply_core" for f in frames)
-    core_frame = next(f for f in frames if f.f_code.co_name == "_generate_reply_core")
+    wrapper, core_frame = _core_frames(frames)
+    _assert_wrapper_clean(wrapper)
     # 关键帧显式清空
     core_locals = core_frame.f_locals
     assert core_locals.get("image_urls") is None
@@ -594,13 +592,20 @@ def test_native_all_download_unavailable_core_frame_locals_are_cleared(
     assert excinfo.value.summary.mode == "native"
     assert excinfo.value.summary.all_images_unavailable is True
     frames = _iter_komari_chat_frames(excinfo.value)
-    core_frame = next(f for f in frames if f.f_code.co_name == "_generate_reply_core")
-    rendered = _render_frame_locals(core_frame)
-    assert _CANARY_PATH_QUERY not in rendered
-    assert _CANARY_URL not in rendered
-    assert _CANARY_URL_B not in rendered
-    assert _CANARY_DATA_URI not in rendered
-    assert _CANARY_BASE64 not in rendered
+    wrapper, core_frame = _core_frames(frames)
+    _assert_wrapper_clean(wrapper)
+    core_locals = core_frame.f_locals
+    assert core_locals.get("image_urls") is None
+    assert core_locals.get("reply_context") is None
+    assert core_locals.get("prompt_messages") == []
+    assert core_locals.get("collector") is None
+    for frame in (wrapper, core_frame):
+        rendered = _render_frame_locals(frame)
+        assert _CANARY_PATH_QUERY not in rendered
+        assert _CANARY_URL not in rendered
+        assert _CANARY_URL_B not in rendered
+        assert _CANARY_DATA_URI not in rendered
+        assert _CANARY_BASE64 not in rendered
     _assert_frames_safe(excinfo.value)
 
 
@@ -648,8 +653,8 @@ def test_delegated_all_unavailable_core_frame_locals_are_cleared(
     assert provider.completions == []
 
     frames = _iter_komari_chat_frames(excinfo.value)
-    assert any(f.f_code.co_name == "_generate_reply_core" for f in frames)
-    core_frame = next(f for f in frames if f.f_code.co_name == "_generate_reply_core")
+    wrapper, core_frame = _core_frames(frames)
+    _assert_wrapper_clean(wrapper)
     core_locals = core_frame.f_locals
     assert core_locals.get("image_session") is None
     assert core_locals.get("image_urls") is None
@@ -678,9 +683,7 @@ def test_debug_reply_image_failure_reraise_clears_frame_locals(
 
     monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
 
-    async def _download_images(
-        urls: list[str], _policy: object
-    ) -> list[str | None]:
+    async def _download_images(urls: list[str], _policy: object) -> list[str | None]:
         del urls
         return [None, None]
 
@@ -727,9 +730,7 @@ def test_debug_reply_image_failure_reraise_clears_frame_locals(
 
     frames = _iter_komari_chat_frames(excinfo.value)
     assert any(f.f_code.co_name == "generate_debug_reply" for f in frames)
-    debug_frame = next(
-        f for f in frames if f.f_code.co_name == "generate_debug_reply"
-    )
+    debug_frame = next(f for f in frames if f.f_code.co_name == "generate_debug_reply")
     debug_locals = debug_frame.f_locals
     assert debug_locals.get("image_urls") is None
     assert debug_locals.get("reply_context") is None

@@ -27,7 +27,6 @@ from komari_bot.plugins.komari_management.api_runtime import (
 from komari_bot.plugins.komari_management.managed_resources import (
     ManagedConfigResource,
 )
-from komari_bot.plugins.komari_memory.api import register_memory_api
 from komari_bot.plugins.komari_search.api import register_search_api
 from komari_bot.plugins.user_ban.api import register_user_ban_api
 from tests.config.prompt_field_contract import (
@@ -63,9 +62,7 @@ class _DummyConfigManager:
     async def get_async(self) -> BaseModel:
         return _DummyConfigModel()
 
-    async def update_field_async(
-        self, field_name: str, value: object
-    ) -> BaseModel:
+    async def update_field_async(self, field_name: str, value: object) -> BaseModel:
         del field_name, value
         return await self.get_async()
 
@@ -88,9 +85,6 @@ def _build_components() -> ManagementApiComponents:
         knowledge_engine_getter=lambda: None,
         register_help_api=register_help_api,
         help_engine_getter=lambda: None,
-        register_memory_api=register_memory_api,
-        memory_service_getter=lambda: None,
-        memory_redis_getter=lambda: None,
         register_agent_run_log_api=register_agent_run_log_api,
         agent_run_log_reader_getter=lambda: None,
         register_search_api=register_search_api,
@@ -155,7 +149,7 @@ async def test_nonebot_fastapi_driver_exposes_docs_and_management_routes(
     schema = schema_response.json()
     assert "/api/v2/komari-knowledge/knowledge" in schema["paths"]
     assert "/api/v2/komari-help/help" in schema["paths"]
-    assert "/api/v2/komari-memory/conversations" in schema["paths"]
+    assert "/api/v2/komari-memory/conversations" not in schema["paths"]
     assert "/api/v2/agent-run-logs/runs" in schema["paths"]
     assert "/api/v2/komari-search/provider-descriptors" in schema["paths"]
     assert "/api/v2/komari-management-config/resources" in schema["paths"]
@@ -173,7 +167,6 @@ async def test_nonebot_fastapi_driver_exposes_docs_and_management_routes(
     assert {
         "komari-knowledge",
         "komari-help",
-        "komari-memory",
         "agent-run-logs",
         "komari-search",
         "komari-management-config",
@@ -182,6 +175,7 @@ async def test_nonebot_fastapi_driver_exposes_docs_and_management_routes(
         "reply-fulfillments",
         "character-binding-repair",
     } <= tag_names
+    assert "komari-memory" not in tag_names
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +199,6 @@ _REAL_MANAGEMENT_INIT = (
 #: Symbols the production loader reads off plugin tops the suite shims.
 _LOADER_DEPENDENCY_SYMBOLS: dict[str, tuple[str, ...]] = {
     "komari_knowledge": ("register_knowledge_api", "get_engine"),
-    "komari_memory": ("register_memory_api", "get_memory_service", "get_redis_manager"),
     "agent_run_logger": ("register_agent_run_log_api", "get_agent_run_log_reader"),
     "user_ban": ("register_user_ban_api", "get_service"),
     "komari_chat": ("get_reply_fulfillment_ops_service",),
@@ -303,6 +296,7 @@ def test_production_loader_carries_real_roulette_symbols(
     components = real_management_loader.load_components()
 
     assert "komari_roulette" in real_management_loader.required_plugins
+    assert "komari_memory" not in real_management_loader.required_plugins
     assert (
         components.register_roulette_management_api
         is roulette_plugin.register_roulette_management_api
@@ -334,6 +328,4 @@ def test_production_loader_carries_real_decision_registrar(
     components = real_management_loader.load_components()
 
     assert "komari_decision" in real_management_loader.required_plugins
-    assert (
-        components.register_decision_api is decision_plugin.register_decision_api
-    )
+    assert components.register_decision_api is decision_plugin.register_decision_api

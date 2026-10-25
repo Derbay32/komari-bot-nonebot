@@ -271,7 +271,7 @@ def test_fulfillment_stays_buildable_without_memory_or_decision(
     monkeypatch.setattr(
         chat_module,
         "memory_plugin",
-        SimpleNamespace(get_memory_service=lambda: None),
+        SimpleNamespace(get_hindsight_memory=lambda: None),
     )
     monkeypatch.setattr(chat_module, "get_decision_engine", lambda: None)
     monkeypatch.setattr(
@@ -303,12 +303,12 @@ def test_handler_rebuilds_when_decision_engine_changes(
             self,
             *,
             redis: object,
-            memory: object,
+            hindsight_memory: object,
             decision_engine: object,
             **_kwargs: object,
         ) -> None:
             self.redis = redis
-            self.memory = memory
+            self.hindsight_memory = hindsight_memory
             self.decision_engine = decision_engine
             built_engines.append(decision_engine)
 
@@ -320,7 +320,7 @@ def test_handler_rebuilds_when_decision_engine_changes(
     monkeypatch.setattr(
         chat_module,
         "memory_plugin",
-        SimpleNamespace(get_memory_service=lambda: memory),
+        SimpleNamespace(get_hindsight_memory=lambda: memory),
     )
     monkeypatch.setattr(
         chat_module,

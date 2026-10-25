@@ -190,7 +190,10 @@ def _prepared_multigroup_cutover(
     真实 gate 指纹）→ 编排 evidence 相位（保留真实 revision/指纹）→
     0012 → 真实 finalize-redis → REDIS_FINALIZED。
     """
-    with cutover_scratch_database(f"mgc{tag}", revision="0011") as (params, database_url):
+    with cutover_scratch_database(f"mgc{tag}", revision="0011") as (
+        params,
+        database_url,
+    ):
         asyncio.run(_clear_fresh_flag(params))
         policy_file = write_policy_file(tmp_path, MULTIGROUP_RAW_POLICY)
         exit_code, payload = run_cli(capsys, *_prepare_argv(database_url, policy_file))
@@ -240,7 +243,7 @@ def test_0013_succeeds_with_multigroup_policy_via_real_prepare_policy(
         assert result.returncode == 0, (
             f"多群号合法升级必须通过 0013 终检:\n{result.stdout}\n{result.stderr}"
         )
-        assert asyncio.run(_fetch_version(params)) == "0027"
+        assert asyncio.run(_fetch_version(params)) == "0028"
 
 
 # ---------------------------------------------------------------------------

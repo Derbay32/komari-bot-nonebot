@@ -25,7 +25,6 @@ from komari_bot.plugins.komari_management.api_runtime import (
 from komari_bot.plugins.komari_management.managed_resources import (
     ManagedConfigResource,
 )
-from komari_bot.plugins.komari_memory.api import register_memory_api
 from komari_bot.plugins.komari_search.api import register_search_api
 from komari_bot.plugins.user_ban.api import register_user_ban_api
 from tests.config.prompt_field_contract import (
@@ -79,9 +78,7 @@ class _FakeConfigManager:
     async def get_async(self) -> BaseModel:
         return _FakeConfigSchema()
 
-    async def update_field_async(
-        self, field_name: str, value: object
-    ) -> BaseModel:
+    async def update_field_async(self, field_name: str, value: object) -> BaseModel:
         del field_name, value
         return await self.get_async()
 
@@ -126,9 +123,6 @@ def _build_components() -> ManagementApiComponents:
         knowledge_engine_getter=lambda: None,
         register_help_api=register_help_api,
         help_engine_getter=lambda: None,
-        register_memory_api=register_memory_api,
-        memory_service_getter=lambda: None,
-        memory_redis_getter=lambda: None,
         register_agent_run_log_api=register_agent_run_log_api,
         agent_run_log_reader_getter=lambda: None,
         register_search_api=register_search_api,
@@ -201,12 +195,8 @@ async def test_register_management_api_for_fastapi_driver(app: App) -> None:
         client = ctx.get_client()
         docs = await client.get("/api/docs")
         schema_response = await client.get("/api/openapi.json")
-        retired_scene_list = await client.get(
-            "/api/v2/komari-decision-scenes/scenes"
-        )
-        retired_scene_sync = await client.post(
-            "/api/v2/komari-decision-scenes/sync"
-        )
+        retired_scene_list = await client.get("/api/v2/komari-decision-scenes/scenes")
+        retired_scene_sync = await client.post("/api/v2/komari-decision-scenes/sync")
 
     assert docs.status_code == 200
     assert schema_response.status_code == 200
@@ -220,7 +210,6 @@ async def test_register_management_api_for_fastapi_driver(app: App) -> None:
     assert retired_scene_sync.status_code == 404
     assert "/api/v2/komari-knowledge/knowledge" in schema["paths"]
     assert "/api/v2/komari-help/help" in schema["paths"]
-    assert "/api/v2/komari-memory/conversations" in schema["paths"]
     assert "/api/v2/agent-run-logs/runs" in schema["paths"]
     assert "/api/v2/komari-search/provider-descriptors" in schema["paths"]
     assert "/api/v2/komari-management-config/resources" in schema["paths"]
@@ -244,16 +233,14 @@ async def test_register_management_api_for_fastapi_driver(app: App) -> None:
     )
     assert logger.info_messages[-2] == (
         "[Komari Management] 管理 API 已注册: "
-        "/api/v2/komari-knowledge, /api/v2/komari-help, /api/v2/komari-memory, "
+        "/api/v2/komari-knowledge, /api/v2/komari-help, "
         "/api/v2/agent-run-logs, /api/v2/komari-search, "
         "/api/v2/komari-management-config, /api/v2/komari-management-prompt, "
         "/api/v2/komari-announce, "
         "/api/v2/komari-user-bans, /api/v2/group-admission, /api/v2/reply-fulfillments"
     )
     assert logger.info_messages[-1] == (
-        "[Komari Management] 管理文档入口: "
-        "docs=/api/docs, "
-        "openapi=/api/openapi.json"
+        "[Komari Management] 管理文档入口: docs=/api/docs, openapi=/api/openapi.json"
     )
     assert logger.warning_messages == []
 
@@ -315,7 +302,6 @@ async def test_read_only_credential_cannot_mutate_any_management_resource(
                 "permissions": [
                     "knowledge:read",
                     "help:read",
-                    "memory:read",
                     "agent_run_logs:read",
                     "search:read",
                     "config:read",
@@ -352,15 +338,6 @@ async def test_read_only_credential_cannot_mutate_any_management_resource(
                 "/api/v2/komari-help/help",
                 headers=headers,
                 json={"title": "测试", "content": "测试"},
-            ),
-            await client.post(
-                "/api/v2/komari-memory/conversations",
-                headers=headers,
-                json={
-                    "group_id": "1",
-                    "summary": "测试",
-                    "participants": ["1"],
-                },
             ),
             await client.patch(
                 "/api/v2/komari-management-config/resources/komari_management/fields/plugin_enable",

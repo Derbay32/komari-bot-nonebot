@@ -50,6 +50,14 @@ SQLALCHEMY_URL = os.getenv("SQLALCHEMY_DATABASE_URL", "")
 DECISION_CONFIG_TABLE = "komari_decision_config"
 CHAT_CONFIG_TABLE = "komari_chat_config"
 
+EXPECTED_HINDSIGHT_MEMORY_COLUMNS = (
+    ("hindsight_base_url", "character varying", "NO", "''::character varying"),
+    ("hindsight_api_key", "character varying", "NO", "''::character varying"),
+    ("hindsight_bank_id", "character varying", "NO", "''::character varying"),
+    ("hindsight_request_timeout_seconds", "double precision", "NO", "10.0"),
+    ("hindsight_recovery_interval_seconds", "double precision", "NO", "30.0"),
+)
+
 #: 退役的四张场景表（依赖顺序：条目 → 运行时 → 场景 → 构建集）。
 RETIRED_TABLES: tuple[str, ...] = (
     "komari_memory_scene_item",
@@ -350,15 +358,24 @@ async def test_populated_0024_upgrade_retires_only_scene_storage() -> None:
                 if definition[0] not in set(RETIRED_DECISION_CONFIG_FIELDS)
             )
             # 0026/0027 迁移把 memory 的 Redis 与 chat/context 字段迁出；
-            # 历史列只要仍存在就必须保持原定义。
+            # 历史列只要仍存在就必须保持原定义。0028 只允许追加五个
+            # Hindsight 连接列，且顺序/类型/空值语义必须精确匹配。
             memory_table = "komari_memory_config"
             surviving_memory_columns = {
                 definition[0] for definition in after_schema[memory_table]
             }
-            expected_schema[memory_table] = tuple(
+            expected_memory_prefix = tuple(
                 definition
                 for definition in before_schema[memory_table]
                 if definition[0] in surviving_memory_columns
+            )
+            expected_schema.pop(memory_table, None)
+            after_memory_schema = after_schema.pop(memory_table)
+            assert after_memory_schema[: len(expected_memory_prefix)] == (
+                expected_memory_prefix
+            )
+            assert after_memory_schema[len(expected_memory_prefix) :] == (
+                EXPECTED_HINDSIGHT_MEMORY_COLUMNS
             )
             chat_table = "komari_chat_config"
             chat_prefix = expected_schema.pop(chat_table)

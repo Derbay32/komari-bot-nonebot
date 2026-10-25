@@ -92,24 +92,31 @@ def _load_management_components() -> ManagementApiComponents:
     """加载统一管理 API 所需的业务插件组件。"""
     require("komari_knowledge")
     from komari_bot.plugins import komari_knowledge as knowledge_plugin
+
     require("komari_help")
     from komari_bot.plugins import komari_help as help_plugin
-    require("komari_memory")
-    from komari_bot.plugins import komari_memory as memory_plugin
+
     require("agent_run_logger")
     from komari_bot.plugins import agent_run_logger as agent_run_logger_plugin
+
     require("komari_search")
     from komari_bot.plugins import komari_search as search_plugin
+
     require("user_ban")
     from komari_bot.plugins import user_ban as user_ban_plugin
+
     require("komari_chat")
     from komari_bot.plugins import komari_chat as chat_plugin
+
     require("group_admission")
     from komari_bot.plugins import group_admission as group_admission_plugin
+
     require("character_binding")
     from komari_bot.plugins import character_binding as character_binding_plugin
+
     require("komari_roulette")
     from komari_bot.plugins import komari_roulette as roulette_plugin
+
     require("komari_decision")
     from komari_bot.plugins import komari_decision as decision_plugin
 
@@ -118,9 +125,6 @@ def _load_management_components() -> ManagementApiComponents:
         knowledge_engine_getter=knowledge_plugin.get_engine,
         register_help_api=help_plugin.register_help_api,
         help_engine_getter=help_plugin.get_engine,
-        register_memory_api=memory_plugin.register_memory_api,
-        memory_service_getter=memory_plugin.get_memory_service,
-        memory_redis_getter=memory_plugin.get_redis_manager,
         register_agent_run_log_api=agent_run_logger_plugin.register_agent_run_log_api,
         agent_run_log_reader_getter=agent_run_logger_plugin.get_agent_run_log_reader,
         register_search_api=search_plugin.register_search_api,

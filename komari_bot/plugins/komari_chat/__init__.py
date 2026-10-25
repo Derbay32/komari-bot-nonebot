@@ -106,15 +106,15 @@ _reply_fulfillment_worker_task: asyncio.Task[None] | None = None
 def _resolve_runtime_components() -> tuple[Any, Any, Any] | None:
     """Resolve the ordinary reply generation boundary.
 
-    Reply generation still needs recent context, old memory, and the decision
-    engine at this intermediate stage.
+    Reply generation needs recent context, the Hindsight caller, and the
+    decision engine at this intermediate stage.
     """
     context_store = context_plugin.get_context_store()
-    memory_service = memory_plugin.get_memory_service()
+    hindsight_memory = memory_plugin.get_hindsight_memory()
     decision_engine = get_decision_engine()
-    if context_store is None or memory_service is None or decision_engine is None:
+    if context_store is None or hindsight_memory is None or decision_engine is None:
         return None
-    return context_store, memory_service, decision_engine
+    return context_store, hindsight_memory, decision_engine
 
 
 def _resolve_fulfillment_components() -> tuple[Any, Any] | None:
@@ -140,12 +140,12 @@ def _get_or_build_handler() -> MessageHandler | None:
     components = _resolve_runtime_components()
     if components is None:
         return None
-    redis, memory, decision_engine = components
+    redis, hindsight_memory, decision_engine = components
     if (
         _handler is not None
         and _handler.decision_engine is decision_engine
         and _handler.redis is redis
-        and _handler.memory is memory
+        and _handler.hindsight_memory is hindsight_memory
         and _handler_workflow is _reply_fulfillment
         and _reply_fulfillment is not None
     ):
@@ -160,11 +160,11 @@ def _get_or_build_handler() -> MessageHandler | None:
         or _handler_workflow is not workflow
         or _handler.decision_engine is not decision_engine
         or _handler.redis is not redis
-        or _handler.memory is not memory
+        or _handler.hindsight_memory is not hindsight_memory
     ):
         _handler = MessageHandler(
             redis=redis,
-            memory=memory,
+            hindsight_memory=hindsight_memory,
             reply_fulfillment=workflow,
             proactive_reservation=workflow.proactive_reservation,
             decision_engine=decision_engine,
@@ -357,7 +357,7 @@ async def generate_debug_reply(
     handler = _get_or_build_handler()
     if handler is None:
         raise RuntimeError(  # noqa: TRY003
-            "KomariChat 底层服务未初始化（Redis 或 Memory 未就绪），无法执行 debug reply。"
+            "KomariChat 底层服务未初始化（Redis 或 Hindsight Memory 未就绪），无法执行 debug reply。"
         )
 
     return await handler.generate_debug_reply(
@@ -386,7 +386,7 @@ async def handle_group_message(  # noqa: PLR0911 - 每个入口门禁都是独�
 
     handler = _get_or_build_handler()
     if handler is None:
-        logger.debug("[KomariChat] KomariMemory 未就绪，跳过消息处理")
+        logger.debug("[KomariChat] Hindsight Memory 未就绪，跳过消息处理")
         return
 
     group_id = getattr(event, "group_id", None)

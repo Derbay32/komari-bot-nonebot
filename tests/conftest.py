@@ -264,15 +264,7 @@ class _DummyUserBanPlugin:
 
 class _DummyMemoryPlugin:
     @staticmethod
-    def get_plugin_manager() -> object | None:
-        return None
-
-    @staticmethod
-    def get_memory_service() -> object | None:
-        return None
-
-    @staticmethod
-    def get_redis_manager() -> object | None:
+    def get_hindsight_memory() -> object | None:
         return None
 
 
@@ -562,7 +554,11 @@ from komari_bot.plugins.komari_context.config_schema import (
     KomariContextConfigSchema,
 )
 from komari_bot.plugins.komari_memory.config_schema import KomariMemoryConfigSchema
-from komari_bot.plugins.komari_memory.services.memory_service import MemoryService
+from komari_bot.plugins.komari_memory.services.hindsight_service import (
+    HindsightMemoryService,
+    HindsightRecallSession,
+    HindsightUnavailableError,
+)
 
 _inject_package_exports(
     "komari_context",
@@ -577,11 +573,11 @@ _inject_package_exports(
 _inject_package_exports(
     "komari_memory",
     {
-        "get_plugin_manager": _DummyMemoryPlugin.get_plugin_manager,
-        "get_memory_service": _DummyMemoryPlugin.get_memory_service,
-        "get_redis_manager": _DummyMemoryPlugin.get_redis_manager,
+        "get_hindsight_memory": _DummyMemoryPlugin.get_hindsight_memory,
         "KomariMemoryConfigSchema": KomariMemoryConfigSchema,
-        "MemoryService": MemoryService,
+        "HindsightMemoryService": HindsightMemoryService,
+        "HindsightRecallSession": HindsightRecallSession,
+        "HindsightUnavailableError": HindsightUnavailableError,
     },
 )
 _inject_package_exports(

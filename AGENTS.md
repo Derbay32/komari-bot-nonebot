@@ -6,7 +6,7 @@
 
 komari-bot 是基于 [NoneBot2](https://github.com/nonebot/nonebot2) 构建的 QQ 机器人，核心角色是《败犬女主太多了》中的 **小鞠知花**。
 
-**核心能力**：AI 聊天（LLM 驱动）、四层记忆系统、RAG 知识库、智能帮助、群聊总结、角色绑定、好感度系统、主动回复判定。
+**核心能力**：AI 聊天（LLM 驱动）、Hindsight 共享长期记忆、RAG 知识库、智能帮助、群聊总结、角色绑定、好感度系统、主动回复判定。
 
 ## 技术栈速览
 
@@ -109,7 +109,7 @@ komari-bot/
 
 插件的 `require()` 声明就是硬依赖，修改前必须理解依赖链。
 
-跨插件 import 边界（ADR-0006）：`require()` 仅作依赖加载声明，实际引用一律走普通 import；import 只允许指向依赖插件的顶层包暴露面（`__all__`），禁止指向其内部子模块（`services` / `repositories` / `handlers` 等）。唯一豁免：管理插件 import 各插件配置 Schema 以注册管理资源。`komari_context` 是近期上下文与聊天履约证据 Redis 客户端以及共享会话身份/通知/近期互动策略的唯一所有者，顶层暴露 `KomariContextConfigSchema` / `RecentContextStore` / `MessageSchema` / `get_context_config` / `get_context_store`；`komari_memory` 顶层只暴露当前旧记忆 API 所需的 `KomariMemoryConfigSchema` / `MemoryService` / `get_memory_service` / `get_redis_manager`，其 `RedisManager` 仅借用 context 客户端；共享 `retry_async` 位于 `komari_bot.core.retry`。komari_chat 经自有 `config_interface`、chat/context 配置与上述顶层暴露面读取配置和共享资源，不再读取 memory 配置，不属于管理插件豁免。详见 `docs/adr/0006-cross-plugin-top-level-imports-decision-contracts.md`。
+跨插件 import 边界（ADR-0006）：`require()` 仅作依赖加载声明，实际引用一律走普通 import；import 只允许指向依赖插件的顶层包暴露面（`__all__`），禁止指向其内部子模块（`services` / `repositories` / `handlers` 等）。唯一豁免：管理插件 import 各插件配置 Schema 以注册管理资源。`komari_context` 是近期上下文与聊天履约证据 Redis 客户端以及共享会话身份/通知/近期互动策略的唯一所有者，顶层暴露 `KomariContextConfigSchema` / `RecentContextStore` / `MessageSchema` / `get_context_config` / `get_context_store`；`komari_memory` 顶层只暴露 `KomariMemoryConfigSchema` / `HindsightMemoryService` / `HindsightRecallSession` / `HindsightUnavailableError` / `get_hindsight_memory`；旧 `MemoryService` / `get_memory_service` / `get_plugin_manager` / `get_redis_manager` 已移除；共享 `retry_async` 位于 `komari_bot.core.retry`。komari_chat 经自有 `config_interface`、chat/context 配置与上述顶层暴露面读取配置和共享资源，不再读取 memory 配置，不属于管理插件豁免。详见 `docs/adr/0006-cross-plugin-top-level-imports-decision-contracts.md`。
 
 ```
 基础服务层（被依赖，不应依赖业务插件）
@@ -124,7 +124,7 @@ komari-bot/
   user_data ────────────────── 当前好感度 PostgreSQL 服务（ORM 表）
 
 核心功能层
-  komari_memory ────────────── 四层记忆系统
+  komari_memory ────────────── Hindsight 共享长期记忆调用侧
   komari_decision ──────────── Jev 回应资格、保留用途与群总结判定
   komari_chat ──────────────── AI 聊天处理器（编排者）
   komari_knowledge ─────────── RAG 知识库
@@ -359,17 +359,33 @@ ok, reason = await check_runtime_permission(bot, event, config)
 - **控制面**：`/api/v2/komari-roulette/status` 与 `/leaderboards/{inspect,rebuild}`；read/manage 分权。仅按 completed 真源校验/重建，不提供任意加分、重置、恢复发送或强制终局。`latest_scan/latest_cleanup` 是结果计数，不是时间戳。
 - **交付边界**：Huly `komari-bot` 团队空间的[升级运维手册](https://huly.derbaynas.top:2096/workbench/derbaysworkspace/document/6aaa95dd649daed23e114cfa)记录升级、旧名主动迁移、运维与最终 QQ 样本；自动化及旧原型不代替当前部署版本的真实 QQ 展示/通知验收。
 
-### 4. 四层记忆系统 (`komari_memory`)
+### 4. Hindsight 共享长期记忆 (`komari_memory`)
 
-| 层 | 存储 | 表 | 说明 |
-|----|------|-----|------|
-| 1. 对话摘要 | PG | `komari_memory_conversations` | 向量搜索 + 遗忘模糊化 |
-| 2. 用户画像 | PG | `komari_memory_user_profile` | JSONB traits，LLM 压缩 |
-| 3. 互动历史 | PG | `komari_memory_interaction_history` | JSONB records，增量更新 |
-| 4. 实体知识 | PG | 通过 EntityRepository | 关键词 + 向量检索 |
+TSK-193 起运行时只接入 Hindsight 共享长期记忆。
+旧四层实现文件与数据表保留到 TSK-197 物理退役；插件启动不再加载旧 worker。
 
-关键类：`PluginManager` → `MemoryService` → `ConversationRepository` / `EntityRepository` + `ForgettingService`
-注意：四层表（含独立 embedding 表、记忆 job 表）与 HNSW 索引的 DDL 由 Alembic 基线 0001 统一管理，运行时不建表；`EntityRepository` 操作的是记忆层自身的画像/互动表，与 `komari_knowledge` 的知识表相互独立。连接统一经 `komari_bot/db/orm_connection.py` 共享引擎 raw 适配层（asyncpg 兼容，`$n` 占位符 SQL 原样保留）。
+| 旧层 | 存储 | 表 | 当前状态 |
+|------|------|-----|----------|
+| 1. 对话摘要 | PG | `komari_memory_conversations` | 旧数据保留，运行时不读取 |
+| 2. 用户画像 | PG | `komari_memory_user_profile` | 旧数据保留，运行时不读取 |
+| 3. 互动历史 | PG | `komari_memory_interaction_history` | 旧数据保留，运行时不读取 |
+| 4. 实体知识 | PG | 通过 EntityRepository | 旧数据保留，运行时不读取 |
+
+- 顶层暴露面只有 `KomariMemoryConfigSchema` / `HindsightMemoryService` / `HindsightRecallSession` / `HindsightUnavailableError` / `get_hindsight_memory`。
+- `plugin_enable` 保留 opt-out；`startup_required=False` 保留。
+- 启动创建一个稳定 caller，并尝试一次有界探测；配置读取失败不中止其他插件。
+- 每个回复任务打开一个会话；会话冻结一份设置快照，并复用一个官方客户端。
+- 就绪要求读取目标 bank 配置成功，并完成一次真实 `arecall` 探测。
+- 失败按配置的恢复间隔做单飞重试；设置指纹变化允许立即重新探测。
+- 新任务仍会重新读取 bank；旧会话的迟到失败不能覆盖新指纹就绪状态。
+- 关闭只关闭自有客户端与在途会话；不关闭 Redis 或共享 ORM。
+- 聊天只执行一次自动召回；模型工具 `recall_memory` 复用同一会话。
+- 召回失败停止本次回复；空召回是成功。
+- 召回内容经 `UntrustedContext(source_type="memory")` 进入非 system 上下文。
+- 当前群准入在打开会话前和自动召回前各检查一次。
+- 不按记忆来源群过滤；工具参数不能选择 bank、地址或凭据。
+- 旧总结、画像、互动与忘却 worker 不再由插件启动；旧文件保留到 TSK-197。
+- 旧四层表与 HNSW 索引的 DDL 仍由 Alembic 迁移链统一管理，运行时不建表。
 
 ### 4.1 知识与帮助关键词索引
 
@@ -522,7 +538,7 @@ Jev 请求截止覆盖连接、发送、接收与响应校验。
 `message_handler.py` 的 `_attempt_reply()` 已拆分为三个边界：
 
 1. **`_read_buffers()`** — 读取 Redis 现有的 recent/global interaction buffer，可选 `store_current`
-2. **`_generate_reply_core()`** — 纯读取/生成核心：查询重写、记忆/画像/好感度读取、prompt 构建、LLM 回复生成；不执行任何副作用；接受可选 `AgentRunCollector`
+2. **`_generate_reply_core()`** — 纯读取/生成核心：查询重写、Hindsight 召回、好感度读取、prompt 构建、LLM 回复生成；不执行任何副作用；接受可选 `AgentRunCollector`
 3. **送达后副作用唯一路径 = outbox** — `commit_delivered_reply()` 只做 `mark_delivered()` 登记 → `claim_operation()` 领取（失败/None 由后台 worker 轮询）→ 四步幂等提交（proactive confirm / 好感度 adjust / AI 历史存储 / 互动历史写入）→ `complete()`；`_attempt_reply()` 自身不提交任何聊天副作用
 
 表情反应与失败通知契约：
@@ -691,4 +707,4 @@ KOMARI_TEST_POSTGRES_URL=postgresql+asyncpg://user:pass@host:5432/komari_bot_tes
 
 ---
 
-*本文件由 AI 生成于 2026-04-26，最后更新于 2026-10-24。发现不一致请以实际代码为准并更新本文档。*
+*本文件由 AI 生成于 2026-04-26，最后更新于 2026-10-25。发现不一致请以实际代码为准并更新本文档。*

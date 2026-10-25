@@ -66,6 +66,7 @@ def test_managed_config_schemas_declare_default_apply_mode(
         ("komari_management", "DynamicConfigSchema", "api_credentials"),
         ("embedding_provider", "DynamicConfigSchema", "embedding_api_key"),
         ("embedding_provider", "DynamicConfigSchema", "rerank_api_key"),
+        ("komari_memory", "KomariMemoryConfigSchema", "hindsight_api_key"),
         ("komari_sentry", "KomariSentryConfigSchema", "dsn"),
         ("llm_provider", "DynamicConfigSchema", "api_token"),
     ],

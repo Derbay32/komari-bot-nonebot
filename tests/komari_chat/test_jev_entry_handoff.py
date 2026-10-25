@@ -431,7 +431,7 @@ async def _world(
         entry = world.entry
         handler = MessageHandler(
             redis=cast("Any", world.redis),
-            memory=cast("Any", SimpleNamespace()),
+            hindsight_memory=cast("Any", SimpleNamespace()),
             reply_fulfillment=cast("Any", world.fulfillment),
             proactive_reservation=cast("Any", world.reservation),
             decision_engine=harness.decision,
