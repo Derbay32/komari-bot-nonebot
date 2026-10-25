@@ -11,6 +11,7 @@ import asyncio
 import importlib.util
 import json
 import stat
+import subprocess
 import sys
 import time
 import uuid
@@ -1628,20 +1629,48 @@ def test_import_requires_apply_and_target_environment(
     assert report["global_error_code"] == "target_env_missing"
 
 
-def test_script_does_not_import_the_bot_runtime(monkeypatch: Any) -> None:
-    original_modules = dict(sys.modules)
-    for name in list(sys.modules):
-        if name == "komari_bot" or name.startswith("komari_bot."):
-            monkeypatch.delitem(sys.modules, name, raising=False)
+def test_script_does_not_import_the_bot_runtime() -> None:
+    # Deliberately preload the SDK in this pytest process: the standalone
+    # script is checked in a fresh interpreter, so parent import order cannot
+    # mask a script-level dependency.
+    import hindsight_client as _preloaded_sdk  # noqa: F401
 
-    module = _load_script_module()
+    assert "hindsight_client" in sys.modules
 
-    assert module.TABLE_CONVERSATIONS == CONVERSATIONS
-    assert "komari_bot" not in sys.modules
-    assert "hindsight_client" not in sys.modules
+    probe = r"""
+import importlib.util
+import json
+import sys
 
-    sys.modules.clear()
-    sys.modules.update(original_modules)
+spec = importlib.util.spec_from_file_location("standalone_migration_probe", sys.argv[1])
+if spec is None or spec.loader is None:
+    raise SystemExit("probe loader unavailable")
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+print(json.dumps({
+    "conversations": module.TABLE_CONVERSATIONS,
+    "profiles": module.TABLE_PROFILES,
+    "interactions": module.TABLE_INTERACTIONS,
+    "bot_imported": "komari_bot" in sys.modules,
+    "sdk_imported": "hindsight_client" in sys.modules,
+}, ensure_ascii=False))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", probe, str(SCRIPT_PATH)],
+        cwd=str(PROJECT_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["conversations"] == CONVERSATIONS
+    assert payload["profiles"] == PROFILES
+    assert payload["interactions"] == INTERACTIONS
+    assert payload["bot_imported"] is False
+    assert payload["sdk_imported"] is False
 
 
 def test_import_persists_operation_id_before_first_network_write(
