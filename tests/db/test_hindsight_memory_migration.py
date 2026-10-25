@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestServer
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -525,19 +527,19 @@ class _FakeBanks:
     def __init__(self, client: Any) -> None:
         self.client = client
 
-    async def get_bank_profile(self, bank_id: str, *, _request_timeout: float) -> Any:
-        self.client.bank_profile_calls.append((bank_id, _request_timeout))
+    async def get_bank_config(self, bank_id: str, *, _request_timeout: float) -> Any:
+        self.client.bank_config_calls.append((bank_id, _request_timeout))
         if self.client.bank_error is not None:
             raise self.client.bank_error
         if (
-            self.client.bank_profile_delay
-            and len(self.client.bank_profile_calls)
-            >= self.client.bank_profile_delay_from_call
+            self.client.bank_config_delay
+            and len(self.client.bank_config_calls)
+            >= self.client.bank_config_delay_from_call
         ):
-            await asyncio.sleep(self.client.bank_profile_delay)
-            self.client.bank_profile_delay_finished = True
-        if self.client.bank_profile_response is not _UNSET:
-            return self.client.bank_profile_response
+            await asyncio.sleep(self.client.bank_config_delay)
+            self.client.bank_config_delay_finished = True
+        if self.client.bank_config_response is not _UNSET:
+            return self.client.bank_config_response
         return {"bank_id": bank_id}
 
 
@@ -592,9 +594,9 @@ class _FakeHindsightClient:
         *,
         api_version: str = "1.1.0",
         bank_error: Exception | None = None,
-        bank_profile_response: Any = _UNSET,
-        bank_profile_delay: float = 0.0,
-        bank_profile_delay_from_call: int = 1,
+        bank_config_response: Any = _UNSET,
+        bank_config_delay: float = 0.0,
+        bank_config_delay_from_call: int = 1,
         default_operation_statuses: list[str] | None = None,
         operation_statuses: dict[str, list[str]] | None = None,
         operation_status_delay: float = 0.0,
@@ -613,10 +615,10 @@ class _FakeHindsightClient:
     ) -> None:
         self.api_version = api_version
         self.bank_error = bank_error
-        self.bank_profile_response = bank_profile_response
-        self.bank_profile_delay = bank_profile_delay
-        self.bank_profile_delay_from_call = bank_profile_delay_from_call
-        self.bank_profile_delay_finished = False
+        self.bank_config_response = bank_config_response
+        self.bank_config_delay = bank_config_delay
+        self.bank_config_delay_from_call = bank_config_delay_from_call
+        self.bank_config_delay_finished = False
         self.default_operation_statuses = default_operation_statuses or ["completed"]
         self.operation_statuses = operation_statuses or {}
         self.operation_status_delay = operation_status_delay
@@ -634,7 +636,7 @@ class _FakeHindsightClient:
         self.receipt_overrides = receipt_overrides or {}
         self.on_retain = on_retain
         self.retain_calls: list[dict[str, Any]] = []
-        self.bank_profile_calls: list[tuple[str, float]] = []
+        self.bank_config_calls: list[tuple[str, float]] = []
         self.document_calls: list[tuple[str, str, float]] = []
         self.operation_calls: list[tuple[str, str, float]] = []
         self.operation_documents: dict[str, str] = {}
@@ -841,7 +843,7 @@ def test_import_completed_operation_and_exact_document_succeeds(
     assert timeout == 30.0
     assert client.version_calls == 1
     assert len(client.retain_calls) == 3
-    assert len(client.bank_profile_calls) == 1 + len(client.retain_calls)
+    assert len(client.bank_config_calls) == 1 + len(client.retain_calls)
     assert client.mutation_calls == []
     assert stat.S_IMODE(progress_path.stat().st_mode) == 0o600
     assert stat.S_IMODE(report_path.stat().st_mode) == 0o600
@@ -899,7 +901,7 @@ def test_import_rejects_unsupported_api_version_without_writes(
     assert exit_code == 1
     assert client.closed is True
     assert client.retain_calls == []
-    assert client.bank_profile_calls == []
+    assert client.bank_config_calls == []
     assert client.mutation_calls == []
     assert not progress_path.exists()
     report = _read_json(report_path)
@@ -932,12 +934,12 @@ def test_import_rejects_missing_bank_without_retain_or_creation(
     [{}, {"bank_id": "other-bank"}],
     ids=["missing", "mismatched"],
 )
-def test_import_rejects_invalid_bank_profile_identity_before_retain(
+def test_import_rejects_invalid_bank_config_identity_before_retain(
     monkeypatch: Any, tmp_path: Path, profile: dict[str, Any]
 ) -> None:
     module = _load_script_module()
     _code, manifest_path, _conn, _calls = _export(module, tmp_path, monkeypatch)
-    client = _FakeHindsightClient(bank_profile_response=profile)
+    client = _FakeHindsightClient(bank_config_response=profile)
 
     exit_code, progress_path, report_path, _creations = _run_import(
         module, monkeypatch, manifest_path, client
@@ -1186,8 +1188,8 @@ def test_import_operation_budget_bounds_not_found_reconciliation(
     client = _FakeHindsightClient(
         default_operation_statuses=["not_found"],
         retain_creates_document=False,
-        bank_profile_delay=1.0,
-        bank_profile_delay_from_call=3,
+        bank_config_delay=1.0,
+        bank_config_delay_from_call=3,
     )
     clock = _FakeClock()
 
@@ -1208,8 +1210,8 @@ def test_import_operation_budget_bounds_not_found_reconciliation(
     )
 
     assert exit_code == 1
-    assert len(client.bank_profile_calls) == 3
-    assert client.bank_profile_delay_finished is False
+    assert len(client.bank_config_calls) == 3
+    assert client.bank_config_delay_finished is False
     assert len(client.retain_calls) == 1
     report = _read_json(report_path)
     assert [entry["status"] for entry in report["records"]] == ["unknown"]
@@ -2321,7 +2323,7 @@ def test_import_rechecks_bank_before_each_new_submission(
     bank_calls_before_retain: list[int] = []
     client = _FakeHindsightClient(
         on_retain=lambda _call: bank_calls_before_retain.append(
-            len(client.bank_profile_calls)
+            len(client.bank_config_calls)
         )
     )
 
@@ -2460,6 +2462,288 @@ def test_export_missing_source_table_fails_without_manifest(
     assert module.ERROR_SOURCE_TABLE_MISSING in captured.err
     assert PROFILES in captured.err
     assert "当前摘要" not in captured.err
+
+
+class _WireHindsight:
+    def __init__(
+        self,
+        *,
+        bank_exists: bool = True,
+        config_bank_id: str = "bank-1",
+    ) -> None:
+        self.bank_exists = bank_exists
+        self.config_bank_id = config_bank_id
+        self.requests: list[dict[str, Any]] = []
+        self.retain_bodies: list[dict[str, Any]] = []
+        self.document_read_statuses: list[int] = []
+        self.documents: dict[str, dict[str, Any]] = {}
+        self.operation_documents: dict[str, str] = {}
+
+    def app(self) -> web.Application:
+        app = web.Application(middlewares=[self._record_request])
+        app.router.add_get("/version", self._version)
+        app.router.add_get(
+            "/v1/default/banks/{bank_id}/profile",
+            self._profile,
+        )
+        app.router.add_get(
+            "/v1/default/banks/{bank_id}/config",
+            self._bank_config,
+        )
+        app.router.add_get(
+            "/v1/default/banks/{bank_id}/documents/{document_id}",
+            self._document,
+        )
+        app.router.add_post(
+            "/v1/default/banks/{bank_id}/memories",
+            self._retain,
+        )
+        app.router.add_get(
+            "/v1/default/banks/{bank_id}/operations/{operation_id}",
+            self._operation,
+        )
+        app.router.add_route("*", "/{tail:.*}", self._unexpected)
+        return app
+
+    @web.middleware
+    async def _record_request(
+        self, request: web.Request, handler: Any
+    ) -> web.StreamResponse:
+        raw_body = await request.text() if request.can_read_body else ""
+        body: Any = None
+        if raw_body:
+            try:
+                body = json.loads(raw_body)
+            except json.JSONDecodeError:
+                body = raw_body
+        self.requests.append(
+            {"method": request.method, "path": request.path, "body": body}
+        )
+        return await handler(request)
+
+    async def _version(self, _request: web.Request) -> web.Response:
+        return web.json_response(
+            {
+                "api_version": "1.1.0",
+                "features": {
+                    "observations": True,
+                    "mcp": False,
+                    "worker": True,
+                    "bank_config_api": True,
+                    "bank_llm_health": False,
+                    "file_upload_api": False,
+                    "document_export_api": False,
+                    "document_import_api": False,
+                    "audit_log": False,
+                    "llm_trace": False,
+                    "store_document_text": True,
+                },
+            }
+        )
+
+    async def _profile(self, _request: web.Request) -> web.Response:
+        return web.json_response(
+            {"detail": "profile endpoint removed"},
+            status=410,
+        )
+
+    async def _bank_config(self, _request: web.Request) -> web.Response:
+        if not self.bank_exists:
+            raise web.HTTPNotFound(text="bank does not exist")
+        return web.json_response(
+            {
+                "bank_id": self.config_bank_id,
+                "config": {"reflect_mission": "wire-config-secret"},
+                "overrides": {"reflect_mission": "wire-override-secret"},
+            }
+        )
+
+    async def _document(self, request: web.Request) -> web.Response:
+        document_id = request.match_info["document_id"]
+        document = self.documents.get(document_id)
+        self.document_read_statuses.append(404 if document is None else 200)
+        if document is None:
+            raise web.HTTPNotFound(text="document does not exist")
+        return web.json_response(document)
+
+    async def _retain(self, request: web.Request) -> web.Response:
+        body: dict[str, Any] = await request.json()
+        self.retain_bodies.append(body)
+        item = body["items"][0]
+        document_id = str(item["document_id"])
+        operation_id = str(body["operation_id"])
+        bank_id = request.match_info["bank_id"]
+        self.operation_documents[operation_id] = document_id
+        self.documents[document_id] = {
+            "id": document_id,
+            "bank_id": bank_id,
+            "original_text": item["content"],
+            "content_hash": None,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "memory_unit_count": 1,
+            "document_metadata": item.get("metadata"),
+            "retain_params": None,
+        }
+        return web.json_response(
+            {
+                "success": True,
+                "bank_id": bank_id,
+                "items_count": 1,
+                "async": True,
+                "operation_id": operation_id,
+            }
+        )
+
+    async def _operation(self, request: web.Request) -> web.Response:
+        operation_id = request.match_info["operation_id"]
+        if operation_id not in self.operation_documents:
+            raise web.HTTPNotFound(text="operation does not exist")
+        return web.json_response({"operation_id": operation_id, "status": "completed"})
+
+    async def _unexpected(self, _request: web.Request) -> web.Response:
+        raise web.HTTPNotFound(text="unexpected request")
+
+
+def _run_wire_import(
+    module: Any,
+    monkeypatch: Any,
+    manifest_path: Path,
+    state: _WireHindsight,
+) -> int:
+    async def _run() -> int:
+        server = TestServer(state.app())
+        await server.start_server()
+        try:
+            monkeypatch.setenv("HINDSIGHT_BASE_URL", str(server.make_url("/")))
+            monkeypatch.setenv("HINDSIGHT_API_KEY", "wire-test-api-key")
+            monkeypatch.setenv("HINDSIGHT_BANK_ID", "bank-1")
+            monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+            return await module.run_cli(
+                [
+                    "import",
+                    "--apply",
+                    "--manifest",
+                    str(manifest_path),
+                    "--progress",
+                    str(manifest_path.parent / "progress.json"),
+                    "--report",
+                    str(manifest_path.parent / "report.json"),
+                    "--request-timeout",
+                    "1",
+                    "--operation-timeout",
+                    "1",
+                    "--poll-interval",
+                    "0.01",
+                ],
+                boundaries=_runtime(module, client=module._default_create_client),
+            )
+        finally:
+            await server.close()
+
+    return asyncio.run(_run())
+
+
+def test_import_real_sdk_wire_happy_path_uses_bank_config(
+    monkeypatch: Any, tmp_path: Path, capsys: Any
+) -> None:
+    module = _load_script_module()
+    _code, manifest_path, _conn, _calls = _export(
+        module,
+        tmp_path,
+        monkeypatch,
+        connection=_FakeSourceConnection(_one_conversation_rows()),
+    )
+    manifest = _read_json(manifest_path)
+    record = manifest["records"][0]
+    state = _WireHindsight()
+
+    exit_code = _run_wire_import(module, monkeypatch, manifest_path, state)
+
+    assert exit_code == 0
+    assert state.requests
+    assert not any(request["path"].endswith("/profile") for request in state.requests)
+    assert not any(
+        request["method"] != "GET" and request["path"].endswith("/config")
+        for request in state.requests
+    )
+    assert not any(
+        request["method"] == "POST" and request["path"].rstrip("/").endswith("/banks")
+        for request in state.requests
+    )
+    assert (
+        sum(
+            request["method"] == "GET" and request["path"].endswith("/config")
+            for request in state.requests
+        )
+        == 2
+    )
+    assert len(state.retain_bodies) == 1
+    assert state.document_read_statuses == [404, 200]
+    retained = state.retain_bodies[0]
+    assert retained["async"] is True
+    assert retained["operation_id"]
+    assert retained["items"][0]["document_id"] == record["document_id"]
+    assert retained["items"][0]["content"] == record["source_text"]
+    assert retained["items"][0]["metadata"] == _expected_metadata(
+        record,
+        source_id=manifest["source_id"],
+        manifest_sha256=_manifest_hash(manifest_path),
+    )
+    report = _read_json(tmp_path / "report.json")
+    assert report["outcome"] == "success"
+    assert [entry["status"] for entry in report["records"]] == ["completed"]
+    progress = _read_json(tmp_path / "progress.json")
+    entry = next(iter(progress["records"].values()))
+    assert entry["operation_id"] == retained["operation_id"]
+    persisted = (
+        json.dumps(progress, ensure_ascii=False, sort_keys=True)
+        + json.dumps(report, ensure_ascii=False, sort_keys=True)
+        + manifest_path.read_text(encoding="utf-8")
+    )
+    captured = capsys.readouterr()
+    visible = persisted + captured.out + captured.err
+    assert "wire-config-secret" not in visible
+    assert "wire-override-secret" not in visible
+
+
+@pytest.mark.parametrize(
+    ("bank_exists", "config_bank_id", "expected_error"),
+    [
+        (False, "bank-1", "target_bank_missing"),
+        (True, "other-bank", "target_bank_check_failed"),
+    ],
+    ids=["missing", "mismatched"],
+)
+def test_import_real_sdk_wire_bank_identity_failure_never_retains(
+    monkeypatch: Any,
+    tmp_path: Path,
+    bank_exists: bool,  # noqa: FBT001
+    config_bank_id: str,
+    expected_error: str,
+) -> None:
+    module = _load_script_module()
+    _code, manifest_path, _conn, _calls = _export(
+        module,
+        tmp_path,
+        monkeypatch,
+        connection=_FakeSourceConnection(_one_conversation_rows()),
+    )
+    state = _WireHindsight(
+        bank_exists=bank_exists,
+        config_bank_id=config_bank_id,
+    )
+
+    exit_code = _run_wire_import(module, monkeypatch, manifest_path, state)
+
+    assert exit_code == 1
+    assert state.retain_bodies == []
+    assert state.document_read_statuses == []
+    assert not any(request["path"].endswith("/profile") for request in state.requests)
+    report = _read_json(tmp_path / "report.json")
+    assert report["global_error_code"] == expected_error
+    assert {entry["status"] for entry in report["records"]} == {"failed"}
+    assert not (tmp_path / "progress.json").exists()
 
 
 def test_import_rejects_missing_manifest_without_creating_client(
