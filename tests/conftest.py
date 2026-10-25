@@ -554,6 +554,9 @@ from komari_bot.plugins.komari_context.config_schema import (
     KomariContextConfigSchema,
 )
 from komari_bot.plugins.komari_memory.config_schema import KomariMemoryConfigSchema
+from komari_bot.plugins.komari_memory.services.hindsight_retain import (
+    HindsightRetainRequest,
+)
 from komari_bot.plugins.komari_memory.services.hindsight_service import (
     HindsightMemoryService,
     HindsightRecallSession,
@@ -577,6 +580,7 @@ _inject_package_exports(
         "KomariMemoryConfigSchema": KomariMemoryConfigSchema,
         "HindsightMemoryService": HindsightMemoryService,
         "HindsightRecallSession": HindsightRecallSession,
+        "HindsightRetainRequest": HindsightRetainRequest,
         "HindsightUnavailableError": HindsightUnavailableError,
     },
 )

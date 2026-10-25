@@ -53,30 +53,6 @@ def _clean_untrusted_line(value: object) -> str:
     return str(value).replace("\r", " ").replace("\n", " ").strip()
 
 
-def _format_time(value: object) -> str | None:
-    """把时间戳或 ISO 时间转换为人类可读短时间。"""
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        return value.astimezone().strftime("%Y-%m-%d %H:%M")
-    if isinstance(value, int | float):
-        return (
-            datetime.fromtimestamp(float(value)).astimezone().strftime("%Y-%m-%d %H:%M")
-        )
-    if isinstance(value, str) and value.strip():
-        text = value.strip()
-        try:
-            normalized = text.replace("Z", "+00:00")
-            return (
-                datetime.fromisoformat(normalized)
-                .astimezone()
-                .strftime("%Y-%m-%d %H:%M")
-            )
-        except ValueError:
-            return text[:16]
-    return None
-
-
 def _format_user_keyword_knowledge_yaml(items: list[dict[str, Any]]) -> str:
     lines = ["items:"]
     for item in items:
@@ -94,23 +70,6 @@ def _format_visible_users_yaml(users: dict[str, str]) -> str:
     for user_id, display_name in users.items():
         lines.append(f"  - user_id: {_clean_yaml_text(user_id)}")
         lines.append(f"    name: {_clean_yaml_text(display_name)}")
-    return "\n".join(lines) if len(lines) > 1 else ""
-
-
-def _format_interaction_records_yaml(records: list[dict[str, Any]]) -> str:
-    lines = ["records:"]
-    for record in records:
-        parts = [
-            _clean_yaml_text(record.get("event", "")),
-            _clean_yaml_text(record.get("result", "")),
-            _clean_yaml_text(record.get("emotion", "")),
-        ]
-        content = "；".join(part for part in parts if part)
-        if not content:
-            continue
-        lines.append(f"  - content: {content}")
-        if time_text := _format_time(record.get("timestamp")):
-            lines.append(f"    time: {time_text}")
     return "\n".join(lines) if len(lines) > 1 else ""
 
 
@@ -234,7 +193,6 @@ async def build_prompt(
     reply_context: ReplyContext | None = None,
     reply_image_urls: list[str] | None = None,
     favorability: UserFavorability | None = None,
-    interaction_records: list[dict[str, Any]] | None = None,
     *,
     delegated_image_mode: bool = False,
     delegated_quoted_image_count: int | None = None,
@@ -514,14 +472,6 @@ async def build_prompt(
     visible_users_text = _format_visible_users_yaml(visible_users)
     if visible_users_text:
         dynamic_parts.append(f"<visible_users>\n{visible_users_text}\n</visible_users>")
-
-    recent_interaction_text = _format_interaction_records_yaml(
-        interaction_records or []
-    )
-    if recent_interaction_text:
-        dynamic_parts.append(
-            f"<recent_interaction_history>\n{recent_interaction_text}\n</recent_interaction_history>"
-        )
 
     if favorability is not None:
         favor_display_name = character_binding.get_character_name(

@@ -214,9 +214,9 @@ def _wire_generate_core(
         generate_kwargs.update(kwargs)
         return llm_service_module.ReplyResult(
             content="回复内容",
-            interaction_history={"event": "看图", "result": "描述", "emotion": "好奇"},
             favorability_delta=0,
             favorability_reason="无变化",
+            hindsight_target_fingerprint="a" * 64,
         )
 
     monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
@@ -243,7 +243,6 @@ def _wire_generate_core(
         return await handler._generate_reply_core(
             message=_make_message(),
             recent_messages=[],
-            interaction_records=[],
             image_urls=image_urls,
             reply_context=None,
             reply_context_requested=False,
@@ -497,9 +496,9 @@ def test_delegated_mode_quoted_images_first_stable_indexes(
         generate_kwargs.update(kwargs)
         return llm_service_module.ReplyResult(
             content="回复内容",
-            interaction_history={"event": "看图", "result": "结果", "emotion": "好奇"},
             favorability_delta=0,
             favorability_reason="无变化",
+            hindsight_target_fingerprint="a" * 64,
         )
 
     monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
@@ -511,7 +510,6 @@ def test_delegated_mode_quoted_images_first_stable_indexes(
         return await handler._generate_reply_core(
             message=_make_message(),
             recent_messages=[],
-            interaction_records=[],
             image_urls=["https://example.com/current-0.png"],
             reply_context=reply_context,
             reply_context_requested=True,
@@ -654,7 +652,6 @@ def test_native_mode_chat_provider_image_failure_fails_explicitly(
         return await handler._generate_reply_core(
             message=_make_message(),
             recent_messages=[],
-            interaction_records=[],
             image_urls=["https://example.com/a.png"],
             reply_context=None,
             reply_context_requested=False,
@@ -804,13 +801,9 @@ def test_generate_core_freezes_image_policy_snapshot_across_tasks(
         generate_calls.append(kwargs)
         return llm_service_module.ReplyResult(
             content="回复内容",
-            interaction_history={
-                "event": "看图",
-                "result": "描述",
-                "emotion": "好奇",
-            },
             favorability_delta=0,
             favorability_reason="无变化",
+            hindsight_target_fingerprint="a" * 64,
         )
 
     monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
@@ -832,7 +825,6 @@ def test_generate_core_freezes_image_policy_snapshot_across_tasks(
         return await handler._generate_reply_core(
             message=_make_message("frozen-1"),
             recent_messages=[],
-            interaction_records=[],
             image_urls=urls,
             reply_context=None,
             reply_context_requested=False,
@@ -864,7 +856,6 @@ def test_generate_core_freezes_image_policy_snapshot_across_tasks(
         return await handler._generate_reply_core(
             message=_make_message("frozen-2"),
             recent_messages=[],
-            interaction_records=[],
             image_urls=urls,
             reply_context=None,
             reply_context_requested=False,

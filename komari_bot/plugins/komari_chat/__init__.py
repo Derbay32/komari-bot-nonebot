@@ -97,7 +97,7 @@ matcher = on_message(rule=group_message_rule(), priority=10, block=False)
 _handler: MessageHandler | None = None
 _handler_workflow: ReplyFulfillmentWorkflow | None = None
 _reply_fulfillment: ReplyFulfillmentWorkflow | None = None
-_reply_fulfillment_components: tuple[Any, Any] | None = None
+_reply_fulfillment_components: tuple[Any, Any, Any] | None = None
 _reply_fulfillment_ops: ReplyFulfillmentOpsService | None = None
 _reply_fulfillment_ops_components: tuple[Any, Any] | None = None
 _reply_fulfillment_worker_task: asyncio.Task[None] | None = None
@@ -127,6 +127,18 @@ def _resolve_fulfillment_components() -> tuple[Any, Any] | None:
     if context_store is None:
         return None
     return context_store, get_shared_orm_connection_pool()
+
+
+def _resolve_reply_fulfillment_components() -> tuple[Any, Any, Any] | None:
+    """Resolve delivery plus the shared Hindsight caller for the commitment.
+
+    The caller may still be ``None`` while the memory plugin starts; the
+    workflow keeps the obligation and never fabricates a successful write.
+    """
+    components = _resolve_fulfillment_components()
+    if components is None:
+        return None
+    return *components, memory_plugin.get_hindsight_memory()
 
 
 def _resolve_ops_components() -> tuple[Any, Any] | None:
@@ -190,10 +202,10 @@ def _get_or_build_reply_fulfillment() -> ReplyFulfillmentWorkflow | None:
     """构建并缓存回复履约工作流及其私有持久化 adapter。"""
     global _reply_fulfillment, _reply_fulfillment_components  # noqa: PLW0603
 
-    components = _resolve_fulfillment_components()
+    components = _resolve_reply_fulfillment_components()
     if components is None:
         return None
-    redis, pg_pool = components
+    redis, pg_pool, hindsight_memory = components
 
     current_components = _reply_fulfillment_components
     same_components = current_components is not None and all(
@@ -212,6 +224,7 @@ def _get_or_build_reply_fulfillment() -> ReplyFulfillmentWorkflow | None:
             recovery_senders_getter=_get_recovery_senders,
             bots_provider=get_bots,
             superusers_provider=_get_superusers,
+            hindsight_memory=hindsight_memory,
         )
         _reply_fulfillment_components = components
     return _reply_fulfillment
@@ -351,7 +364,6 @@ async def generate_debug_reply(
             reply_to_message_id=None,
             favorability_delta=None,
             favorability_reason=None,
-            interaction_history=None,
             collector=collector,
         )
     handler = _get_or_build_handler()

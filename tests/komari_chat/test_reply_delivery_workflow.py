@@ -79,9 +79,7 @@ class _DeliveryRepository:
     ) -> dict[str, Any]:
         return {
             "fulfillment_id": fulfillment_id,
-            "payload_hash": (
-                draft.payload_hash if draft is not None else "a" * 64
-            ),
+            "payload_hash": (draft.payload_hash if draft is not None else "a" * 64),
             "request_trace_id": (
                 draft.request_trace_id if draft is not None else "trace-1"
             ),
@@ -93,9 +91,7 @@ class _DeliveryRepository:
             ),
             "group_id": draft.group_id if draft is not None else group_id,
             "bot_self_id": draft.bot_self_id if draft is not None else bot_self_id,
-            "adapter_name": (
-                draft.adapter_name if draft is not None else adapter_name
-            ),
+            "adapter_name": (draft.adapter_name if draft is not None else adapter_name),
             "reply_target_message_id": (
                 draft.reply_target_message_id
                 if draft is not None
@@ -363,9 +359,9 @@ def _pending_reply(
         ),
         reply_result=handler_module.ReplyResult(
             content="回复正文",
-            interaction_history={"event": "发言", "result": "回复", "emotion": "平静"},
             favorability_delta=1,
             favorability_reason="正常互动",
+            hindsight_target_fingerprint="a" * 64,
         ),
         force_reply=False,
         bot_nickname="小鞠",
@@ -377,6 +373,7 @@ def _pending_reply(
         reply_timestamp=2.0,
         proactive_reservation_id=handoff.reservation_id,
         proactive_handoff=handoff,
+        hindsight_target_fingerprint="a" * 64,
     )
 
 

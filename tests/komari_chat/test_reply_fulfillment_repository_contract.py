@@ -6,10 +6,11 @@ import json
 from contextlib import asynccontextmanager
 from importlib import import_module
 from pathlib import Path
-from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
+
+from tests.komari_chat.hindsight_commitment_support import memory_payload
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -28,7 +29,7 @@ def test_commitment_inputs_use_fixed_typed_payloads() -> None:
         "proactive_reply_confirmation",
         "favorability_adjustment",
         "assistant_reply_history",
-        "interaction_history",
+        "hindsight_memory",
     }
 
     assert set(module.COMMITMENT_TYPES) == expected_types
@@ -56,26 +57,20 @@ def test_commitment_inputs_use_fixed_typed_payloads() -> None:
         )
 
 
-def test_interaction_payload_copies_record_into_read_only_mapping() -> None:
-    """冻结载荷不与调用方共享可变字典，也不允许事后原地改写。"""
+def test_hindsight_payload_requires_one_canonical_serialized_request() -> None:
+    """The memory payload stores one canonical JSON object and nothing else."""
     module = _repository_module()
-    source = {"event": "发言", "result": "回复", "emotion": "平静"}
-    payload = module.InteractionHistoryPayload(
-        user_id="user-1",
-        display_name="测试用户",
-        trigger_size=20,
-        reply_timestamp=2,
-        trigger_message_id="message-1",
-        record=source,
-    )
+    request = memory_payload("reply:1")["request"]
+    payload = module.HindsightMemoryPayload(request=request)
 
-    source["event"] = "被调用方篡改"
+    assert payload.to_json() == {"request": request}
 
-    assert isinstance(payload.record, MappingProxyType)
-    assert payload.record["event"] == "发言"
-    assert payload.reply_timestamp == 2.0
+    with pytest.raises((TypeError, ValueError)):
+        module.HindsightMemoryPayload(request="[]")
+    with pytest.raises((TypeError, ValueError)):
+        module.HindsightMemoryPayload(request='{ "version": 1 }')
     with pytest.raises(TypeError):
-        cast("dict[str, str]", payload.record)["event"] = "原地篡改"
+        module.HindsightMemoryPayload(request=cast("Any", 1))
 
 
 def test_draft_requires_fixed_core_commitments_in_domain_order() -> None:
@@ -98,6 +93,12 @@ def test_draft_requires_fixed_core_commitments_in_domain_order() -> None:
             reply_timestamp=2.0,
         ),
     )
+    memory = module.ReplyCommitmentInput(
+        commitment_type="hindsight_memory",
+        payload=module.HindsightMemoryPayload(
+            request=memory_payload("reply:1")["request"]
+        ),
+    )
     fields = {
         "fulfillment_id": "reply-1",
         "payload_hash": "a" * 64,
@@ -113,19 +114,20 @@ def test_draft_requires_fixed_core_commitments_in_domain_order() -> None:
 
     valid = module.ReplyFulfillmentDraft(
         **fields,
-        commitments=(favorability, history),
+        commitments=(favorability, history, memory),
     )
     assert [item.commitment_type for item in valid.commitments] == [
         "favorability_adjustment",
         "assistant_reply_history",
+        "hindsight_memory",
     ]
 
     with pytest.raises(ValueError, match="必须包含"):
-        module.ReplyFulfillmentDraft(**fields, commitments=(favorability,))
+        module.ReplyFulfillmentDraft(**fields, commitments=(favorability, memory))
     with pytest.raises(ValueError, match="固定顺序"):
         module.ReplyFulfillmentDraft(
             **fields,
-            commitments=(history, favorability),
+            commitments=(memory, history, favorability),
         )
 
 
@@ -192,13 +194,13 @@ def test_new_adapter_is_the_only_active_chat_persistence_path() -> None:
     """contract 后正常聊天只组装父子 adapter，不保留旧宽表兼容路径。"""
     project_root = Path(__file__).resolve().parents[2]
     plugin_dir = project_root / "komari_bot/plugins/komari_chat"
-    workflow_source = (
-        plugin_dir / "services/reply_fulfillment_workflow.py"
-    ).read_text(encoding="utf-8")
+    workflow_source = (plugin_dir / "services/reply_fulfillment_workflow.py").read_text(
+        encoding="utf-8"
+    )
     plugin_source = (plugin_dir / "__init__.py").read_text(encoding="utf-8")
-    handler_source = (
-        plugin_dir / "handlers/message_handler.py"
-    ).read_text(encoding="utf-8")
+    handler_source = (plugin_dir / "handlers/message_handler.py").read_text(
+        encoding="utf-8"
+    )
 
     assert "ReplyFulfillmentRepository" in workflow_source
     assert "reply_fulfillment_repository" in workflow_source
@@ -221,6 +223,5 @@ def test_legacy_reply_commit_repository_is_physically_deleted() -> None:
         / "komari_bot/plugins/komari_chat/repositories/reply_commit_repository.py"
     ).exists()
     assert not (
-        project_root
-        / "tests/komari_chat/test_reply_commit_repository_integration.py"
+        project_root / "tests/komari_chat/test_reply_commit_repository_integration.py"
     ).exists()

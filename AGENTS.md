@@ -177,7 +177,7 @@ SUPERUSER 消息 → komari_debug（命令处理器）
          ├─ favor — 调用 user_data.get/set_user_favorability
          ├─ bind — 通过 character_binding.get_binding_manager() 操作；list 明细默认私聊
          ├─ reply — 调用 komari_chat.generate_debug_reply，走纯读取/生成核心，
-         │         跳过决策引擎、Redis push、好感度 adjust、互动写入、冷却/频控，
+         │         跳过决策引擎、Redis push、好感度 adjust、Hindsight 写入、冷却/频控，
          │         读取真实群上下文与附图/引用消息；完整诊断报告仅私聊 SUPERUSER，
          │         群内默认只发 request ID/状态，`--public` 仅追加二次脱敏摘要
          └─ summary — 调用 group_history_summary.execute_group_summary 共享服务，
@@ -190,7 +190,20 @@ SUPERUSER 消息 → komari_debug（命令处理器）
 ### 1. 配置管理 (`config_manager`)
 
 - **存储源**：业务插件动态配置统一存储在 PostgreSQL 强类型单行表 `komari_<插件>_config`（迁移 0002 建表、0004 为 komari_chat 补充、0026 新增 komari_context、0027 完成 chat/context 字段所有权迁移）；每张表固定主键 `id=1`、CAS 修订号 `revision`（写操作原子自增）、写入时间 `updated_at`（存储层显式赋值）；可扩展字段（列表/字典/嵌套配置）保留 JSONB 列
-- **komari_chat 专属配置**：主动回复频控与回复送达副作用 outbox 的 10 个字段位于 `komari_chat_config`（迁移 0004 建表，从 `komari_memory_config` 单行迁入，死字段 `proactive_score_threshold` 随批删除）；TSK-192/TSK-193 起回复 Agent 预算（`agent_max_rounds` / `agent_max_tool_calls_per_round` / `agent_max_total_tool_calls`）与工具调用约束模式（`agent_tool_call_mode`）也落在此表；TSK-194/ADR-0010 起图片理解模式（`image_understanding_mode`）与 8 项下载预算（`vision_image_download_*`，迁移 0015）同样归 `komari_chat`；TSK-192 phase B（迁移 0027）起聊天生成槽位、常识库/上下文预算、表情反应、聊天检索开关与 `plugin_enable` 也归 `komari_chat`，查询重写使用独立的 `query_rewrite_*` 槽位。`komari_context_config` 则拥有 `redis_db`、`bot_nickname`、`error_notify_enabled`、`global_interaction_enabled` 与 `global_interaction_trigger_size`。运行时分别经 `komari_chat/services/config_interface.py` 与 `komari_context` 顶层 `get_context_config()` 读取；两处迁移后均不保留 alias / 双读 / fallback，komari_chat 不得 import `komari_memory.services.config_interface`
+- **聊天配置**：`komari_chat_config` 保存主动回复频控与回复履约策略。
+- 回复履约策略包括租约、批次、重试、新鲜度和墓碑保留。
+- `komari_chat_config` 保存回复 Agent 预算与工具调用约束模式。
+- `komari_chat_config` 保存图片理解模式与 8 项下载预算。
+- 迁移 `0027` 将聊天生成槽位、常识库与上下文预算迁入聊天配置。
+- 迁移 `0027` 将表情反应、聊天检索开关与聊天启用开关迁入聊天配置。
+- 查询重写使用独立的 `query_rewrite_*` 槽位。
+- **上下文配置**：`komari_context_config` 保存 `redis_db`、`bot_nickname` 与 `error_notify_enabled`。
+- TSK-195 的回复履约不再读取全局互动开关。
+- `global_interaction_enabled` 与 `global_interaction_trigger_size` 保留到 TSK-197 清理。
+- 聊天配置通过 `komari_chat/services/config_interface.py` 读取。
+- 上下文配置通过 `komari_context.get_context_config()` 读取。
+- 配置迁移不保留旧别名、双读或故障回退。
+- 聊天插件禁止导入 `komari_memory.services.config_interface`。
 - **结构真源**：各插件 `config_schema.py` 中的 SQLModel 元数据（`TypedConfigModel` 基类，见 `config/typed_config.py`）；Alembic 迁移环境只按源文件加载 schema（`load_all_typed_config_models()`），不执行插件包 `__init__`、不访问数据库
 - **旧 JSONB 表**：迁移 `0013` 已显式删除 `komari_plugin_configs`。运行时只使用强类型配置表。删除表必须使用手写迁移。
 - **Prompt 配置**：字符串 prompt 不存入配置表，统一使用独立强类型表（见 1.1 节）
@@ -378,6 +391,26 @@ TSK-193 起运行时只接入 Hindsight 共享长期记忆。
 - 就绪要求读取目标 bank 配置成功，并完成一次真实 `arecall` 探测。
 - 失败按配置的恢复间隔做单飞重试；设置指纹变化允许立即重新探测。
 - 新任务仍会重新读取 bank；旧会话的迟到失败不能覆盖新指纹就绪状态。
+- TSK-195 通过 `hindsight_memory` 承诺保存已确认送达的角色回复。
+- 回复准备阶段冻结 Hindsight 请求。
+- 冻结内容包括正文、群、Bot、适配器、触发消息、引用目标与生成时间。
+- 请求的 `source_id` 为 `reply:<fulfillment_id>`。
+- 请求时间戳使用回复生成时间，不代表平台送达时间。
+- 只有 `DELIVERED` 父履约的执行器可以提交请求。
+- 执行器按冻结的目标指纹打开会话。
+- 同一目标允许凭据轮换。
+- 地址或 bank 变化时拒绝改投。
+- 最终提交准入检查拒绝时，执行器保留义务。
+- 准入拒绝不消费重试预算。
+- `document_conflict` 记为永久幂等冲突。
+- 其他错误只记录调用侧归一化的安全码。
+- 记忆失败不撤销已确认送达事实。
+- 好感度与角色回复历史保持独立执行。
+- 角色回复历史继续向判定引擎报告已送达事实。
+- 记忆承诺恢复不重发平台内容。
+- 迁移 `0029` 拒绝存在未完成旧父履约的数据库。
+- 切换前必须完成旧已送达义务。
+- 未知送达必须通过既有授权运维流程对账。
 - 关闭只关闭自有客户端与在途会话；不关闭 Redis 或共享 ORM。
 - 聊天只执行一次自动召回；模型工具 `recall_memory` 复用同一会话。
 - 召回失败停止本次回复；空召回是成功。
@@ -535,11 +568,26 @@ Jev 请求截止覆盖连接、发送、接收与响应校验。
 
 ### 6. 聊天处理器拆解 (`komari_chat`)
 
-`message_handler.py` 的 `_attempt_reply()` 已拆分为三个边界：
+`message_handler.py` 分离上下文读取与回复生成。
+`reply_fulfillment_workflow.py` 管理平台发送与送达后承诺。
 
-1. **`_read_buffers()`** — 读取 Redis 现有的 recent/global interaction buffer，可选 `store_current`
-2. **`_generate_reply_core()`** — 纯读取/生成核心：查询重写、Hindsight 召回、好感度读取、prompt 构建、LLM 回复生成；不执行任何副作用；接受可选 `AgentRunCollector`
-3. **送达后副作用唯一路径 = outbox** — `commit_delivered_reply()` 只做 `mark_delivered()` 登记 → `claim_operation()` 领取（失败/None 由后台 worker 轮询）→ 四步幂等提交（proactive confirm / 好感度 adjust / AI 历史存储 / 互动历史写入）→ `complete()`；`_attempt_reply()` 自身不提交任何聊天副作用
+- `_read_buffers()` 读取同群近期消息缓冲。
+- 同群缓冲包含已确认送达的角色回复。
+- `store_current` 控制当前消息入缓冲。
+- `_generate_reply_core()` 执行读取与生成，不执行记忆写入。
+- 生成包装层从实际 Hindsight 会话标注目标指纹。
+- 生成核心接受可选的 `AgentRunCollector`。
+- `fulfill()` 在发送前冻结父身份与适用承诺。
+- 发送前登记 `mark_send_started()`。
+- 平台发送结果落为 `DELIVERED`、`PENDING_CONFIRMATION` 或 `NOT_DELIVERED`。
+- 仅 `DELIVERED` 父履约允许执行送达后承诺。
+- 好感度调整、角色回复历史与 Hindsight 记忆始终适用。
+- 存在主动回复预占时，追加主动回复确认承诺。
+- 每项承诺维护独立的尝试、退避与完成状态。
+- 全部适用承诺完成后，父履约才能完成。
+- 发送开始后结果未知时，父履约保持待确认。
+- 承诺重试与运维续跑不重发平台内容。
+- `_attempt_reply()` 不执行送达后承诺。
 
 表情反应与失败通知契约：
 - 表情反应在 `_attempt_reply()` 内、调用 `_generate_reply_core()` 之前以 `asyncio.create_task` fire-and-forget 派发（任务引用挂 `self._reaction_tasks` 防 GC），提示“正在生成”；`commit_delivered_reply()` 不再触发表情，送达后不撤下。
@@ -554,7 +602,7 @@ Jev 请求截止覆盖连接、发送、接收与响应校验。
 `process_message(..., reply_allowed=False)` 用于 chat 封禁：保留原消息的判定和缓冲写入，但在 `_attempt_reply()` 前返回，并记录 `blocked_by_user_ban`。
 
 公开 debug 入口：
-- `komari_chat.generate_debug_reply()` — 以命令发起者身份、当前群上下文执行纯读取/生成，完全跳过决策引擎、表情反应、Redis push、好感度 adjust、互动历史、冷却/频控；使用 `debug-reply-*` trace ID；返回 `DebugReplyResult`（含 collector）
+- `komari_chat.generate_debug_reply()` — 以命令发起者身份、当前群上下文执行纯读取/生成，完全跳过决策引擎、表情反应、Redis push、好感度 adjust、Hindsight 写入、冷却/频控；使用 `debug-reply-*` trace ID；返回 `DebugReplyResult`（含 collector）
 - 底层依赖未初始化时抛出 `RuntimeError`（可展示的错误信息）
 
 视觉服务与图片理解（`vision_service.py` / `image_understanding.py`，TSK-194/ADR-0010）：
@@ -697,7 +745,7 @@ KOMARI_TEST_POSTGRES_URL=postgresql+asyncpg://user:pass@host:5432/komari_bot_tes
 6. **Python 3.13 特有**：本项目不兼容 Python 3.12 及以下
 7. **Sentry 过滤**：NoneBot 控制流异常（StopPropagation 等）已在 `sentry_support.py` 中过滤；脱敏采用黑名单式：诊断数据（异常正文、breadcrumb、Sentry Logs 正文、事务/span、堆栈局部变量、请求数据）默认全量保留，仅通过三层机制（字段名黑名单、值模式正则、已配置秘密精确替换）隐藏凭据类字段。`send_default_pii` 仅控制 user 上下文（用户标识）是否上报
 8. **debug 插件权限**：`komari_debug` 所有子命令在处理器第一行调用 `await SUPERUSER(bot, event)`，绝对不放进 matcher 的 `permission=` 或 `rule=`
-9. **debug 无副作用**：`.debug reply` 走 `generate_debug_reply()`，完全不触发 Redis push、好感度 adjust、互动历史写入或冷却/频控
+9. **debug 无副作用**：`.debug reply` 走 `generate_debug_reply()`，完全不触发 Redis push、好感度 adjust、Hindsight 写入或冷却/频控
 10. **诊断结构与投递**：完整报告绝不包含完整 prompt、reasoning content、base64、历史或画像正文，且只私聊已鉴权 SUPERUSER；群内默认仅返回 request ID/状态，`--public` 仍必须隐藏输入、输出、用户标识、异常正文与工具参数
 11. **用户封禁边界**：`chat` 只压制 `komari_chat` 的实际回复；其他用户 matcher 统一属于 `command`，封禁时必须静默且保留原 matcher 的传播阻断语义
 12. **内容预算**：用户/管理入口可写文本必须复用 `komari_bot.llm.content_budget`；同时检查字符、UTF-8 字节、估算 token 与关键词组合，不得在各插件复制限额或静默截断

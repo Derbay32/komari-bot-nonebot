@@ -988,7 +988,6 @@ async def test_reply_success_calls_generate_debug_reply_and_sends_report(
             reply_to_message_id=None,
             favorability_delta=5,
             favorability_reason="测试",
-            interaction_history=None,
             collector=collector,
         )
 

@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from komari_bot.context.redis_store import MessageSchema
+from tests.komari_chat.hindsight_commitment_support import memory_payload
 
 if TYPE_CHECKING:
     from nonebug import App
@@ -89,11 +90,12 @@ def _pending_reply(
     reply_target_message_id: str = "message-1",
     favorability_delta: int = 1,
     favorability_reason: str = "正常互动",
-    interaction_history: dict[str, str] | None = None,
     proactive_reservation_id: str | None = "reservation-1",
     reply_timestamp: float = 2.0,
     request_trace_id: str = "chat-message-1",
     user_nickname: str = "测试用户",
+    bot_nickname: str = "小鞠",
+    target_fingerprint: str = "a" * 64,
 ) -> Any:
     handler_module = import_module(
         "komari_bot.plugins.komari_chat.handlers.message_handler"
@@ -117,13 +119,12 @@ def _pending_reply(
         message=message,
         reply_result=handler_module.ReplyResult(
             content=reply_content,
-            interaction_history=interaction_history
-            or {"event": "发言", "result": "回复", "emotion": "平静"},
             favorability_delta=favorability_delta,
             favorability_reason=favorability_reason,
+            hindsight_target_fingerprint=target_fingerprint,
         ),
         force_reply=False,
-        bot_nickname="小鞠",
+        bot_nickname=bot_nickname,
         bot_self_id=bot_self_id,
         adapter_name=adapter_name,
         reason="score",
@@ -134,6 +135,7 @@ def _pending_reply(
         proactive_handoff=(
             _ReservationHandoff() if proactive_reservation_id is not None else None
         ),
+        hindsight_target_fingerprint=target_fingerprint,
     )
 
 
@@ -171,11 +173,14 @@ def test_fulfillment_id_is_stable_and_versioned_by_trigger_identity(
 ) -> None:
     build_id = workflow_module.build_reply_fulfillment_id
 
-    assert build_id(
-        group_id="group-1",
-        trigger_message_id="message-1",
-        trigger_user_id="user-1",
-    ) == "reply-f4a5b040c6483b19aba869b1f19106c86bcb1de97e763ea2a51e3c0f74d77469"
+    assert (
+        build_id(
+            group_id="group-1",
+            trigger_message_id="message-1",
+            trigger_user_id="user-1",
+        )
+        == "reply-f4a5b040c6483b19aba869b1f19106c86bcb1de97e763ea2a51e3c0f74d77469"
+    )
     assert build_id(
         group_id="group-1",
         trigger_message_id="message-1",
@@ -185,30 +190,33 @@ def test_fulfillment_id_is_stable_and_versioned_by_trigger_identity(
         trigger_message_id="message-1",
         trigger_user_id="user-1",
     )
-    assert len(
-        {
-            build_id(
-                group_id="group-1",
-                trigger_message_id="message-1",
-                trigger_user_id="user-1",
-            ),
-            build_id(
-                group_id="group-2",
-                trigger_message_id="message-1",
-                trigger_user_id="user-1",
-            ),
-            build_id(
-                group_id="group-1",
-                trigger_message_id="message-2",
-                trigger_user_id="user-1",
-            ),
-            build_id(
-                group_id="group-1",
-                trigger_message_id="message-1",
-                trigger_user_id="user-2",
-            ),
-        }
-    ) == 4
+    assert (
+        len(
+            {
+                build_id(
+                    group_id="group-1",
+                    trigger_message_id="message-1",
+                    trigger_user_id="user-1",
+                ),
+                build_id(
+                    group_id="group-2",
+                    trigger_message_id="message-1",
+                    trigger_user_id="user-1",
+                ),
+                build_id(
+                    group_id="group-1",
+                    trigger_message_id="message-2",
+                    trigger_user_id="user-1",
+                ),
+                build_id(
+                    group_id="group-1",
+                    trigger_message_id="message-1",
+                    trigger_user_id="user-2",
+                ),
+            }
+        )
+        == 4
+    )
 
 
 async def test_first_prepare_freezes_identity_target_and_applicable_commitments(
@@ -233,7 +241,7 @@ async def test_first_prepare_freezes_identity_target_and_applicable_commitments(
         "proactive_reply_confirmation",
         "favorability_adjustment",
         "assistant_reply_history",
-        "interaction_history",
+        "hindsight_memory",
     ]
     assert [item.to_json() for item in draft.commitments] == [
         {
@@ -248,18 +256,11 @@ async def test_first_prepare_freezes_identity_target_and_applicable_commitments(
             "reply_content": "回复正文",
             "reply_timestamp": 2.0,
         },
-        {
-            "user_id": "user-1",
-            "display_name": "测试用户",
-            "trigger_size": 20,
-            "reply_timestamp": 2.0,
-            "trigger_message_id": "message-1",
-            "record": {"event": "发言", "result": "回复", "emotion": "平静"},
-        },
+        memory_payload(pending.fulfillment_id),
     ]
 
 
-async def test_inapplicable_commitments_are_absent_and_stay_frozen(
+async def test_only_proactive_confirmation_is_optional_and_stays_frozen(
     workflow_module: Any,
 ) -> None:
     store = _FrozenFulfillmentStore()
@@ -279,6 +280,7 @@ async def test_inapplicable_commitments_are_absent_and_stay_frozen(
     assert [item.commitment_type for item in draft.commitments] == [
         "favorability_adjustment",
         "assistant_reply_history",
+        "hindsight_memory",
     ]
 
     replacement_workflow = _workflow(
@@ -286,15 +288,18 @@ async def test_inapplicable_commitments_are_absent_and_stay_frozen(
         store,
         global_interaction_enabled=True,
     )
-    with pytest.raises(ValueError, match="履约冲突"):
+    assert (
         await replacement_workflow.fulfill(
             pending,
             send_reply=lambda _pending: pytest.fail("重复履约不得重新发送"),
         )
+        is False
+    )
     assert store.records[pending.fulfillment_id] is draft
     assert [item.commitment_type for item in draft.commitments] == [
         "favorability_adjustment",
         "assistant_reply_history",
+        "hindsight_memory",
     ]
 
 
@@ -317,35 +322,28 @@ async def test_payload_hash_is_canonical_and_covers_every_frozen_responsibility(
         return str(store.records[pending.fulfillment_id].payload_hash)
 
     baseline = await _payload_hash()
-    reordered = await _payload_hash(
-        interaction_history={"emotion": "平静", "result": "回复", "event": "发言"}
-    )
 
     assert len(baseline) == 64
-    assert baseline == reordered
     assert baseline == await _payload_hash(request_trace_id="chat-redelivery-2")
-    assert len(
-        {
-            baseline,
-            await _payload_hash(reply_content="另一份回复"),
-            await _payload_hash(bot_self_id="bot-2"),
-            await _payload_hash(adapter_name="other-adapter"),
-            await _payload_hash(reply_target_message_id="message-2"),
-            await _payload_hash(favorability_delta=2),
-            await _payload_hash(favorability_reason="特殊互动"),
-            await _payload_hash(reply_timestamp=3.0),
-            await _payload_hash(
-                interaction_history={
-                    "event": "追问",
-                    "result": "解释",
-                    "emotion": "认真",
-                }
-            ),
-            await _payload_hash(user_nickname="另一个显示名"),
-            await _payload_hash(proactive_reservation_id=None),
-            await _payload_hash(global_interaction_enabled=False),
-        }
-    ) == 12
+    assert (
+        len(
+            {
+                baseline,
+                await _payload_hash(reply_content="另一份回复"),
+                await _payload_hash(reply_content="第三份回复"),
+                await _payload_hash(bot_self_id="bot-2"),
+                await _payload_hash(adapter_name="other-adapter"),
+                await _payload_hash(reply_target_message_id="message-2"),
+                await _payload_hash(favorability_delta=2),
+                await _payload_hash(favorability_reason="特殊互动"),
+                await _payload_hash(reply_timestamp=3.0),
+                await _payload_hash(target_fingerprint="c" * 64),
+                await _payload_hash(bot_nickname="另一个昵称"),
+                await _payload_hash(proactive_reservation_id=None),
+            }
+        )
+        == 12
+    )
 
 
 async def test_same_hash_is_idempotent_but_changed_payload_is_a_conflict(
@@ -363,10 +361,13 @@ async def test_same_hash_is_idempotent_but_changed_payload_is_a_conflict(
         send_count += 1
         return object()
 
-    assert await workflow.fulfill(
-        _pending_reply(workflow_module),
-        send_reply=_send,
-    ) is False
+    assert (
+        await workflow.fulfill(
+            _pending_reply(workflow_module),
+            send_reply=_send,
+        )
+        is False
+    )
     assert send_count == 0
     assert len(store.records) == 1
 
@@ -393,9 +394,12 @@ async def test_terminal_identity_still_prevents_resend(
     store.records.pop(pending.fulfillment_id)
     store.terminal_states[pending.fulfillment_id] = terminal_state
 
-    assert await workflow.fulfill(
-        _pending_reply(workflow_module),
-        send_reply=lambda _pending: pytest.fail("终态履约不得重新发送"),
-    ) is False
+    assert (
+        await workflow.fulfill(
+            _pending_reply(workflow_module),
+            send_reply=lambda _pending: pytest.fail("终态履约不得重新发送"),
+        )
+        is False
+    )
     assert pending.fulfillment_id not in store.records
     assert store.terminal_states[pending.fulfillment_id] == terminal_state

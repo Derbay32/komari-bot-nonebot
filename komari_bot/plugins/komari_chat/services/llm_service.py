@@ -6,7 +6,7 @@ import asyncio
 import json
 import time
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING, Any
 
 from nonebot import logger
 from nonebot.plugin import require
@@ -57,15 +57,7 @@ FINAL_RESPONSE_TOOL_NAME = "final_response"
 RECORD_FAVORABILITY_DELTA_TOOL_NAME = "record_favorability_delta"
 _EMPTY_TOOLS_ERROR = "tools 不能为空，无工具场景请使用 generate_reply()"
 _MISSING_FINAL_CONTENT_ERROR = "final_response 缺少有效的 'content' 字段"
-_MISSING_INTERACTION_HISTORY_ERROR = (
-    "final_response 缺少有效的 'interaction_history' 字段"
-)
-_INCOMPLETE_INTERACTION_HISTORY_ERROR = (
-    "final_response.interaction_history 缺少 event/result/emotion"
-)
-_MISSING_MESSAGES_ERROR = (
-    "generate_reply() 需要 messages 参数以强制生成 interaction_history"
-)
+_MISSING_MESSAGES_ERROR = "generate_reply() 需要 messages 参数以生成最终回复"
 _INVALID_FAVORABILITY_DELTA_JSON_ERROR = "record_favorability_delta 参数不是合法 JSON"
 _MISSING_FAVORABILITY_DELTA_ARGUMENTS_ERROR = "record_favorability_delta 参数缺失"
 _INVALID_FAVORABILITY_DELTA_TYPE_ERROR = (
@@ -208,35 +200,8 @@ FINAL_RESPONSE_TOOL: dict[str, Any] = {
                     "maxLength": 2_000,
                     "description": "给用户看的回复正文（即要发送出去的消息内容）",
                 },
-                "interaction_history": {
-                    "type": "object",
-                    "description": (
-                        "对该用户本轮对话的互动记录。每次回复都必须生成，"
-                        "简单互动也要简短记录。包含 event（该用户做了什么）、"
-                        "result（你的反应）、emotion（你当时的感受）。"
-                    ),
-                    "properties": {
-                        "event": {
-                            "type": "string",
-                            "maxLength": 500,
-                            "description": "该用户做了什么（一句话描述）",
-                        },
-                        "result": {
-                            "type": "string",
-                            "maxLength": 500,
-                            "description": "你的反应（一句话描述）",
-                        },
-                        "emotion": {
-                            "type": "string",
-                            "maxLength": 100,
-                            "description": "你当时的感受（简短情绪词或短语）",
-                        },
-                    },
-                    "required": ["event", "result", "emotion"],
-                    "additionalProperties": False,
-                },
             },
-            "required": ["content", "interaction_history"],
+            "required": ["content"],
             "additionalProperties": False,
         },
     },
@@ -282,17 +247,13 @@ _CANONICAL_TOOLS = {
 }
 
 
-class InteractionHistoryRecord(TypedDict):
-    """单轮聊天同步生成的互动历史记录。"""
-
-    event: str
-    result: str
-    emotion: str
-
-
 @dataclass(frozen=True)
 class ReplyResult:
-    """聊天回复正文与同步生成的互动历史。
+    """聊天回复正文与本次生成同步取得的运行时事实。
+
+    ``hindsight_target_fingerprint``（TSK-195）：由 ``_generate_reply_core``
+    从实际打开的任务记忆会话标注的内部字段，默认 ``None``；模型工具参数
+    永远不得提供该字段，只有生成包装层可以写入。
 
     ``image_failure_summary``（TSK-196）：任务成功但存在图片失败时附带的
     安全聚合摘要（``ImageFailureSummary``，无 URL/base64/正文/视觉描述）；
@@ -301,9 +262,9 @@ class ReplyResult:
     """
 
     content: str
-    interaction_history: InteractionHistoryRecord
     favorability_delta: int | None = None
     favorability_reason: str | None = None
+    hindsight_target_fingerprint: str | None = None
     image_failure_summary: ImageFailureSummary | None = None
 
 
@@ -399,24 +360,8 @@ def _parse_reply_result(
     if not isinstance(content_raw, str) or not content_raw.strip():
         raise ValueError(_MISSING_FINAL_CONTENT_ERROR)
 
-    interaction_history_raw = parsed.get("interaction_history")
-    if not isinstance(interaction_history_raw, dict):
-        raise TypeError(_MISSING_INTERACTION_HISTORY_ERROR)
-
-    event = str(interaction_history_raw.get("event", "")).strip()
-    result = str(interaction_history_raw.get("result", "")).strip()
-    emotion = str(interaction_history_raw.get("emotion", "")).strip()
-    if not event or not result or not emotion:
-        raise ValueError(_INCOMPLETE_INTERACTION_HISTORY_ERROR)
-
-    interaction_history: InteractionHistoryRecord = {
-        "event": event,
-        "result": result,
-        "emotion": emotion,
-    }
     return ReplyResult(
         content=content_raw.strip(),
-        interaction_history=interaction_history,
         favorability_delta=favorability_delta,
         favorability_reason=favorability_reason,
     )
@@ -1059,10 +1004,7 @@ async def _execute_tool_loop(
             # 安静丢弃本轮结果，不进入 provider、不落任何待恢复补执行状态、
             # 不复活；一次裁决只授权本轮的这一个不可分效果。
             if not effect_business_admitted(group_id=group_id):
-                return ReplyResult(
-                    content="",
-                    interaction_history={"event": "", "result": "", "emotion": ""},
-                )
+                return ReplyResult(content="")
             # TSK-192 / ADR-0010：主工具循环恒使用聊天模型与 chat 槽位；
             # read_image 工具的视觉子调用（vision_service）才使用 vision
             # 模型与槽位，不再因存在 read_image 工具而切换整个循环。
@@ -1248,8 +1190,7 @@ async def _execute_tool_loop(
                     if not tool_call.parsed_arguments:
                         err_msg = (
                             "final_response 缺少 JSON 参数。请重新调用 final_response，"
-                            "并提供符合 schema 的 JSON：必须包含 content（字符串）"
-                            "与 interaction_history（含 event、result、emotion）。"
+                            "并提供符合 schema 的 JSON：必须包含 content（字符串）。"
                         )
                         tool_error_results.append(
                             {

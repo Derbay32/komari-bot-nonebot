@@ -17,6 +17,9 @@
   ledger / komari_plugin_configs / 旧 outbox）、六列 RENAME 保持轮 A 语义、
   cutover-cancelled 行的 proactive commitment 子行删除且 parent 保留无正文
   tombstone、downgrade 拒绝 ``0013_TSK232_IS_IRREVERSIBLE``。
+- 0029 前置条件：held-state 库先成功推进到 0028；随后 ``upgrade head`` 因
+  故意保留的未完成父履约以固定 ``TSK195_UNFINISHED_REPLY_FULFILLMENT``
+  拒绝，版本停留 0028，父/子行快照逐值不变（不补完、不对账、不删除）。
 - fresh 豁免：空库（is_fresh=true、双 ledger 空、digest NULL）不经验证
   直通 head。
 
@@ -717,7 +720,7 @@ async def _cleanup_test_redis_keys() -> None:
 def test_0013_succeeds_with_held_states_and_cleans_migration_only_tables(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """白名单全绿：0013 成功、migration-only 表删净、tombstone 收尾正确。"""
+    """白名单全绿：0013 成功、migration-only 表删净、tombstone 收尾正确；0029 对 held 义务显式拒绝。"""
     with _scratch_at_revision("hs", "0011") as (params, database_url):
         seed_legacy_configs(
             params,
@@ -743,10 +746,42 @@ def test_0013_succeeds_with_held_states_and_cleans_migration_only_tables(
             )
             assert asyncio.run(_fetch_version(params)) == "0013"
 
-            # 完成当前 head 升级后，继续验证全部业务存量断言。
-            result = run_bootstrap(database_url, "upgrade", "head")
-            assert result.returncode == 0, result.stderr
+            # 0029 起切换送达记忆协议：先把库推进到 0028，再证明被故意
+            # 保留的未完成父履约会让 head 升级按固定前置条件失败且原样保留。
+            pre_head = run_bootstrap(database_url, "upgrade", "0028")
+            assert pre_head.returncode == 0, pre_head.stderr
             assert asyncio.run(_fetch_version(params)) == "0028"
+
+            async def _held_fulfillment_rows() -> tuple[list[Any], list[Any]]:
+                connection = await _connect(params)
+                try:
+                    parents = await connection.fetch(
+                        "SELECT * FROM komari_chat_reply_fulfillments"
+                        " WHERE fulfillment_id IN ("
+                        " 'fulfill-c13-held-pending',"
+                        " 'fulfill-c13-delivered-open')"
+                        " ORDER BY fulfillment_id"
+                    )
+                    children = await connection.fetch(
+                        "SELECT * FROM komari_chat_reply_fulfillment_commitments"
+                        " WHERE fulfillment_id IN ("
+                        " 'fulfill-c13-held-pending',"
+                        " 'fulfill-c13-delivered-open')"
+                        " ORDER BY fulfillment_id, commitment_type"
+                    )
+                finally:
+                    await connection.close()
+                return [dict(row) for row in parents], [dict(row) for row in children]
+
+            held_before = asyncio.run(_held_fulfillment_rows())
+            result = run_bootstrap(database_url, "upgrade", "head")
+            assert result.returncode != 0
+            assert (
+                "TSK195_UNFINISHED_REPLY_FULFILLMENT"
+                in f"{result.stdout}\n{result.stderr}"
+            )
+            assert asyncio.run(_fetch_version(params)) == "0028"
+            assert asyncio.run(_held_fulfillment_rows()) == held_before
         finally:
             asyncio.run(_cleanup_test_redis_keys())
 
@@ -850,6 +885,6 @@ def test_0013_fresh_empty_database_passes_head_without_redis() -> None:
     try:
         result = run_bootstrap(database_url, "upgrade", "head")
         assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
-        assert asyncio.run(_fetch_version(params)) == "0028"
+        assert asyncio.run(_fetch_version(params)) == "0029"
     finally:
         asyncio.run(drop_scratch_database(str(params["database"])))

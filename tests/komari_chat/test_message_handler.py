@@ -335,10 +335,9 @@ def test_read_buffers_uses_context_limit_instead_of_summary_limit(
         message_id="current",
     )
 
-    recent, _interactions, stored = asyncio.run(
+    recent, stored = asyncio.run(
         handler._read_buffers(
             group_id="g1",
-            user_id="u2",
             message=current,
             store_current=False,
         )
@@ -397,13 +396,9 @@ def test_attempt_reply_only_rewrites_current_message(
         generate_with_tools_kwargs.update(_kwargs)
         return llm_service_module.ReplyResult(
             content="收到啦",
-            interaction_history={
-                "event": "发送当前待回复消息",
-                "result": "回复收到啦",
-                "emotion": "平静",
-            },
             favorability_delta=1,
             favorability_reason="正常互动",
+            hindsight_target_fingerprint="a" * 64,
         )
 
     _patch_both_configs(
@@ -459,12 +454,9 @@ def test_attempt_reply_only_rewrites_current_message(
     assert pending_reply.reply == "收到啦"
     assert pending_reply.reply_to_message_id == current_message.message_id
     assert handler.query_rewrite.current_query == "当前待回复消息"
-    assert redis.global_interaction_buffer_calls == [{"user_id": "user-1", "limit": 10}]
+    assert redis.global_interaction_buffer_calls == []
     assert memory.recall_calls == ["重写后的查询"]
     assert build_prompt_kwargs["recall_response"] is recall_result
-    assert build_prompt_kwargs["interaction_records"] == [
-        {"event": "旧互动", "result": "旧回应", "emotion": "平静"}
-    ]
     assert llm_service_module.RECALL_MEMORY_TOOL in generate_with_tools_kwargs["tools"]
     assert (
         llm_service_module.RECORD_FAVORABILITY_DELTA_TOOL
@@ -570,13 +562,9 @@ def _wire_reaction_sent_case(
     async def _fake_generate(**_kwargs: object) -> object:
         return llm_service_module.ReplyResult(
             content="生成成功",
-            interaction_history={
-                "event": "测试",
-                "result": "生成成功",
-                "emotion": "平静",
-            },
             favorability_delta=1,
             favorability_reason="测试",
+            hindsight_target_fingerprint="a" * 64,
         )
 
     _patch_both_configs(
@@ -1065,13 +1053,9 @@ def test_generate_debug_reply_skips_all_side_effects(
     async def _fake_generate(**_kwargs: object) -> object:
         return llm_service_module.ReplyResult(
             content="debug测试回复",
-            interaction_history={
-                "event": "测试",
-                "result": "测试回复",
-                "emotion": "平静",
-            },
             favorability_delta=1,
             favorability_reason="debug测试",
+            hindsight_target_fingerprint="a" * 64,
         )
 
     monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
@@ -1095,11 +1079,7 @@ def test_generate_debug_reply_skips_all_side_effects(
     assert result.reply == "debug测试回复"
     assert result.favorability_delta == 1
     assert result.favorability_reason == "debug测试"
-    assert result.interaction_history == {
-        "event": "测试",
-        "result": "测试回复",
-        "emotion": "平静",
-    }
+    assert not hasattr(result, "interaction_history")
     assert result.collector is not None
     assert result.collector.request_id.startswith("debug-reply-")
     assert result.reply_to_message_id is None
@@ -1164,13 +1144,9 @@ def test_generate_debug_reply_collector_has_query_rewrite_trace(
         )
         return llm_service_module.ReplyResult(
             content="带trace的回复",
-            interaction_history={
-                "event": "trace",
-                "result": "trace回复",
-                "emotion": "平静",
-            },
             favorability_delta=2,
             favorability_reason="trace测试",
+            hindsight_target_fingerprint="a" * 64,
         )
 
     monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
@@ -1244,13 +1220,9 @@ def test_generate_debug_reply_with_images_and_reply_context(
     async def _fake_generate(**_kwargs: object) -> object:
         return llm_service_module.ReplyResult(
             content="附图debug回复",
-            interaction_history={
-                "event": "附图测试",
-                "result": "附图回复",
-                "emotion": "平静",
-            },
             favorability_delta=0,
             favorability_reason="无变化",
+            hindsight_target_fingerprint="a" * 64,
         )
 
     monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
@@ -1367,10 +1339,10 @@ def test_generate_debug_reply_with_image_failure_summary_never_notifies(
     async def _fake_generate(**_kwargs: object) -> object:
         return llm_service_module.ReplyResult(
             content="debug附图回复",
-            interaction_history={"event": "附图", "result": "回复", "emotion": "平静"},
             favorability_delta=0,
             favorability_reason="无变化",
             image_failure_summary=summary,
+            hindsight_target_fingerprint="a" * 64,
         )
 
     monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
@@ -1492,13 +1464,9 @@ def test_normal_attempt_reply_defers_side_effects_until_delivery(
     async def _fake_generate(**_kwargs: object) -> object:
         return llm_service_module.ReplyResult(
             content="正常回复",
-            interaction_history={
-                "event": "正常消息",
-                "result": "正常回复",
-                "emotion": "平静",
-            },
             favorability_delta=1,
             favorability_reason="正常互动",
+            hindsight_target_fingerprint="a" * 64,
         )
 
     monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
@@ -1554,15 +1522,15 @@ def test_proactive_attempt_returns_pending_reply_carrying_handoff(
     handler.redis = redis
     handler.proactive_reservation = reservation_svc
 
-    async def _fake_read_buffers(**_kwargs: object) -> tuple[list, list, bool]:
-        return [], [], True
+    async def _fake_read_buffers(**_kwargs: object) -> tuple[list, bool]:
+        return [], True
 
     async def _fake_generate_core(**_kwargs: object) -> object:
         return llm_service_module.ReplyResult(
             content="主动回复",
-            interaction_history=None,
             favorability_delta=0,
             favorability_reason="主动关心",
+            hindsight_target_fingerprint="a" * 64,
         )
 
     monkeypatch.setattr(handler, "_read_buffers", _fake_read_buffers)
@@ -1633,8 +1601,8 @@ def test_proactive_generation_failure_returns_failure_and_lease_exit_releases(
     handler.redis = redis
     handler.proactive_reservation = reservation_svc
 
-    async def _fake_read_buffers(**_kwargs: object) -> tuple[list, list, bool]:
-        return [], [], True
+    async def _fake_read_buffers(**_kwargs: object) -> tuple[list, bool]:
+        return [], True
 
     async def _fail_generate_core(**_kwargs: object) -> object:
         msg = "好感度读取失败"
@@ -1700,8 +1668,8 @@ def test_normal_attempt_reply_gracefully_handles_favorability_read_failure(
         message_handler_module.MessageHandler
     )
 
-    async def _fake_read_buffers(**_kwargs: object) -> tuple[list, list, bool]:
-        return [], [], True
+    async def _fake_read_buffers(**_kwargs: object) -> tuple[list, bool]:
+        return [], True
 
     async def _fake_generate_core(**_kwargs: object) -> object:
         msg = "好感度服务不可用"
@@ -1756,20 +1724,16 @@ def test_generate_debug_reply_refetches_quoted_image_without_url(
     )
     captured: dict[str, object] = {}
 
-    async def _fake_read_buffers(**_kwargs: object) -> tuple[list, list, bool]:
-        return [], [], False
+    async def _fake_read_buffers(**_kwargs: object) -> tuple[list, bool]:
+        return [], False
 
     async def _fake_generate_core(**kwargs: object) -> object:
         captured.update(kwargs)
         return llm_service_module.ReplyResult(
             content="已读取引用图片",
-            interaction_history={
-                "event": "引用图片",
-                "result": "读取完成",
-                "emotion": "平静",
-            },
             favorability_delta=0,
             favorability_reason="无变化",
+            hindsight_target_fingerprint="a" * 64,
         )
 
     monkeypatch.setattr(handler, "_read_buffers", _fake_read_buffers)
@@ -1872,13 +1836,9 @@ def test_reaction_scheduled_before_generate_core(
     async def _fake_generate(**_kwargs: object) -> object:
         return llm_service_module.ReplyResult(
             content="带表情的回复",
-            interaction_history={
-                "event": "表情测试",
-                "result": "表情回复",
-                "emotion": "平静",
-            },
             favorability_delta=1,
             favorability_reason="表情互动",
+            hindsight_target_fingerprint="a" * 64,
         )
 
     async def _fake_reaction() -> None:
@@ -1974,13 +1934,9 @@ def test_reaction_not_scheduled_when_disabled(
     async def _fake_generate(**_kwargs: object) -> object:
         return llm_service_module.ReplyResult(
             content="无表情回复",
-            interaction_history={
-                "event": "无表情",
-                "result": "无表情回复",
-                "emotion": "平静",
-            },
             favorability_delta=1,
             favorability_reason="测试",
+            hindsight_target_fingerprint="a" * 64,
         )
 
     async def _fake_reaction() -> None:
@@ -2075,13 +2031,9 @@ def test_reaction_sent_then_empty_reply_returns_failure_with_reaction_sent_true(
     async def _fake_generate(**_kwargs: object) -> object:
         return llm_service_module.ReplyResult(
             content="",  # 空回复
-            interaction_history={
-                "event": "空回复测试",
-                "result": "",
-                "emotion": "平静",
-            },
             favorability_delta=1,
             favorability_reason="测试",
+            hindsight_target_fingerprint="a" * 64,
         )
 
     monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
@@ -2174,13 +2126,9 @@ def test_reaction_sent_then_delta_missing_returns_failure_with_reaction_sent_tru
     async def _fake_generate(**_kwargs: object) -> object:
         return llm_service_module.ReplyResult(
             content="有回复但无delta",
-            interaction_history={
-                "event": "delta测试",
-                "result": "有回复无delta",
-                "emotion": "平静",
-            },
             favorability_delta=None,  # 缺失
             favorability_reason=None,
+            hindsight_target_fingerprint="a" * 64,
         )
 
     monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
@@ -2406,19 +2354,15 @@ def test_proactive_handoff_lost_returns_generate_failure_with_reaction_sent_true
     handler._reaction_tasks = set()
     handler.proactive_reservation = reservation_svc
 
-    async def _fake_read_buffers(**_kwargs: object) -> tuple[list, list, bool]:
-        return [], [], True
+    async def _fake_read_buffers(**_kwargs: object) -> tuple[list, bool]:
+        return [], True
 
     async def _fake_generate_core(**_kwargs: object) -> object:
         return llm_service_module.ReplyResult(
             content="生成成功但租约已丢",
-            interaction_history={
-                "event": "测试",
-                "result": "生成成功",
-                "emotion": "平静",
-            },
             favorability_delta=1,
             favorability_reason="测试",
+            hindsight_target_fingerprint="a" * 64,
         )
 
     monkeypatch.setattr(handler, "_read_buffers", _fake_read_buffers)
@@ -2529,13 +2473,9 @@ def test_pending_reply_does_not_retain_reaction_callback(
     async def _fake_generate(**_kwargs: object) -> object:
         return llm_service_module.ReplyResult(
             content="送达测试",
-            interaction_history={
-                "event": "送达",
-                "result": "送达回复",
-                "emotion": "平静",
-            },
             favorability_delta=1,
             favorability_reason="测试",
+            hindsight_target_fingerprint="a" * 64,
         )
 
     monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
@@ -2601,7 +2541,7 @@ def test_read_buffers_failure_returns_failure_with_reaction_sent_false(
         ),
     )
 
-    async def _failing_read_buffers(**_kwargs: object) -> tuple[list, list, bool]:
+    async def _failing_read_buffers(**_kwargs: object) -> tuple[list, bool]:
         msg = "Redis 读缓冲失败"
         raise RuntimeError(msg)
 

@@ -642,10 +642,10 @@ async def test_process_message_success_with_image_failures_notifies_once(
     summary = _image_summary()
     reply_result = message_handler_module.ReplyResult(
         content="回复内容",
-        interaction_history={"event": "看图", "result": "描述", "emotion": "平静"},
         favorability_delta=0,
         favorability_reason="无变化",
         image_failure_summary=summary,
+        hindsight_target_fingerprint="a" * 64,
     )
     pending = message_handler_module.PendingReply(
         reply="回复内容",
@@ -665,6 +665,7 @@ async def test_process_message_success_with_image_failures_notifies_once(
         fulfillment_id="fid-1",
         request_trace_id="trace-img",
         reply_timestamp=1.0,
+        hindsight_target_fingerprint="a" * 64,
     )
 
     async def _fake_attempt_reply(**kwargs: object) -> tuple[object, bool, None]:

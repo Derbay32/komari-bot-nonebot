@@ -369,9 +369,9 @@ def _pending_reply(
         ),
         reply_result=handler_module.ReplyResult(
             content=reply_content,
-            interaction_history={"event": "发言", "result": "回复", "emotion": "平静"},
             favorability_delta=favorability_delta,
             favorability_reason="正常互动",
+            hindsight_target_fingerprint="a" * 64,
         ),
         force_reply=False,
         bot_nickname="小鞠",
@@ -383,6 +383,7 @@ def _pending_reply(
         reply_timestamp=2.0,
         proactive_reservation_id=handoff.reservation_id,
         proactive_handoff=handoff,
+        hindsight_target_fingerprint="a" * 64,
     )
 
 

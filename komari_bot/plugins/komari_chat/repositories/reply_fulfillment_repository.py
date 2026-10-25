@@ -20,7 +20,7 @@ from ..reply_fulfillment_domain import (
     AssistantReplyHistoryPayload,
     CommitmentPayload,
     FavorabilityAdjustmentPayload,
-    InteractionHistoryPayload,
+    HindsightMemoryPayload,
     ProactiveReplyConfirmationPayload,
     ReplyCommitmentInput,
     ReplyFulfillmentConflictError,
@@ -273,16 +273,12 @@ class ReplyFulfillmentRepository:
         merged: list[dict[str, Any]] = []
         for row in rows:
             item = dict(row)
-            item["proactive_group_id"] = (
-                projection.get(str(row["fulfillment_id"]), {}).get(
-                    "proactive_group_id"
-                )
-            )
-            item["proactive_reservation_id"] = (
-                projection.get(str(row["fulfillment_id"]), {}).get(
-                    "proactive_reservation_id"
-                )
-            )
+            item["proactive_group_id"] = projection.get(
+                str(row["fulfillment_id"]), {}
+            ).get("proactive_group_id")
+            item["proactive_reservation_id"] = projection.get(
+                str(row["fulfillment_id"]), {}
+            ).get("proactive_reservation_id")
             merged.append(item)
         return merged
 
@@ -1490,7 +1486,7 @@ __all__ = [
     "AssistantReplyHistoryPayload",
     "CommitmentPayload",
     "FavorabilityAdjustmentPayload",
-    "InteractionHistoryPayload",
+    "HindsightMemoryPayload",
     "ProactiveReplyConfirmationPayload",
     "ReplyCommitmentInput",
     "ReplyFulfillmentConflictError",

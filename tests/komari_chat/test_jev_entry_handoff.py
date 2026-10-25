@@ -441,13 +441,9 @@ async def _world(
             world.generation_kwargs.append(dict(kwargs))
             return ReplyResult(
                 content="回复正文",
-                interaction_history={
-                    "event": "对话",
-                    "result": "回复",
-                    "emotion": "平静",
-                },
                 favorability_delta=0,
                 favorability_reason="测试",
+                hindsight_target_fingerprint="a" * 64,
             )
 
         memory_config = SimpleNamespace(

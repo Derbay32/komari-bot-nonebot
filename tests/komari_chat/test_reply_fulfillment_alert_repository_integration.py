@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -15,12 +17,39 @@ import pytest
 from komari_bot.plugins.komari_chat.repositories.reply_fulfillment_repository import (
     AssistantReplyHistoryPayload,
     FavorabilityAdjustmentPayload,
-    InteractionHistoryPayload,
+    HindsightMemoryPayload,
     ProactiveReplyConfirmationPayload,
     ReplyCommitmentInput,
     ReplyFulfillmentDraft,
     ReplyFulfillmentRepository,
 )
+from komari_bot.plugins.komari_memory.services.hindsight_retain import (
+    HindsightRetainRequest,
+)
+
+
+def _memory_payload(fulfillment_id: str) -> HindsightMemoryPayload:
+    request = HindsightRetainRequest.create(
+        target_fingerprint="a" * 64,
+        source_id=f"reply:{fulfillment_id}",
+        content=json.dumps(
+            {"reply_content": "持久化的角色回复"},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        timestamp=datetime.fromtimestamp(123.5, UTC),
+        metadata={"bot_nickname": "小鞠"},
+    )
+    return HindsightMemoryPayload(
+        request=json.dumps(
+            request.to_json(),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -93,19 +122,8 @@ def _draft(fulfillment_id: str) -> ReplyFulfillmentDraft:
                 ),
             ),
             ReplyCommitmentInput(
-                commitment_type="interaction_history",
-                payload=InteractionHistoryPayload(
-                    user_id="user-1",
-                    display_name="测试用户",
-                    trigger_size=20,
-                    reply_timestamp=123.5,
-                    trigger_message_id=f"message-{fulfillment_id}",
-                    record={
-                        "event": "用户发言",
-                        "result": "机器人回复",
-                        "emotion": "平静",
-                    },
-                ),
+                commitment_type="hindsight_memory",
+                payload=_memory_payload(fulfillment_id),
             ),
         ),
     )

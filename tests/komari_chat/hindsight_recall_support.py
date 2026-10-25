@@ -27,13 +27,24 @@ def recall_response(*results: dict[str, Any]) -> "RecallResponse":
 class FakeRecallSession:
     service: "FakeHindsightMemory"
     recall_calls: list[str] = field(default_factory=list)
+    retain_calls: list[Any] = field(default_factory=list)
     closed: bool = False
+    target_fingerprint: str = "a" * 64
 
     async def recall(self, query: str) -> "RecallResponse":
         self.recall_calls.append(query)
         if self.service.recall_error is not None:
             raise self.service.recall_error
         return self.service.recall_response
+
+    async def retain(
+        self,
+        request: object,
+        *,
+        submission_guard: object = None,
+    ) -> None:
+        del submission_guard
+        self.retain_calls.append(request)
 
     async def aclose(self) -> None:
         self.closed = True
@@ -76,7 +87,12 @@ class FakeHindsightMemory:
         self.open_calls = 0
         self.sessions: list[FakeRecallSession] = []
 
-    def open_session(self) -> FakeSessionContext:
+    def open_session(
+        self,
+        *,
+        expected_target_fingerprint: str | None = None,
+    ) -> FakeSessionContext:
+        del expected_target_fingerprint
         return FakeSessionContext(self)
 
     @property

@@ -237,13 +237,9 @@ def _wire_native_core(
             if generate_result is not None
             else llm_service_module.ReplyResult(
                 content="回复内容",
-                interaction_history={
-                    "event": "看图",
-                    "result": "描述",
-                    "emotion": "好奇",
-                },
                 favorability_delta=0,
                 favorability_reason="无变化",
+                hindsight_target_fingerprint="a" * 64,
             )
         )
 
@@ -276,7 +272,6 @@ def _wire_native_core(
         return await handler._generate_reply_core(
             message=_make_message(),
             recent_messages=[],
-            interaction_records=[],
             image_urls=image_urls,
             reply_context=None,
             reply_context_requested=False,
@@ -310,7 +305,6 @@ def test_native_all_downloads_unavailable_terminates_before_llm(
             handler._generate_reply_core(
                 message=_make_message(),
                 recent_messages=[],
-                interaction_records=[],
                 image_urls=[
                     "https://example.com/a.png",
                     "https://example.com/b.png",
@@ -368,7 +362,6 @@ def test_native_multimodal_provider_failure_wraps_without_mode_switch(
             handler._generate_reply_core(
                 message=_make_message(),
                 recent_messages=[],
-                interaction_records=[],
                 image_urls=["https://example.com/a.png"],
                 reply_context=None,
                 reply_context_requested=False,
@@ -430,7 +423,6 @@ def test_native_generic_errors_with_images_are_not_wrapped(
             handler._generate_reply_core(
                 message=_make_message(),
                 recent_messages=[],
-                interaction_records=[],
                 image_urls=["https://example.com/a.png"],
                 reply_context=None,
                 reply_context_requested=False,
@@ -476,7 +468,6 @@ def test_native_provider_failure_counts_all_images(
             handler._generate_reply_core(
                 message=_make_message(),
                 recent_messages=[],
-                interaction_records=[],
                 image_urls=[
                     "https://example.com/a.png",
                     "https://example.com/b.png",
@@ -530,7 +521,6 @@ def test_native_partial_download_failure_plus_provider_failure_counts_total(
             handler._generate_reply_core(
                 message=_make_message(),
                 recent_messages=[],
-                interaction_records=[],
                 image_urls=[
                     "https://example.com/bad.png",
                     "https://example.com/ok.png",
@@ -575,7 +565,6 @@ def test_native_partial_download_failure_success_attaches_diagnostic(
         handler._generate_reply_core(
             message=_make_message(),
             recent_messages=[],
-            interaction_records=[],
             image_urls=[
                 "https://example.com/bad.png",
                 "https://example.com/ok.png",
@@ -616,7 +605,6 @@ def test_native_no_images_plain_llm_error_propagates_unwrapped(
             handler._generate_reply_core(
                 message=_make_message(),
                 recent_messages=[],
-                interaction_records=[],
                 image_urls=None,
                 reply_context=None,
                 reply_context_requested=False,
@@ -665,7 +653,6 @@ def test_agent_run_native_multimodal_failure_redacts_exception_message(
             handler._generate_reply_core(
                 message=_make_message(),
                 recent_messages=[],
-                interaction_records=[],
                 image_urls=["https://example.com/a.png"],
                 reply_context=None,
                 reply_context_requested=False,
@@ -841,7 +828,6 @@ def test_native_provider_failure_exception_chain_is_fully_broken(
             handler._generate_reply_core(
                 message=_make_message(),
                 recent_messages=[],
-                interaction_records=[],
                 image_urls=["https://example.com/a.png"],
                 reply_context=None,
                 reply_context_requested=False,
