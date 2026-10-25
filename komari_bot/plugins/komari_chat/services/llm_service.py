@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import html
 import json
 import time
 from dataclasses import dataclass, replace
@@ -13,13 +12,12 @@ from nonebot import logger
 from nonebot.plugin import require
 
 from komari_bot.core.retry import retry_async
-from komari_bot.llm.content_budget import estimate_text_tokens
+from komari_bot.llm.content_budget import QUERY_TEXT_BUDGET, normalize_required_text
 from komari_bot.llm.untrusted_context import (
     UntrustedContext,
     UntrustedSourceType,
     render_untrusted_context,
 )
-from komari_bot.memory.profile_operations import profile_traits_to_list
 from komari_bot.plugins.llm_provider.base_client import build_assistant_message
 
 from .admission_gate import effect_business_admitted
@@ -36,7 +34,6 @@ if TYPE_CHECKING:
     from komari_bot.plugins.komari_chat.config_schema import (
         KomariChatConfigSchema,
     )
-    from komari_bot.plugins.komari_memory import MemoryService
 
     from .image_reading_session import ImageReadingSessionProtocol
 
@@ -45,11 +42,17 @@ require("llm_provider")
 require("komari_search")
 
 from komari_bot.plugins import komari_search, llm_provider
+from komari_bot.plugins.komari_memory import (
+    HindsightRecallSession,
+    HindsightUnavailableError,
+)
+
+from .prompt_builder import format_recall_payload
 
 READ_IMAGE_TOOL_NAME = "read_image"
 SEARCH_WEB_TOOL_NAME = "search_web"
 FETCH_PAGE_TOOL_NAME = "fetch_page"
-READ_PROFILE_TOOL_NAME = "read_profile"
+RECALL_MEMORY_TOOL_NAME = "recall_memory"
 FINAL_RESPONSE_TOOL_NAME = "final_response"
 RECORD_FAVORABILITY_DELTA_TOOL_NAME = "record_favorability_delta"
 _EMPTY_TOOLS_ERROR = "tools 不能为空，无工具场景请使用 generate_reply()"
@@ -69,6 +72,11 @@ _INVALID_FAVORABILITY_DELTA_TYPE_ERROR = (
     "record_favorability_delta.delta 必须是整数且不能是 bool"
 )
 _INVALID_FAVORABILITY_REASON_ERROR = "record_favorability_delta.reason 不能为空"
+_RECALL_ARGUMENTS_JSON_ERROR = "recall_memory 参数不是合法 JSON"
+_RECALL_ARGUMENTS_OBJECT_ERROR = "recall_memory 参数必须是 JSON 对象"
+_RECALL_QUERY_MISSING_ERROR = "recall_memory.query 不能为空"
+_RECALL_QUERY_KEYS_ERROR = "recall_memory 只允许 query 参数"
+_RECALL_QUERY_TYPE_ERROR = "recall_memory.query 必须是字符串"
 _MISSING_TOOL_FUNCTION_ERROR = "工具定义缺少 function"
 _DISALLOWED_TOOL_ERROR = "不允许声明工具"
 _INVALID_TOOL_TYPE_ERROR = "工具类型必须为 function"
@@ -78,16 +86,11 @@ _LLM_COMPLETION_CONCURRENCY_LIMIT = 4
 _LLM_COMPLETION_SEMAPHORE = asyncio.Semaphore(_LLM_COMPLETION_CONCURRENCY_LIMIT)
 
 _MAX_TOOL_RESULT_CHARS = 8_000
-_MAX_READ_PROFILE_TRAITS = 16
-_MAX_READ_PROFILE_RESULT_CHARS = 4_000
-_MAX_READ_PROFILE_RESULT_TOKENS = 2_048
-_READ_PROFILE_PUBLIC_CATEGORIES = frozenset({"preference", "fact", "general"})
-_READ_PROFILE_SENSITIVE_CATEGORIES = frozenset({"relation"})
 _TOOL_SOURCE_TYPES: dict[str, UntrustedSourceType] = {
     READ_IMAGE_TOOL_NAME: "vision",
     SEARCH_WEB_TOOL_NAME: "web",
     FETCH_PAGE_TOOL_NAME: "web",
-    READ_PROFILE_TOOL_NAME: "profile",
+    RECALL_MEMORY_TOOL_NAME: "memory",
 }
 
 READ_IMAGE_TOOL: dict[str, Any] = {
@@ -166,32 +169,23 @@ FETCH_PAGE_TOOL: dict[str, Any] = {
     },
 }
 
-READ_PROFILE_TOOL: dict[str, Any] = {
+RECALL_MEMORY_TOOL: dict[str, Any] = {
     "type": "function",
     "function": {
-        "name": READ_PROFILE_TOOL_NAME,
+        "name": RECALL_MEMORY_TOOL_NAME,
         "description": (
-            "只读查询已有用户画像，不写入、不修改、不推断新增画像。"
-            "当前触发回复用户的画像通常已在 <current_user_profile> 中提供；"
-            "只有需要查询其他用户画像或补查特定缺失字段时再调用。"
+            "按需召回长期记忆。只在需要过去经历、偏好或事实时调用；"
+            "查询使用当前对话中的自然语言，不传记忆库、地址或凭据参数。"
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "user_id": {
+                "query": {
                     "type": "string",
-                    "minLength": 1,
-                    "maxLength": 64,
-                    "description": "要查询画像的用户 ID，优先使用 <visible_users> 中的 user_id。",
-                },
-                "keys": {
-                    "type": "array",
-                    "items": {"type": "string", "maxLength": 64},
-                    "maxItems": 16,
-                    "description": "可选，只返回这些画像键。省略时返回该用户全部可展示画像。",
-                },
+                    "description": "召回查询，使用当前对话中的自然语言。",
+                }
             },
-            "required": ["user_id"],
+            "required": ["query"],
             "additionalProperties": False,
         },
     },
@@ -282,7 +276,7 @@ _CANONICAL_TOOLS = {
     READ_IMAGE_TOOL_NAME: READ_IMAGE_TOOL,
     SEARCH_WEB_TOOL_NAME: SEARCH_WEB_TOOL,
     FETCH_PAGE_TOOL_NAME: FETCH_PAGE_TOOL,
-    READ_PROFILE_TOOL_NAME: READ_PROFILE_TOOL,
+    RECALL_MEMORY_TOOL_NAME: RECALL_MEMORY_TOOL,
     FINAL_RESPONSE_TOOL_NAME: FINAL_RESPONSE_TOOL,
     RECORD_FAVORABILITY_DELTA_TOOL_NAME: RECORD_FAVORABILITY_DELTA_TOOL,
 }
@@ -511,128 +505,48 @@ def _parse_favorability_delta(
     return delta_raw, reason
 
 
-def _parse_read_profile_arguments(
+def _parse_recall_query(
     arguments: dict[str, Any] | None,
     raw_arguments: str,
-) -> tuple[str | None, set[str] | None]:
-    """解析 read_profile 工具参数。"""
+) -> str:
+    """Validate the single model-supplied query without silent truncation."""
     payload = arguments
     if payload is None and raw_arguments:
         try:
             loaded = json.loads(raw_arguments)
-            if isinstance(loaded, dict):
-                payload = loaded
-        except json.JSONDecodeError:
-            return None, None
-
-    if not payload:
-        return None, None
-
-    user_id_raw = payload.get("user_id")
-    user_id = user_id_raw.strip() if isinstance(user_id_raw, str) else ""
-    keys_raw = payload.get("keys")
-    keys: set[str] | None = None
-    if isinstance(keys_raw, list):
-        keys = {
-            item.strip() for item in keys_raw if isinstance(item, str) and item.strip()
-        }
-    return user_id or None, keys
-
-
-def _clean_yaml_text(value: object) -> str:
-    return _escape_prompt_text(str(value).replace("\r", " ").replace("\n", " ").strip())
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ValueError(_RECALL_ARGUMENTS_JSON_ERROR) from exc
+        if not isinstance(loaded, dict):
+            raise TypeError(_RECALL_ARGUMENTS_OBJECT_ERROR)
+        payload = loaded
+    if not isinstance(payload, dict):
+        raise TypeError(_RECALL_ARGUMENTS_OBJECT_ERROR)
+    if "query" not in payload:
+        raise ValueError(_RECALL_QUERY_MISSING_ERROR)
+    if set(payload) != {"query"}:
+        raise ValueError(_RECALL_QUERY_KEYS_ERROR)
+    query_raw = payload["query"]
+    if not isinstance(query_raw, str):
+        raise TypeError(_RECALL_QUERY_TYPE_ERROR)
+    return normalize_required_text(
+        query_raw,
+        label="recall_memory.query",
+        budget=QUERY_TEXT_BUDGET,
+    )
 
 
-def _escape_prompt_text(value: object) -> str:
-    """转义外部文本，避免破坏 prompt 中的标签边界。"""
-    return html.escape(str(value), quote=True)
-
-
-def _format_read_profile_tool_yaml(
+async def _build_recall_tool_result(
     *,
-    user_id: str,
-    profile: dict[str, Any],
-    keys: set[str] | None,
-    include_sensitive_traits: bool,
-) -> str:
-    all_traits = profile_traits_to_list(profile.get("traits"))
-    if keys is not None:
-        all_traits = [item for item in all_traits if str(item.get("key", "")) in keys]
-
-    visible_categories = set(_READ_PROFILE_PUBLIC_CATEGORIES)
-    if include_sensitive_traits:
-        visible_categories.update(_READ_PROFILE_SENSITIVE_CATEGORIES)
-    traits = [
-        item
-        for item in all_traits
-        if str(item.get("category", "general")) in visible_categories
-    ]
-    sensitive_traits_omitted = len(traits) != len(all_traits)
-    traits_truncated = len(traits) > _MAX_READ_PROFILE_TRAITS
-    traits = traits[:_MAX_READ_PROFILE_TRAITS]
-
-    lines = [f"user_id: {user_id}"]
-    name = _clean_yaml_text(
-        profile.get("display_name") or profile.get("name") or user_id
-    )[:128]
-    lines.append(f"name: {name}")
-    if traits:
-        lines.append("traits:")
-        for item in traits:
-            key = _clean_yaml_text(item["key"])[:64]
-            value = _clean_yaml_text(item["value"])
-            value_truncated = len(value) > 512
-            if value_truncated:
-                value = f"{value[:511]}…"
-            candidate_lines = [*lines, f"  - {key}: {value}"]
-            candidate_text = "\n".join(candidate_lines)
-            if (
-                len(candidate_text) > _MAX_READ_PROFILE_RESULT_CHARS - 80
-                or estimate_text_tokens(candidate_text)
-                > _MAX_READ_PROFILE_RESULT_TOKENS
-            ):
-                traits_truncated = True
-                break
-            lines = candidate_lines
-            traits_truncated = traits_truncated or value_truncated
-    else:
-        lines.append("traits: []")
-    if sensitive_traits_omitted:
-        lines.append("sensitive_traits_omitted: true")
-    if traits_truncated:
-        lines.append("traits_truncated: true")
-    return "\n".join(lines)
-
-
-async def _build_read_profile_tool_result(
-    *,
-    memory_service: MemoryService | None,
-    group_id: str | None,
+    recall_session: HindsightRecallSession | None,
     raw_arguments: str,
     parsed_arguments: dict[str, Any] | None,
-    allowed_profile_user_ids: frozenset[str],
-    caller_user_id: str | None,
 ) -> str:
-    """执行 read_profile 工具并返回 YAML 风格只读画像。"""
-    if memory_service is None or group_id is None:
-        return "error: read_profile 当前不可用"
-
-    user_id, keys = _parse_read_profile_arguments(parsed_arguments, raw_arguments)
-    if user_id is None:
-        return "error: user_id 参数缺失或格式错误"
-    if user_id not in allowed_profile_user_ids:
-        return "error: user_id 不在本轮可见用户范围内"
-
-    profile = await memory_service.get_user_profile(user_id=user_id, group_id=group_id)
-    if profile is None:
-        return "not_found: 用户画像不存在"
-
-    return _format_read_profile_tool_yaml(
-        user_id=user_id,
-        profile=profile,
-        keys=keys,
-        include_sensitive_traits=user_id == caller_user_id,
-    )
+    """Execute one recall against the task-owned session and return payload."""
+    if recall_session is None:
+        raise HindsightUnavailableError("configuration_unavailable")
+    query = _parse_recall_query(parsed_arguments, raw_arguments)
+    response = await recall_session.recall(query)
+    return format_recall_payload(response)
 
 
 async def _build_image_tool_result(
@@ -902,7 +816,7 @@ async def generate_reply(
             request_trace_id=request_trace_id,
             image_session=None,
             budget=budget,
-            memory_service=None,
+            recall_session=None,
             group_id=None,
             collector=collector,
             parent_call_id=parent_call_id,
@@ -922,8 +836,6 @@ def _build_tool_request_phase_prefix(tools: Sequence[dict[str, Any]]) -> str:
     }
     if not tool_names:
         return "normal_reply"
-    if tool_names == {READ_PROFILE_TOOL_NAME}:
-        return "profile_tool"
     composable_names = {
         READ_IMAGE_TOOL_NAME,
         SEARCH_WEB_TOOL_NAME,
@@ -965,10 +877,8 @@ async def _execute_business_tool(
     image_session: ImageReadingSessionProtocol | None,
     phase_prefix: str,
     round_num: int,
-    memory_service: MemoryService | None,
+    recall_session: HindsightRecallSession | None,
     group_id: str | None,
-    allowed_profile_user_ids: frozenset[str],
-    caller_user_id: str | None,
     caller_group_id: str | None,
     caller_is_superuser: bool,
     request_trace_id: str | None = None,
@@ -987,8 +897,7 @@ async def _execute_business_tool(
     result_summary: str | None = None
     error_summary: str | None = None
     # ADR-0012 / TSK-225：caller 名单门控从搜索/抓取边界移除后，本函数不再
-    # 使用 caller_group_id / caller_is_superuser（read_profile 仍用
-    # caller_user_id 判定本人画像）；显式消费以免误报未用参数。
+    # 使用 caller_group_id / caller_is_superuser；显式消费以免误报未用参数。
     del caller_group_id, caller_is_superuser
 
     # TSK-225：每个工具 body 前准入裁决（chat.tool_dispatch / tool_search /
@@ -1043,24 +952,13 @@ async def _execute_business_tool(
                 error_summary = "网页抓取失败"
             else:
                 result_summary = f"result_chars={len(content)}"
-        case "read_profile":
-            content = await _build_read_profile_tool_result(
-                memory_service=memory_service,
-                group_id=group_id,
+        case "recall_memory":
+            content = await _build_recall_tool_result(
+                recall_session=recall_session,
                 raw_arguments=raw_arguments,
                 parsed_arguments=parsed_arguments,
-                allowed_profile_user_ids=allowed_profile_user_ids,
-                caller_user_id=caller_user_id,
             )
-            if content.startswith("error:"):
-                status = "error"
-                error_summary = "读取用户画像失败"
-            else:
-                result_summary = (
-                    "profile_found=false"
-                    if content.startswith("not_found:")
-                    else "profile_found=true"
-                )
+            result_summary = f"payload_chars={len(content)}"
         case _:
             logger.warning(
                 "[KomariChat] {} 第 {} 轮：未知工具 '{}'，跳过",
@@ -1105,10 +1003,8 @@ async def _execute_tool_loop(
     request_trace_id: str | None,
     image_session: ImageReadingSessionProtocol | None,
     budget: AgentExecutionBudget,
-    memory_service: MemoryService | None = None,
+    recall_session: HindsightRecallSession | None = None,
     group_id: str | None = None,
-    allowed_profile_user_ids: frozenset[str] = frozenset(),
-    caller_user_id: str | None = None,
     caller_group_id: str | None = None,
     caller_is_superuser: bool = False,
     max_favorability_delta: int = 5,
@@ -1138,7 +1034,7 @@ async def _execute_tool_loop(
         READ_IMAGE_TOOL_NAME,
         SEARCH_WEB_TOOL_NAME,
         FETCH_PAGE_TOOL_NAME,
-        READ_PROFILE_TOOL_NAME,
+        RECALL_MEMORY_TOOL_NAME,
     }
     pending_favorability_delta: int | None = None
     pending_favorability_reason: str | None = None
@@ -1512,18 +1408,39 @@ async def _execute_tool_loop(
                         image_session=image_session,
                         phase_prefix=request_phase_prefix,
                         round_num=round_num,
-                        memory_service=memory_service,
+                        recall_session=recall_session,
                         group_id=group_id,
-                        allowed_profile_user_ids=allowed_profile_user_ids,
-                        caller_user_id=caller_user_id,
                         caller_group_id=caller_group_id,
                         caller_is_superuser=caller_is_superuser,
                         request_trace_id=request_trace_id,
                         parent_call_id=round_call_id,
                     )
+                except HindsightUnavailableError as exc:
+                    # A memory-service failure stops the reply; it never becomes
+                    # a model-correctable tool error followed by another round.
+                    if collector is not None:
+                        collector.add_tool(
+                            ToolExecutionTrace(
+                                call_id=round_call_id or "",
+                                tool_name=tool_name,
+                                parsed_arguments={},
+                                status="error",
+                                error=exc.reason_code,
+                                duration_ms=(time.monotonic() - tool_started_at) * 1000,
+                                error_summary=exc.reason_code,
+                            )
+                        )
+                    raise
                 except Exception as exc:  # 向模型回写后继续会话
+                    error_detail: str | BaseException = type(exc).__name__
+                    if tool_name == RECALL_MEMORY_TOOL_NAME and isinstance(
+                        exc, (ValueError, TypeError)
+                    ):
+                        # Argument validation is model-correctable: keep the
+                        # safe descriptive reason, never the raw argument body.
+                        error_detail = str(exc)
                     tool_error_results.append(
-                        _build_tool_error_result(tool_call, type(exc).__name__)
+                        _build_tool_error_result(tool_call, error_detail)
                     )
                     last_retry_reason = (
                         f"{request_phase_prefix} 第 {round_num} 轮："
@@ -1534,7 +1451,11 @@ async def _execute_tool_loop(
                             ToolExecutionTrace(
                                 call_id=round_call_id or "",
                                 tool_name=tool_name,
-                                parsed_arguments=_build_tool_log_args(tool_call),
+                                parsed_arguments=(
+                                    {}
+                                    if tool_name == RECALL_MEMORY_TOOL_NAME
+                                    else _build_tool_log_args(tool_call)
+                                ),
                                 status="error",
                                 error=str(exc),
                                 duration_ms=(time.monotonic() - tool_started_at) * 1000,
@@ -1632,10 +1553,8 @@ async def generate_reply_with_tools(
     tools: Sequence[dict[str, Any]],
     request_trace_id: str | None = None,
     image_session: ImageReadingSessionProtocol | None = None,
-    memory_service: MemoryService | None = None,
+    recall_session: HindsightRecallSession | None = None,
     group_id: str | None = None,
-    allowed_profile_user_ids: frozenset[str] = frozenset(),
-    caller_user_id: str | None = None,
     caller_group_id: str | None = None,
     caller_is_superuser: bool = False,
     max_favorability_delta: int = 5,
@@ -1697,10 +1616,8 @@ async def generate_reply_with_tools(
         request_trace_id=request_trace_id,
         image_session=image_session,
         budget=budget,
-        memory_service=memory_service,
+        recall_session=recall_session,
         group_id=group_id,
-        allowed_profile_user_ids=allowed_profile_user_ids,
-        caller_user_id=caller_user_id,
         caller_group_id=caller_group_id,
         caller_is_superuser=caller_is_superuser,
         max_favorability_delta=max_favorability_delta,

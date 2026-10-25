@@ -26,6 +26,7 @@ from komari_bot.decision.jev import (  # noqa: TC001 - 消费方注解的契约�
     DecisionRequest,
     DecisionResult,
 )
+from komari_bot.llm.content_budget import QUERY_TEXT_BUDGET, normalize_required_text
 from komari_bot.onebot import (
     GroupTaskFailureNotification,
     GroupTaskFailureNotifier,
@@ -57,7 +58,7 @@ from ..services.image_understanding import ImageUnderstandingPolicy
 from ..services.llm_service import (
     FETCH_PAGE_TOOL,
     READ_IMAGE_TOOL,
-    READ_PROFILE_TOOL,
+    RECALL_MEMORY_TOOL,
     RECORD_FAVORABILITY_DELTA_TOOL,
     SEARCH_WEB_TOOL,
     InteractionHistoryRecord,
@@ -91,7 +92,10 @@ if TYPE_CHECKING:
     from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
 
     from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
-    from komari_bot.plugins.komari_memory import MemoryService
+    from komari_bot.plugins.komari_memory import (
+        HindsightMemoryService,
+        HindsightRecallSession,
+    )
 
     from ..services.proactive_reservation import (
         ProactiveLease,
@@ -164,6 +168,7 @@ class PendingReply:
 
 
 GROUP_ERROR_TEXT = "啊、啊呜……对不起，脑袋里刚才突然乱成一团了……"
+_MEDIA_ONLY_RECALL_QUERY = "当前交流"
 
 
 @dataclass(frozen=True)
@@ -252,14 +257,14 @@ class MessageHandler:
     def __init__(
         self,
         redis: RecentContextStore,
-        memory: MemoryService,
+        hindsight_memory: HindsightMemoryService,
         reply_fulfillment: ReplyFulfillmentQueryProtocol,
         proactive_reservation: ProactiveReservationService,
         decision_engine: DecisionEngineProtocol,
     ) -> None:
         """初始化消息处理器。"""
         self.redis = redis
-        self.memory = memory
+        self.hindsight_memory = hindsight_memory
         self.reply_fulfillment = reply_fulfillment
         self.query_rewrite = QueryRewriteService()
         self._reaction_tasks: set[asyncio.Task[None]] = set()
@@ -1054,7 +1059,55 @@ class MessageHandler:
         caller_is_superuser: bool = False,
         collector: LLMDiagnosticCollector | None = None,
     ) -> ReplyResult:
-        """纯读取/生成核心：查询重写、记忆/画像/好感度读取、prompt 构建、LLM 回复生成。
+        """Open the task memory session, then run the pure read/generate core.
+
+        Current-group admission runs immediately before opening the session.
+        The same session is handed to automatic and model-tool recalls.
+        """
+        if not effect_business_admitted(group_id=message.group_id):
+            return ReplyResult(
+                content="",
+                interaction_history={"event": "", "result": "", "emotion": ""},
+            )
+        try:
+            async with self.hindsight_memory.open_session() as recall_session:
+                return await self._generate_reply_with_session(
+                    message=message,
+                    recent_messages=recent_messages,
+                    interaction_records=interaction_records,
+                    image_urls=image_urls,
+                    reply_context=reply_context,
+                    reply_context_requested=reply_context_requested,
+                    reply_context_refetched=reply_context_refetched,
+                    request_trace_id=request_trace_id,
+                    caller_is_superuser=caller_is_superuser,
+                    collector=collector,
+                    recall_session=recall_session,
+                )
+        except Exception:
+            # TSK-196：委托核心的敏感图片 locals 已由其单点安全抛出点清空；
+            # 本包装帧同样重绑参数与 collector，保持既有 traceback 投影边界。
+            image_urls = None
+            reply_context = None
+            collector = None
+            raise
+
+    async def _generate_reply_with_session(
+        self,
+        *,
+        message: MessageSchema,
+        recent_messages: list[MessageSchema],
+        interaction_records: list[dict[str, object]],
+        image_urls: list[str] | None,
+        reply_context: ReplyContext | None,
+        reply_context_requested: bool,
+        reply_context_refetched: bool,
+        request_trace_id: str,
+        recall_session: HindsightRecallSession,
+        caller_is_superuser: bool = False,
+        collector: LLMDiagnosticCollector | None = None,
+    ) -> ReplyResult:
+        """纯读取/生成核心：查询重写、记忆召回、prompt 构建、LLM 回复生成。
 
         不执行任何副作用：不写 Redis、不调好感度、不写互动历史、不设冷却。
         """
@@ -1078,53 +1131,21 @@ class MessageHandler:
             collector=collector,
         )
 
-        try:
-            from komari_bot.plugins import embedding_provider
+        # TSK-225 / TSK-193：召回实际外呼前按当前群重新裁决。准入拒绝走
+        # 既有安静空 ReplyResult 控制路径，不调用 SDK/provider，也不记录记忆故障。
+        if not effect_business_admitted(group_id=message.group_id):
+            return ReplyResult(
+                content="",
+                interaction_history={"event": "", "result": "", "emotion": ""},
+            )
 
-            if not effect_business_admitted(group_id=message.group_id):
-                # TSK-225：chat.embedding——查询向量化（Embedding 子效果）前
-                # 按该群裁决；受限时不发起 embed 外呼，静默降级为无向量。
-                query_embedding = None
-            else:
-                query_embedding = await embedding_provider.embed(rewritten_query)
-        except Exception as e:
-            logger.warning("[KomariMemory] 预生成查询特征向量失败: {}", e)
-            query_embedding = None
-
-        memories = await self.memory.search_conversations(
-            query=rewritten_query,
-            group_id=message.group_id,
-            user_id=message.user_id,
-            limit=config.memory_search_limit,
-            query_embedding=query_embedding,
+        recall_query_source = rewritten_query.strip() or _MEDIA_ONLY_RECALL_QUERY
+        recall_query = normalize_required_text(
+            recall_query_source,
+            label="召回查询",
+            budget=QUERY_TEXT_BUDGET,
         )
-        try:
-            interaction_memories = await self.memory.search_interaction_events(
-                user_id=message.user_id,
-                query=rewritten_query,
-                limit=config.memory_search_limit,
-                query_embedding=query_embedding,
-            )
-        except Exception:
-            logger.debug(
-                "[KomariChat] 长期互动事件记忆检索失败，跳过注入: user={}",
-                message.user_id,
-                exc_info=True,
-            )
-            interaction_memories = []
-
-        try:
-            current_user_profile = await self.memory.get_user_profile(
-                user_id=message.user_id,
-                group_id=message.group_id,
-            )
-        except Exception:
-            logger.debug(
-                "[KomariChat] 当前用户画像读取失败，跳过注入: user={}",
-                message.user_id,
-                exc_info=True,
-            )
-            current_user_profile = None
+        recall_response = await recall_session.recall(recall_query)
 
         reply_sources = list(reply_context.image_sources) if reply_context else []
         current_sources = image_urls or []
@@ -1215,20 +1236,6 @@ class MessageHandler:
         if _image_failure_summary is None:
             use_search_tool = bool(komari_search_plugin.is_search_available())
             use_fetch_tool = bool(komari_search_plugin.is_fetch_available())
-            allowed_profile_user_ids = {message.user_id}
-            allowed_profile_user_ids.update(
-                item.user_id
-                for item in recent_messages
-                if not item.is_bot
-                and item.group_id == message.group_id
-                and item.user_id
-            )
-            if (
-                reply_context is not None
-                and reply_context.source_side == "user"
-                and reply_context.user_id
-            ):
-                allowed_profile_user_ids.add(reply_context.user_id)
 
             if reply_context_requested:
                 logger.info(
@@ -1272,7 +1279,7 @@ class MessageHandler:
                     current_viewable,
                     len(message.content),
                     base64_chars,
-                    len(memories),
+                    len(recall_response.results or []),
                     image_policy.mode,
                     use_vision_tool,
                 )
@@ -1288,21 +1295,17 @@ class MessageHandler:
             prompt_messages = await build_prompt(
                 user_message=message.content,
                 search_query=rewritten_query,
-                memories=memories,
+                recall_response=recall_response,
                 config=config,
                 recent_messages=recent_messages,
                 current_user_id=message.user_id,
                 current_user_nickname=message.user_nickname,
-                memory_service=self.memory,
                 group_id=message.group_id,
                 image_urls=base64_image_urls if image_session is None else None,
                 reply_context=reply_context,
                 reply_image_urls=reply_image_urls if image_session is None else None,
-                query_embedding=query_embedding,
                 favorability=favorability,
-                current_user_profile=current_user_profile,
                 interaction_records=interaction_records,
-                interaction_memories=interaction_memories,
                 delegated_image_mode=use_vision_tool,
                 delegated_quoted_image_count=(
                     image_session.quoted_count if image_session is not None else None
@@ -1315,7 +1318,7 @@ class MessageHandler:
             )
 
             tools: list[dict[str, Any]] = [
-                READ_PROFILE_TOOL,
+                RECALL_MEMORY_TOOL,
                 RECORD_FAVORABILITY_DELTA_TOOL,
             ]
             if use_vision_tool:
@@ -1335,10 +1338,8 @@ class MessageHandler:
                         tools=tools,
                         request_trace_id=request_trace_id,
                         image_session=image_session if use_vision_tool else None,
-                        memory_service=self.memory,
+                        recall_session=recall_session,
                         group_id=message.group_id,
-                        allowed_profile_user_ids=frozenset(allowed_profile_user_ids),
-                        caller_user_id=message.user_id,
                         caller_group_id=message.group_id,
                         caller_is_superuser=caller_is_superuser,
                         max_favorability_delta=user_data_plugin.get_config().max_favorability_delta_per_reply,

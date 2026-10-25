@@ -25,7 +25,11 @@ CONTEXT_INIT = (
 )
 
 #: komari_chat 消费、且必须由 komari_memory 顶层暴露面提供的符号。
-REQUIRED_MEMORY_SYMBOLS = ("MemoryService",)
+REQUIRED_MEMORY_SYMBOLS = (
+    "HindsightMemoryService",
+    "HindsightRecallSession",
+    "HindsightUnavailableError",
+)
 REQUIRED_CONTEXT_SYMBOLS = (
     "KomariContextConfigSchema",
     "MessageSchema",
@@ -94,7 +98,18 @@ def test_komari_memory_top_level_all_exposes_only_required_symbols() -> None:
 
     missing = [name for name in REQUIRED_MEMORY_SYMBOLS if name not in all_names]
     assert missing == [], f"komari_memory 顶层 __all__ 缺少符号: {missing}"
-    assert not {"MessageSchema", "RedisManager", "retry_async"} & all_names
+    assert (
+        not {
+            "MessageSchema",
+            "RedisManager",
+            "retry_async",
+            "MemoryService",
+            "get_memory_service",
+            "get_plugin_manager",
+            "get_redis_manager",
+        }
+        & all_names
+    )
 
 
 def test_komari_context_top_level_all_exposes_shared_owner_symbols() -> None:

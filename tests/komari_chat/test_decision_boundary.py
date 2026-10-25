@@ -81,6 +81,9 @@ def chat_entry_module(app: App, monkeypatch: pytest.MonkeyPatch) -> Any:
             )
         ]
         decision_package.get_decision_engine = lambda: None  # type: ignore[attr-defined]
+        decision_package.get_decision_dispatch = (  # type: ignore[attr-defined]
+            lambda *_args, **_kwargs: None
+        )
         sys.modules[decision_package_name] = decision_package
 
     module_name = "komari_bot.plugins.komari_chat._boundary_entry_under_test"
@@ -107,7 +110,7 @@ def test_handler_is_none_when_engine_unavailable(
     monkeypatch.setattr(
         chat_entry_module,
         "memory_plugin",
-        SimpleNamespace(get_memory_service=lambda: object()),
+        SimpleNamespace(get_hindsight_memory=lambda: object()),
     )
     monkeypatch.setattr(chat_entry_module, "get_decision_engine", lambda: None)
     monkeypatch.setattr(chat_entry_module, "_handler", None)
@@ -127,12 +130,12 @@ def test_handler_built_with_engine_and_rebuilt_on_identity_change(
             self,
             *,
             redis: object,
-            memory: object,
+            hindsight_memory: object,
             decision_engine: object,
             **_kwargs: object,
         ) -> None:
             self.redis = redis
-            self.memory = memory
+            self.hindsight_memory = hindsight_memory
             self.decision_engine = decision_engine
             built_engines.append(decision_engine)
 
@@ -146,7 +149,7 @@ def test_handler_built_with_engine_and_rebuilt_on_identity_change(
     monkeypatch.setattr(
         chat_entry_module,
         "memory_plugin",
-        SimpleNamespace(get_memory_service=lambda: memory_service),
+        SimpleNamespace(get_hindsight_memory=lambda: memory_service),
     )
     monkeypatch.setattr(
         chat_entry_module,

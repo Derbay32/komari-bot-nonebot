@@ -29,15 +29,11 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-import sys
-import types
 from importlib import import_module
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
-
-import komari_bot.plugins as plugins_package
 
 image_understanding_module = import_module(
     "komari_bot.plugins.komari_chat.services.image_understanding"
@@ -79,6 +75,8 @@ _CHAT_BUDGET_FIELDS: dict[str, object] = {
 
 # ── 基础替身 ────────────────────────────────────────────────────────────
 
+from tests.komari_chat.hindsight_recall_support import FakeHindsightMemory
+
 
 class _FakeRedis:
     async def get_buffer(self, _group_id: str, limit: int = 100) -> list[object]:
@@ -95,30 +93,9 @@ class _FakeRedis:
         return []
 
 
-class _FakeMemory:
-    async def search_conversations(self, **_kwargs: object) -> list[dict[str, object]]:
-        return []
-
-    async def search_interaction_events(
-        self, **_kwargs: object
-    ) -> list[dict[str, object]]:
-        return []
-
-    async def get_user_profile(
-        self, *, user_id: str, group_id: str
-    ) -> dict[str, object]:
-        del user_id, group_id
-        return {"display_name": "测试用户", "traits": {}}
-
-
 class _FakeQueryRewrite:
     async def rewrite_query(self, current_query: str, **_kwargs: object) -> str:
         return current_query
-
-
-class _FakeEmbeddingProvider:
-    async def embed(self, _text: str) -> list[float]:
-        return [0.1, 0.2]
 
 
 class _FakeUserData:
@@ -197,7 +174,7 @@ def _wire_generate_core(
         message_handler_module.MessageHandler
     )
     handler.redis = _FakeRedis()
-    handler.memory = _FakeMemory()
+    handler.hindsight_memory = FakeHindsightMemory()
     handler.query_rewrite = _FakeQueryRewrite()
 
     monkeypatch.setattr(message_handler_module, "get_config", lambda: config)
@@ -262,14 +239,6 @@ def _wire_generate_core(
         _download_images,
     )
 
-    embedding_package_name = "komari_bot.plugins.embedding_provider"
-    embedding_fake = types.ModuleType(embedding_package_name)
-    embedding_fake.embed = _FakeEmbeddingProvider().embed  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, embedding_package_name, embedding_fake)
-    monkeypatch.setattr(
-        plugins_package, "embedding_provider", embedding_fake, raising=False
-    )
-
     async def _run() -> Any:
         return await handler._generate_reply_core(
             message=_make_message(),
@@ -324,9 +293,7 @@ def test_policy_from_config_native_mode_requires_all_budget_fields() -> None:
     assert policy.is_delegated is False
     assert policy.download.max_images == 4
     assert policy.download.max_total_bytes == 20 * 1024 * 1024
-    assert (
-        policy.download.total_timeout_seconds == 45.0
-    )
+    assert policy.download.total_timeout_seconds == 45.0
 
 
 def test_policy_from_config_any_missing_budget_field_fails_fast() -> None:
@@ -354,7 +321,9 @@ def test_policy_from_config_any_missing_budget_field_fails_fast() -> None:
 
 def test_download_policy_from_config_rejects_invalid_budget_types() -> None:
     """预算字段类型非法（含 bool）同样明确失败（TypeError）。"""
-    config = SimpleNamespace(image_understanding_mode="delegated", **_CHAT_BUDGET_FIELDS)
+    config = SimpleNamespace(
+        image_understanding_mode="delegated", **_CHAT_BUDGET_FIELDS
+    )
     config.vision_image_download_max_count = True  # type: ignore[assignment]
     with pytest.raises(TypeError, match="vision_image_download_max_count"):
         ImageUnderstandingPolicy.from_config(config)
@@ -363,9 +332,7 @@ def test_download_policy_from_config_rejects_invalid_budget_types() -> None:
         image_understanding_mode="delegated", **_CHAT_BUDGET_FIELDS
     )
     float_config.vision_image_download_total_timeout_seconds = "慢"  # type: ignore[assignment]
-    with pytest.raises(
-        TypeError, match="vision_image_download_total_timeout_seconds"
-    ):
+    with pytest.raises(TypeError, match="vision_image_download_total_timeout_seconds"):
         ImageUnderstandingPolicy.from_config(float_config)
 
 
@@ -389,7 +356,9 @@ def test_policy_from_config_invalid_mode_fails_fast() -> None:
 
 def test_policy_frozen_and_reproducible() -> None:
     """冻结值对象不可变；同配置两次读取结果相等且互不共享。"""
-    config = SimpleNamespace(image_understanding_mode="delegated", **_CHAT_BUDGET_FIELDS)
+    config = SimpleNamespace(
+        image_understanding_mode="delegated", **_CHAT_BUDGET_FIELDS
+    )
     first = ImageUnderstandingPolicy.from_config(config)
     second = ImageUnderstandingPolicy.from_config(config)
     assert first == second
@@ -409,10 +378,12 @@ def test_native_mode_embeds_images_and_hides_read_image_tool(
         image_understanding_mode="native",
         vision_image_download_max_count=4,
     )
-    handler, generate_kwargs, download_batches, build_prompt_kwargs = _wire_generate_core(
-        monkeypatch,
-        config,
-        image_urls=["https://example.com/a.png", "https://example.com/b.png"],
+    handler, generate_kwargs, download_batches, build_prompt_kwargs = (
+        _wire_generate_core(
+            monkeypatch,
+            config,
+            image_urls=["https://example.com/a.png", "https://example.com/b.png"],
+        )
     )
     del handler
 
@@ -445,10 +416,12 @@ def test_delegated_mode_zero_predownload_and_exposes_read_image_tool(
     URL/base64 列表；download 层零触达。
     """
     config = _chat_config_stub(image_understanding_mode="delegated")
-    handler, generate_kwargs, download_batches, build_prompt_kwargs = _wire_generate_core(
-        monkeypatch,
-        config,
-        image_urls=["https://example.com/a.png", "https://example.com/b.png"],
+    handler, generate_kwargs, download_batches, build_prompt_kwargs = (
+        _wire_generate_core(
+            monkeypatch,
+            config,
+            image_urls=["https://example.com/a.png", "https://example.com/b.png"],
+        )
     )
     del handler
 
@@ -493,7 +466,7 @@ def test_delegated_mode_quoted_images_first_stable_indexes(
         message_handler_module.MessageHandler
     )
     handler.redis = _FakeRedis()
-    handler.memory = _FakeMemory()
+    handler.hindsight_memory = FakeHindsightMemory()
     handler.query_rewrite = _FakeQueryRewrite()
     monkeypatch.setattr(message_handler_module, "get_config", lambda: config)
     monkeypatch.setattr(message_handler_module, "get_context_config", lambda: config)
@@ -532,14 +505,6 @@ def test_delegated_mode_quoted_images_first_stable_indexes(
     monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
     monkeypatch.setattr(
         message_handler_module, "generate_reply_with_tools", _fake_generate_with_tools
-    )
-
-    embedding_package_name = "komari_bot.plugins.embedding_provider"
-    embedding_fake = types.ModuleType(embedding_package_name)
-    embedding_fake.embed = _FakeEmbeddingProvider().embed  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, embedding_package_name, embedding_fake)
-    monkeypatch.setattr(
-        plugins_package, "embedding_provider", embedding_fake, raising=False
     )
 
     async def _run() -> Any:
@@ -613,7 +578,7 @@ def test_native_mode_chat_provider_image_failure_fails_explicitly(
         message_handler_module.MessageHandler
     )
     handler.redis = _FakeRedis()
-    handler.memory = _FakeMemory()
+    handler.hindsight_memory = FakeHindsightMemory()
     handler.query_rewrite = _FakeQueryRewrite()
 
     monkeypatch.setattr(message_handler_module, "get_config", lambda: config)
@@ -668,7 +633,9 @@ def test_native_mode_chat_provider_image_failure_fails_explicitly(
     ) -> list[str | None]:
         return [f"base64:{url}" for url in urls]
 
-    monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt_multimodal)
+    monkeypatch.setattr(
+        message_handler_module, "build_prompt", _fake_build_prompt_multimodal
+    )
     monkeypatch.setattr(
         message_handler_module,
         "generate_reply_with_tools",
@@ -681,14 +648,6 @@ def test_native_mode_chat_provider_image_failure_fails_explicitly(
     )
     monkeypatch.setattr(
         image_reading_session_module, "read_images", _recording_read_images
-    )
-
-    embedding_package_name = "komari_bot.plugins.embedding_provider"
-    embedding_fake = types.ModuleType(embedding_package_name)
-    embedding_fake.embed = _FakeEmbeddingProvider().embed  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, embedding_package_name, embedding_fake)
-    monkeypatch.setattr(
-        plugins_package, "embedding_provider", embedding_fake, raising=False
     )
 
     async def _run() -> Any:
@@ -755,7 +714,7 @@ def test_generate_core_freezes_image_policy_snapshot_across_tasks(
         message_handler_module.MessageHandler
     )
     handler.redis = _FakeRedis()
-    handler.memory = _FakeMemory()
+    handler.hindsight_memory = FakeHindsightMemory()
     handler.query_rewrite = _FakeQueryRewrite()
 
     get_config_calls: list[object] = []
@@ -769,9 +728,7 @@ def test_generate_core_freezes_image_policy_snapshot_across_tasks(
         get_config_calls.append(config)
         return config
 
-    original_budget_from_config = (
-        agent_budget_module.AgentExecutionBudget.from_config
-    )
+    original_budget_from_config = agent_budget_module.AgentExecutionBudget.from_config
     original_policy_from_config = (
         image_downloader_module.ImageDownloadPolicy.from_config
     )

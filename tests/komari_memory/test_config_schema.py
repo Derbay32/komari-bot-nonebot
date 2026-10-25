@@ -225,3 +225,57 @@ def test_memory_config_resource_is_optional_at_startup() -> None:
     assert KomariMemoryConfigSchema.startup_required is False
     assert "startup_required" not in KomariMemoryConfigSchema.model_fields
     assert "startup_required" not in KomariMemoryConfigSchema().model_dump()
+
+
+def test_hindsight_config_defaults_and_secret_metadata() -> None:
+    """TSK-193：Hindsight 连接字段默认空、超时/恢复间隔有显式默认值。"""
+    import pytest
+
+    config = KomariMemoryConfigSchema()
+
+    assert config.hindsight_base_url == ""
+    assert config.hindsight_api_key == ""
+    assert config.hindsight_bank_id == ""
+    assert config.hindsight_request_timeout_seconds == 10.0
+    assert config.hindsight_recovery_interval_seconds == 30.0
+
+    api_key_extra = KomariMemoryConfigSchema.model_fields[
+        "hindsight_api_key"
+    ].json_schema_extra
+    assert isinstance(api_key_extra, dict)
+    assert api_key_extra["secret"] is True
+
+    for field_name in (
+        "hindsight_base_url",
+        "hindsight_api_key",
+        "hindsight_bank_id",
+        "hindsight_request_timeout_seconds",
+        "hindsight_recovery_interval_seconds",
+    ):
+        field_extra = KomariMemoryConfigSchema.model_fields[
+            field_name
+        ].json_schema_extra
+        assert isinstance(field_extra, dict)
+        assert field_extra["apply_mode"] == "immediate"
+
+    with pytest.raises(ValueError):
+        KomariMemoryConfigSchema(hindsight_request_timeout_seconds=0.0)
+    with pytest.raises(ValueError):
+        KomariMemoryConfigSchema(hindsight_request_timeout_seconds=120.1)
+    with pytest.raises(ValueError):
+        KomariMemoryConfigSchema(hindsight_recovery_interval_seconds=0.0)
+    with pytest.raises(ValueError):
+        KomariMemoryConfigSchema(hindsight_recovery_interval_seconds=3600.1)
+
+
+def test_hindsight_config_has_no_legacy_connection_aliases() -> None:
+    """TSK-193：新字段不兼容旧连接字段，不提供别名或默认回退。"""
+    fields = KomariMemoryConfigSchema.model_fields
+
+    assert not {
+        "hindsight_url",
+        "hindsight_token",
+        "hindsight_target_bank",
+        "hindsight_timeout",
+        "hindsight_retry_interval",
+    } & set(fields)

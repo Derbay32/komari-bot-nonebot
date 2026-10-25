@@ -619,16 +619,16 @@ ADMISSION_EFFECT_CASES += (
 
 ADMISSION_EFFECT_CASES += (
     AdmissionEffectCase(
-        effect_id="group_admission.effect.chat.embedding",
+        effect_id="group_admission.effect.chat.recall",
         owner_module="komari_bot.plugins.komari_chat",
-        source_symbol="embedding_provider",
-        sink_kind="embedding_https",
+        source_symbol="MessageHandler._generate_reply_core",
+        sink_kind="hindsight_recall_http",
         intent="business",
         attribution_source="komari_chat_message_group_id",
         work_category="transient_interaction",
         acceptance_anchor=(
             "tests/group_admission/test_chat_seam_admission.py"
-            "::test_embedding_restricted_blocks_query_embedding"
+            "::test_recall_restricted_blocks_recall"
         ),
     ),
     AdmissionEffectCase(

@@ -9,7 +9,7 @@
 数据不受影响。用例之间各自重建唯一的隔离库，重复运行与并行安全。
 
 覆盖清单（对应 TSK-182 可选资源切片）：
-- 全新数据库 upgrade head（0027）后运行真实播种命令：三个必需 Prompt
+- 全新数据库 upgrade head（0028）后运行真实播种命令：三个必需 Prompt
   资源齐全，另加可选判定 Prompt 单行（值等于打包资产）；场景初始化已
   退役，4 张退役场景表不得存在；
 - 重复初始化：判定 Prompt 正文/revision/updated_at 不变；
@@ -73,8 +73,8 @@ SENTINEL = "TSK182-DECISION-BODY-SENTINEL-91a4"
 #: 合成“连接归还失败”异常里的哨兵：失败路径不得将它回显给用户。
 RELEASE_SENTINEL = "TSK182-RELEASE-SENTINEL-4c1d"
 
-#: 当前迁移 head（TSK-192 phase B 新增 chat/context 配置所有权后为 0027）。
-TSK182_HEAD_REVISION = "0027"
+#: 当前迁移 head（TSK-193 新增 Hindsight 连接配置后为 0028）。
+TSK182_HEAD_REVISION = "0028"
 
 #: 已退役的 4 张场景表（test-owned 字面量，来自 TSK-190 manifest）。
 RETIRED_SCENE_TABLES: tuple[str, ...] = (
@@ -210,13 +210,9 @@ DECISION_TABLE = _decision_table_name()
 
 def _decision_asset_values() -> dict[str, str]:
     """打包可选资产中的判定正文（契约固定形状的显式 ``decision_prompt`` 键）。"""
-    raw = yaml.safe_load(
-        DEFAULT_DECISION_SEED_FILE.read_text(encoding="utf-8")
-    ) or {}
+    raw = yaml.safe_load(DEFAULT_DECISION_SEED_FILE.read_text(encoding="utf-8")) or {}
     section = raw.get("decision_prompt")
-    assert isinstance(section, dict), (
-        "判定初始数据必须包含 decision_prompt 对象块"
-    )
+    assert isinstance(section, dict), "判定初始数据必须包含 decision_prompt 对象块"
     return {str(field): str(value) for field, value in section.items()}
 
 
@@ -278,9 +274,7 @@ async def _prepare_head_scratch(
 async def _fetch_decision_row(
     connection: asyncpg.Connection,
 ) -> dict[str, Any] | None:
-    row = await connection.fetchrow(
-        f"SELECT * FROM {DECISION_TABLE} WHERE id = 1"
-    )
+    row = await connection.fetchrow(f"SELECT * FROM {DECISION_TABLE} WHERE id = 1")
     return None if row is None else dict(row)
 
 
@@ -462,9 +456,7 @@ async def test_initialization_preserves_custom_field_and_fills_blank_only() -> N
 
             row = await _fetch_decision_row(connection)
             assert row is not None
-            assert row[custom_field] == custom_text, (
-                "种子绝不覆盖非空自定义判定字段"
-            )
+            assert row[custom_field] == custom_text, "种子绝不覆盖非空自定义判定字段"
             asset = _decision_asset_values()
             for field in [blank_field, *empty_fields]:
                 assert row[field] == asset[field], (
@@ -617,9 +609,7 @@ async def test_optional_write_failure_rolls_back_only_optional_work(
             assert output.count(OPTIONAL_UNAVAILABLE_MESSAGE) == 1, output
             assert SENTINEL not in output, "可选失败诊断不得回显判定正文"
             assert "Traceback" not in output, output
-            assert blanked_field not in output, (
-                "可选失败诊断不得回显字段级校验细节"
-            )
+            assert blanked_field not in output, "可选失败诊断不得回显字段级校验细节"
 
             await _assert_required_prompt_rows_complete(connection)
             await _assert_retired_tables_absent(connection)

@@ -10,13 +10,11 @@ from __future__ import annotations
 import asyncio
 import importlib
 import sys
-import types
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 
-import komari_bot.plugins as plugins_package
 from tests.group_admission.chat_admission_support import (
     ScriptedAdjudicate,
     install_scripted_adjudicate,
@@ -139,10 +137,8 @@ async def test_fetch_page_restricted_blocks_fetch(
         image_session=None,
         phase_prefix="p",
         round_num=1,
-        memory_service=None,
+        recall_session=None,
         group_id=str(GROUP_ID),
-        allowed_profile_user_ids=frozenset(),
-        caller_user_id=None,
         caller_group_id=None,
         caller_is_superuser=False,
         request_trace_id="t",
@@ -355,51 +351,51 @@ async def test_concurrent_sibling_admitted_completes_restricted_not_started(
 
 
 # ---------------------------------------------------------------------------
-# 强制补充项：embedding（chat.embedding）真实行为断言
+# 强制补充项：recall（chat.recall）真实行为断言
 # ---------------------------------------------------------------------------
 
 
-async def test_embedding_restricted_blocks_query_embedding(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """chat.embedding：查询向量化前按群裁决，受限时不发起 embed 外呼。
-
-    驱动「效果所在的最近生产函数」``MessageHandler._generate_reply_core``：
-    embedding 子效果位于其中对 ``embedding_provider.embed`` 的调用点。
-    """
-    s = ScriptedAdjudicate("restricted")
-    install_scripted_adjudicate(monkeypatch, s)
-
-    embed_calls: list[str] = []
-
-    class _EmbedSpy:
-        async def embed(self, text: str) -> list[float]:
-            embed_calls.append(text)
-            return [0.1]
-
-    class _Mem:
-        async def search_conversations(self, **_kw: object) -> list[object]:
-            return []
-
-        async def search_interaction_events(self, **_kw: object) -> list[object]:
-            return []
-
-        async def get_user_profile(self, **_kw: object) -> None:
-            return None
-
-    class _Rewrite:
-        async def rewrite_query(self, current_query: str, **_kw: object) -> str:
-            del _kw
-            return current_query
-
-    async def _async_favorability(_user_id: str) -> object:
-        del _user_id
-        return SimpleNamespace(favorability=0)
-
+def _recall_handler(memory: Any) -> Any:
     handler = mh.MessageHandler.__new__(mh.MessageHandler)
-    handler.memory = _Mem()
-    handler.query_rewrite = _Rewrite()
+    handler.hindsight_memory = memory
+    handler.redis = SimpleNamespace()
+    handler.query_rewrite = SimpleNamespace(
+        rewrite_query=lambda current_query, **_kw: _return_value(current_query)
+    )
+    return handler
 
+
+async def _return_value(value: Any) -> Any:
+    return value
+
+
+async def _run_recall_core(handler: Any) -> Any:
+    message = mh.MessageSchema(
+        user_id="u1",
+        user_nickname="昵称",
+        group_id=str(GROUP_ID),
+        content="你好",
+        timestamp=1.0,
+        message_id="m1",
+    )
+    return await handler._generate_reply_core(
+        message=message,
+        recent_messages=[],
+        interaction_records=[],
+        image_urls=None,
+        reply_context=None,
+        reply_context_requested=False,
+        reply_context_refetched=False,
+        request_trace_id="t",
+    )
+
+
+def _patch_recall_core(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    prompt_calls: list[dict[str, Any]] | None = None,
+    generate_calls: list[dict[str, Any]] | None = None,
+) -> None:
     conf = SimpleNamespace(
         memory_search_limit=3,
         image_understanding_mode="native",
@@ -422,12 +418,6 @@ async def test_embedding_restricted_blocks_query_embedding(
     )
     monkeypatch.setattr(mh, "get_config", lambda: conf)
     monkeypatch.setattr(mh, "get_context_config", lambda: conf)
-
-    async def _build_prompt(**_kw: object) -> list[object]:
-        del _kw
-        return []
-
-    monkeypatch.setattr(mh, "build_prompt", _build_prompt)
     monkeypatch.setattr(
         mh,
         "komari_search_plugin",
@@ -436,49 +426,116 @@ async def test_embedding_restricted_blocks_query_embedding(
             is_fetch_available=lambda **_kw: False,
         ),
     )
-
-    async def _gen(**_kw: object) -> object:
-        del _kw
-        return llm.ReplyResult(
-            content="ok",
-            interaction_history={"event": "e", "result": "r", "emotion": "m"},
-        )
-
-    monkeypatch.setattr(mh, "generate_reply_with_tools", _gen)
-    monkeypatch.setattr(mh, "generate_reply", _gen)
-    emb = types.ModuleType("komari_bot.plugins.embedding_provider")
-    emb.embed = _EmbedSpy().embed  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "komari_bot.plugins.embedding_provider", emb)
-    monkeypatch.setattr(plugins_package, "embedding_provider", emb, raising=False)
     monkeypatch.setattr(
         mh,
         "user_data_plugin",
         SimpleNamespace(
-            get_user_favorability=_async_favorability,
+            get_user_favorability=lambda _user_id: _favorability(),
             get_config=lambda: SimpleNamespace(max_favorability_delta_per_reply=5),
         ),
     )
 
-    message = mh.MessageSchema(
-        user_id="u1",
-        user_nickname="昵称",
-        group_id="100",
-        content="你好",
-        timestamp=1.0,
-        message_id="m1",
+    async def _prompt(**kwargs: object) -> list[object]:
+        if prompt_calls is not None:
+            prompt_calls.append(kwargs)
+        return [{"role": "user", "content": "test"}]
+
+    async def _generate(**kwargs: object) -> object:
+        if generate_calls is not None:
+            generate_calls.append(kwargs)
+        return llm.ReplyResult(
+            content="ok",
+            interaction_history={"event": "e", "result": "r", "emotion": "m"},
+            favorability_delta=0,
+            favorability_reason="无变化",
+        )
+
+    monkeypatch.setattr(mh, "build_prompt", _prompt)
+    monkeypatch.setattr(mh, "generate_reply_with_tools", _generate)
+
+
+async def _favorability() -> object:
+    return SimpleNamespace(favorability=0)
+
+
+async def test_recall_restricted_blocks_recall(monkeypatch: pytest.MonkeyPatch) -> None:
+    """chat.recall：会话打开前与自动召回外呼前各做一次当前群裁决。"""
+    from tests.komari_chat.hindsight_recall_support import FakeHindsightMemory
+
+    # Phase 1: restricted before session opening.
+    scripted = ScriptedAdjudicate("restricted")
+    install_scripted_adjudicate(monkeypatch, scripted)
+    memory = FakeHindsightMemory()
+    _patch_recall_core(monkeypatch)
+
+    result = await _run_recall_core(_recall_handler(memory))
+
+    assert scripted.calls != [], "chat.recall 会话打开前未调用 adjudicate"
+    assert memory.open_calls == 0
+    assert memory.recall_calls == []
+    assert result.content == ""
+
+    # Phase 2: admitted for the session, restricted immediately before recall.
+    scripted = ScriptedAdjudicate("admitted")
+    scripted.set_sequence("admitted", "restricted")
+    install_scripted_adjudicate(monkeypatch, scripted)
+    memory = FakeHindsightMemory()
+    prompt_calls: list[dict[str, Any]] = []
+    generate_calls: list[dict[str, Any]] = []
+    _patch_recall_core(
+        monkeypatch,
+        prompt_calls=prompt_calls,
+        generate_calls=generate_calls,
     )
-    await handler._generate_reply_core(
-        message=message,
-        recent_messages=[],
-        interaction_records=[],
-        image_urls=None,
-        reply_context=None,
-        reply_context_requested=False,
-        reply_context_refetched=False,
-        request_trace_id="t",
+
+    result = await _run_recall_core(_recall_handler(memory))
+
+    assert len(scripted.calls) >= 2, "自动召回外呼前未再次裁决"
+    assert memory.open_calls == 1
+    assert memory.recall_calls == []
+    assert memory.sessions[0].closed is True
+    assert prompt_calls == []
+    assert generate_calls == []
+    assert result.content == ""
+
+
+async def test_recalled_memory_from_restricted_source_usable_in_admitted_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """已接收记忆不按来源群过滤；当前群获准即可用于另一群。"""
+    from hindsight_client import RecallResponse
+
+    from tests.komari_chat.hindsight_recall_support import FakeHindsightMemory
+
+    scripted = ScriptedAdjudicate("admitted")
+    install_scripted_adjudicate(monkeypatch, scripted)
+    response = RecallResponse.model_validate(
+        {
+            "results": [
+                {
+                    "id": "memory-from-group-a",
+                    "text": "A 群的旅行经历",
+                    "metadata": {"source_group_id": "group-a"},
+                }
+            ]
+        }
     )
-    assert s.calls != [], "chat.embedding 效果前未调用 adjudicate"
-    assert embed_calls == [], "chat.embedding 在受限准入下仍发起了 embed 外呼"
+    memory = FakeHindsightMemory(response=response)
+    prompt_calls: list[dict[str, Any]] = []
+    generate_calls: list[dict[str, Any]] = []
+    _patch_recall_core(
+        monkeypatch,
+        prompt_calls=prompt_calls,
+        generate_calls=generate_calls,
+    )
+
+    result = await _run_recall_core(_recall_handler(memory))
+
+    assert result.content == "ok"
+    assert memory.recall_calls == ["你好"]
+    assert prompt_calls[0]["recall_response"] is response
+    assert generate_calls
+    assert all(call[0] == (GROUP_ID,) for call in scripted.calls)
 
 
 # ---------------------------------------------------------------------------
@@ -513,7 +570,6 @@ def _fresh_chat_module(monkeypatch: pytest.MonkeyPatch) -> Any:
     """按 test_plugin_entry 模式独立加载 chat 插件入口，避开 NoneBot 插件装载。"""
     import importlib.util
     import pathlib
-    import sys
 
     import nonebot.plugin as np
 

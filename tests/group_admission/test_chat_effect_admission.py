@@ -81,9 +81,7 @@ def _final_response_completion() -> Any:
             SimpleNamespace(
                 id="call-final",
                 type="function",
-                function=SimpleNamespace(
-                    name="final_response", arguments="{}"
-                ),
+                function=SimpleNamespace(name="final_response", arguments="{}"),
                 raw_arguments="{}",
                 parsed_arguments={
                     "content": "回复内容",
@@ -224,10 +222,8 @@ async def test_tool_dispatch_restricted_blocks_tool_body(
         image_session=fake_image_session,
         phase_prefix="test",
         round_num=1,
-        memory_service=None,
+        recall_session=None,
         group_id=str(GROUP_ID),
-        allowed_profile_user_ids=frozenset(),
-        caller_user_id=None,
         caller_group_id=None,
         caller_is_superuser=False,
         request_trace_id="chat-1",
@@ -272,10 +268,8 @@ async def test_tool_search_restricted_blocks_search_web(
         image_session=None,
         phase_prefix="reader",
         round_num=1,
-        memory_service=None,
+        recall_session=None,
         group_id=str(GROUP_ID),
-        allowed_profile_user_ids=frozenset(),
-        caller_user_id=None,
         caller_group_id=None,
         caller_is_superuser=False,
         request_trace_id="chat-2",
@@ -283,9 +277,7 @@ async def test_tool_search_restricted_blocks_search_web(
     )
 
     assert scripted.calls != [], "chat.tool_search 搜索前未调用 adjudicate"
-    assert search_calls == [], (
-        "chat.tool_search 在受限准入下仍发起了 search_web"
-    )
+    assert search_calls == [], "chat.tool_search 在受限准入下仍发起了 search_web"
 
 
 # ---------------------------------------------------------------------------
@@ -317,9 +309,7 @@ async def test_group_read_restricted_blocks_get_msg(
     await handler._refetch_reply(bot=cast("Any", _FakeBot()), reply=reply)
 
     assert scripted.calls != [], "chat.group_read 读取前未调用 adjudicate"
-    assert get_msg_called == [], (
-        "chat.group_read 在受限下仍发生了 get_msg 平台读取"
-    )
+    assert get_msg_called == [], "chat.group_read 在受限下仍发生了 get_msg 平台读取"
 
 
 # ---------------------------------------------------------------------------
@@ -349,9 +339,7 @@ async def test_reaction_restricted_blocks_fire_and_forget(
     await asyncio.sleep(0)  # 允许任何已派发的 fire-and-forget 任务运行一次
 
     assert scripted.calls != [], "chat.reaction dispatch 前未调用 adjudicate"
-    assert scheduled is False, (
-        "chat.reaction 在受限准入下仍派发“生成中”表情"
-    )
+    assert scheduled is False, "chat.reaction 在受限准入下仍派发“生成中”表情"
     assert fired == [], "chat.reaction 在受限准入下回调仍启动"
 
 

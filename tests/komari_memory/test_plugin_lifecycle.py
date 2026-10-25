@@ -1,4 +1,4 @@
-"""TSK-192 phase A: memory lifecycle borrows context resources safely."""
+"""TSK-193 Hindsight caller plugin lifecycle acceptance."""
 
 from __future__ import annotations
 
@@ -32,6 +32,7 @@ async def _loaded_memory_plugin() -> AsyncIterator[Any]:
     shutdown_before = list(lifespan._shutdown_funcs)
     saved_package = sys.modules.get(PACKAGE)
     saved_schema = sys.modules.get(f"{PACKAGE}.config_schema")
+    saved_service = sys.modules.get(f"{PACKAGE}.services.hindsight_service")
     spec = importlib.util.spec_from_file_location(
         PACKAGE,
         PLUGIN_DIR / "__init__.py",
@@ -54,93 +55,135 @@ async def _loaded_memory_plugin() -> AsyncIterator[Any]:
             sys.modules.pop(f"{PACKAGE}.config_schema", None)
         else:
             sys.modules[f"{PACKAGE}.config_schema"] = saved_schema
+        if saved_service is None:
+            sys.modules.pop(f"{PACKAGE}.services.hindsight_service", None)
+        else:
+            sys.modules[f"{PACKAGE}.services.hindsight_service"] = saved_service
+
+
+async def test_plugin_public_surface_is_hindsight_only() -> None:
+    async with _loaded_memory_plugin() as module:
+        assert set(module.__all__) == {
+            "HindsightMemoryService",
+            "HindsightRecallSession",
+            "HindsightUnavailableError",
+            "KomariMemoryConfigSchema",
+            "get_hindsight_memory",
+        }
+        for removed in (
+            "MemoryService",
+            "get_memory_service",
+            "get_plugin_manager",
+            "get_redis_manager",
+            "register_memory_api",
+            "register_summary_task",
+            "register_interaction_event_task",
+            "register_forgetting_task",
+            "create_pool",
+        ):
+            assert not hasattr(module, removed), removed
+        assert module.get_hindsight_memory() is None
 
 
 @pytest.mark.asyncio
-async def test_memory_startup_failure_does_not_raise_or_close_context(
+async def test_startup_keeps_stable_service_when_config_read_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async with _loaded_memory_plugin() as module:
-        class _ContextRedis:
-            def __init__(self) -> None:
-                self.closed = False
 
-        context_redis = _ContextRedis()
-        context_store = SimpleNamespace(redis=context_redis)
-
-        async def _config() -> KomariMemoryConfigSchema:
-            return KomariMemoryConfigSchema(plugin_enable=True)
-
-        async def _create_pool() -> object:
-            msg = "postgres unavailable"
-            raise RuntimeError(msg)
+        async def _config() -> object:
+            raise RuntimeError("config storage unavailable")  # noqa: TRY003
 
         monkeypatch.setattr(module, "get_config_async", _config)
-        monkeypatch.setattr(module, "get_context_store", lambda: context_store)
-        monkeypatch.setattr(module, "create_pool", _create_pool)
 
-        assert module.get_memory_service() is None
         await module.startup()
 
-        assert module.get_memory_service() is None
-        assert module.get_redis_manager() is None
-        assert module.get_plugin_manager() is None
-        assert context_redis.closed is False
-
-
-@pytest.mark.asyncio
-async def test_memory_config_read_failure_does_not_abort_startup(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    async with _loaded_memory_plugin() as module:
-        async def _config() -> KomariMemoryConfigSchema:
-            msg = "config storage unavailable"
-            raise RuntimeError(msg)
-
-        monkeypatch.setattr(module, "get_config_async", _config)
-        await module.startup()
-        assert module.get_plugin_manager() is None
-
-
-@pytest.mark.asyncio
-async def test_memory_shutdown_drops_references_without_closing_shared_resources(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    async with _loaded_memory_plugin() as module:
-        class _ContextRedis:
-            def __init__(self) -> None:
-                self.closed = 0
-
-            async def aclose(self) -> None:
-                self.closed += 1
-
-        context_redis = _ContextRedis()
-        closed_pools: list[str] = []
-
-        async def _close_pool() -> None:
-            closed_pools.append("closed")
-
-        manager = module.PluginManager(KomariMemoryConfigSchema())
-        manager.redis = SimpleNamespace(redis=context_redis)
-        manager.memory = SimpleNamespace(cleanup=lambda: _noop())
-        manager.forgetting = object()
-        manager.pg_pool = SimpleNamespace(close=_close_pool)
-        monkeypatch.setattr(module, "_plugin_manager", manager)
-        monkeypatch.setattr(module, "unregister_summary_task", lambda: None)
-        monkeypatch.setattr(module, "unregister_forgetting_task", lambda: None)
-        monkeypatch.setattr(module, "unregister_interaction_event_task", lambda: None)
+        service = module.get_hindsight_memory()
+        assert service is not None
+        with pytest.raises(module.HindsightUnavailableError) as captured:
+            async with service.open_session():
+                pass
+        assert captured.value.reason_code == "configuration_unavailable"
+        assert service._ready is False
 
         await module.shutdown()
-
-        assert manager.redis is None
-        assert manager.memory is None
-        assert manager.forgetting is None
-        assert manager.pg_pool is None
-        assert context_redis.closed == 0
-        assert closed_pools == []
-        assert module.get_memory_service() is None
-        assert module.get_redis_manager() is None
+        assert module.get_hindsight_memory() is None
 
 
-async def _noop() -> None:
-    return None
+@pytest.mark.asyncio
+async def test_startup_keeps_stable_service_when_memory_is_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _loaded_memory_plugin() as module:
+
+        async def _config() -> KomariMemoryConfigSchema:
+            return KomariMemoryConfigSchema(plugin_enable=False)
+
+        monkeypatch.setattr(module, "get_config_async", _config)
+
+        await module.startup()
+
+        service = module.get_hindsight_memory()
+        assert service is not None
+        with pytest.raises(module.HindsightUnavailableError) as captured:
+            async with service.open_session():
+                pass
+        assert captured.value.reason_code == "configuration_disabled"
+        await module.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_startup_probe_failure_is_isolated_and_shutdown_is_idempotent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _loaded_memory_plugin() as module:
+        probes: list[int] = []
+        closes: list[int] = []
+
+        class _FakeService:
+            def __init__(self, *, config_getter: object) -> None:
+                assert callable(config_getter)
+
+            async def startup_probe(self) -> None:
+                probes.append(1)
+                raise RuntimeError("probe transport exploded")  # noqa: TRY003
+
+            async def close(self) -> None:
+                closes.append(1)
+
+        monkeypatch.setattr(module, "HindsightMemoryService", _FakeService)
+
+        await module.startup()
+        assert probes == [1]
+        assert isinstance(module.get_hindsight_memory(), _FakeService)
+
+        await module.shutdown()
+        await module.shutdown()
+        assert closes == [1]
+        assert module.get_hindsight_memory() is None
+
+
+@pytest.mark.asyncio
+async def test_shutdown_closes_owned_service_without_shared_resources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _loaded_memory_plugin() as module:
+        closed: list[str] = []
+        shared_redis = SimpleNamespace(closed=False)
+
+        class _FakeService:
+            def __init__(self, *, config_getter: object) -> None:
+                del config_getter
+
+            async def startup_probe(self) -> None:
+                return None
+
+            async def close(self) -> None:
+                closed.append("service")
+
+        monkeypatch.setattr(module, "HindsightMemoryService", _FakeService)
+        await module.startup()
+        await module.shutdown()
+
+        assert closed == ["service"]
+        assert shared_redis.closed is False
