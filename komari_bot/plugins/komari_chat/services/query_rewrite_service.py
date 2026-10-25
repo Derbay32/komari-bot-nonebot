@@ -3,9 +3,9 @@
 from nonebot import logger
 from nonebot.plugin import require
 
-from komari_bot.plugins.komari_memory import retry_async
+from komari_bot.core.retry import retry_async
 
-from .config_interface import get_memory_config
+from .config_interface import get_config
 
 if __import__("typing", fromlist=["TYPE_CHECKING"]).TYPE_CHECKING:
     from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
@@ -110,7 +110,7 @@ class QueryRewriteService:
             return current_query
 
         # 获取最新配置
-        config = get_memory_config()
+        config = get_config()
 
         try:
             # 构建重写 Prompt
@@ -118,16 +118,14 @@ class QueryRewriteService:
                 current_query=current_query,
             )
 
-            # 调用 LLM 重写（使用总结模型，更快）
+            # 调用 LLM 重写（使用查询重写专用槽位）
             rewritten = await self._generate_rewritten_completion(
                 rewrite_prompt=rewrite_prompt,
-                model=config.llm_model_summary,
-                thinking_mode=config.llm_thinking_mode_summary,
-                reasoning_effort=config.llm_reasoning_effort_summary,
-                request_api=getattr(
-                    config, "llm_request_api_summary", "chat_completions"
-                ),
-                stream_enabled=getattr(config, "llm_stream_enabled_summary", False),
+                model=config.query_rewrite_model,
+                thinking_mode=config.query_rewrite_thinking_mode,
+                reasoning_effort=config.query_rewrite_reasoning_effort,
+                request_api=config.query_rewrite_request_api,
+                stream_enabled=config.query_rewrite_stream_enabled,
                 request_trace_id=request_trace_id,
                 parent_call_id=parent_call_id,
                 collector=collector,

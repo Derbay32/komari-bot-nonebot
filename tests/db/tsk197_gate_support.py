@@ -52,7 +52,7 @@ SKIP_NO_POSTGRES = pytest.mark.skipif(
     reason="未设置 KOMARI_TEST_POSTGRES_URL，跳过集成测试",
 )
 
-HEAD_REVISION = "0025"
+HEAD_REVISION = "0027"
 
 #: 0013 引入的三项回复 Agent 预算列（仅让这些列走数据库默认值）。
 AGENT_BUDGET_COLUMNS = (
@@ -91,6 +91,30 @@ NON_BUDGET_COLUMN_DEFAULTS: dict[str, object] = {
     "vision_image_download_connect_timeout_seconds": 5.0,
     "vision_image_download_read_timeout_seconds": 30.0,
     "vision_image_download_total_timeout_seconds": 45.0,
+    # TSK-192 phase B：chat/context 配置所有权迁入的非空 chat 列。
+    "plugin_enable": False,
+    "llm_model_chat": "gemini-3-flash-preview",
+    "llm_temperature_chat": 1.0,
+    "llm_max_tokens_chat": 4000,
+    "llm_request_api_chat": "chat_completions",
+    "llm_stream_enabled_chat": False,
+    "llm_thinking_mode_chat": False,
+    "llm_reasoning_effort_chat": "",
+    "assistant_prefill_enabled": False,
+    "dsv4_roleplay_instruct_mode": "auto",
+    "knowledge_enabled": True,
+    "knowledge_limit": 3,
+    "memory_search_limit": 3,
+    "context_messages_limit": 10,
+    "context_max_utf8_bytes": 24_000,
+    "context_max_estimated_tokens": 6_000,
+    "face_reaction_enabled": False,
+    "face_reaction_id": "76",
+    "query_rewrite_model": "deepseek-v4-flash",
+    "query_rewrite_request_api": "chat_completions",
+    "query_rewrite_stream_enabled": False,
+    "query_rewrite_thinking_mode": False,
+    "query_rewrite_reasoning_effort": "",
 }
 
 #: 8 项图片下载预算列（chat head 与 memory 0014 历史两集合共有的部分）。

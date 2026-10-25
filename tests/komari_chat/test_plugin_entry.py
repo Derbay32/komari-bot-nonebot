@@ -49,7 +49,7 @@ def _install_allowed_entry_dependencies(
             return False
 
     monkeypatch.setattr(chat_module, "get_config", lambda: config)
-    monkeypatch.setattr(chat_module, "get_memory_config", lambda: config)
+    monkeypatch.setattr(chat_module, "get_context_config", lambda: config)
     monkeypatch.setattr(chat_module, "_get_or_build_handler", lambda: handler)
     monkeypatch.setattr(
         chat_module,
@@ -57,6 +57,7 @@ def _install_allowed_entry_dependencies(
         lambda: workflow,
         raising=False,
     )
+
     def _adjudicate_allowed(_groups: object) -> object:
         return SimpleNamespace(
             qualification=chat_module.AdmissionQualification.BUSINESS
@@ -196,7 +197,7 @@ async def test_admission_gate_controls_group_message_processing(
             calls.dispatch = kwargs.get("decision_dispatch")
 
     monkeypatch.setattr(chat_module, "get_config", lambda: config)
-    monkeypatch.setattr(chat_module, "get_memory_config", lambda: config)
+    monkeypatch.setattr(chat_module, "get_context_config", lambda: config)
     monkeypatch.setattr(chat_module, "_get_or_build_handler", lambda: _Handler())
     monkeypatch.setattr(chat_module, "adjudicate", _adjudicate_allowed)
     monkeypatch.setattr(chat_module, "user_ban_plugin", _BanPlugin())
@@ -217,15 +218,20 @@ def test_reply_fulfillment_ops_does_not_require_decision_engine(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """履约运维只依赖 PostgreSQL/Redis，不应被判定引擎故障拖垮。"""
-    redis = SimpleNamespace(redis=object())
-    memory = SimpleNamespace(pg_pool=object())
+    store = SimpleNamespace(redis=object())
+    pg_pool = object()
     built: list[tuple[object, object]] = []
     service = object()
 
     monkeypatch.setattr(
         chat_module,
-        "get_memory_plugin_manager",
-        lambda: SimpleNamespace(redis=redis, memory=memory),
+        "context_plugin",
+        SimpleNamespace(get_context_store=lambda: store),
+    )
+    monkeypatch.setattr(
+        chat_module,
+        "get_shared_orm_connection_pool",
+        lambda: pg_pool,
     )
     monkeypatch.setattr(chat_module, "get_decision_engine", lambda: None)
     monkeypatch.setattr(
@@ -239,15 +245,56 @@ def test_reply_fulfillment_ops_does_not_require_decision_engine(
     monkeypatch.setattr(chat_module, "_reply_fulfillment_ops_components", None)
 
     assert chat_module.get_reply_fulfillment_ops_service() is service
-    assert built == [(memory.pg_pool, redis.redis)]
+    assert built == [(pg_pool, store.redis)]
+
+
+def test_fulfillment_stays_buildable_without_memory_or_decision(
+    chat_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Context + shared PG are sufficient for recovery/workflow construction."""
+    store = SimpleNamespace(redis=object())
+    pg_pool = object()
+    workflow = object()
+    built: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        chat_module,
+        "context_plugin",
+        SimpleNamespace(get_context_store=lambda: store),
+    )
+    monkeypatch.setattr(
+        chat_module,
+        "get_shared_orm_connection_pool",
+        lambda: pg_pool,
+    )
+    monkeypatch.setattr(
+        chat_module,
+        "memory_plugin",
+        SimpleNamespace(get_memory_service=lambda: None),
+    )
+    monkeypatch.setattr(chat_module, "get_decision_engine", lambda: None)
+    monkeypatch.setattr(
+        chat_module,
+        "build_reply_fulfillment_workflow",
+        lambda **kwargs: built.append(kwargs) or workflow,
+    )
+    monkeypatch.setattr(chat_module, "_reply_fulfillment", None)
+    monkeypatch.setattr(chat_module, "_reply_fulfillment_components", None)
+
+    assert chat_module._resolve_runtime_components() is None
+    assert chat_module._get_or_build_reply_fulfillment() is workflow
+    assert built
+    assert built[0]["pg_pool"] is pg_pool
+    assert built[0]["redis"] is store
 
 
 def test_handler_rebuilds_when_decision_engine_changes(
     chat_module: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    redis = object()
-    memory = SimpleNamespace(pg_pool=object())
+    redis = SimpleNamespace(redis=object())
+    memory = SimpleNamespace()
     engine_ref = SimpleNamespace(value=object())
     built_engines: list[object] = []
 
@@ -267,8 +314,13 @@ def test_handler_rebuilds_when_decision_engine_changes(
 
     monkeypatch.setattr(
         chat_module,
-        "get_memory_plugin_manager",
-        lambda: SimpleNamespace(redis=redis, memory=memory),
+        "context_plugin",
+        SimpleNamespace(get_context_store=lambda: redis),
+    )
+    monkeypatch.setattr(
+        chat_module,
+        "memory_plugin",
+        SimpleNamespace(get_memory_service=lambda: memory),
     )
     monkeypatch.setattr(
         chat_module,
@@ -837,3 +889,34 @@ async def test_worker_rethrows_cancelled_error_from_handler(
     assert retry_calls == [1]
     assert fake_asyncio.sleep_calls == []
     assert errors_logged == []
+
+
+def test_fulfillment_config_reads_global_controls_from_context(
+    chat_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TSK-192 phase B: fulfillment construction never reads memory config."""
+    from komari_bot.plugins.komari_chat.config_schema import (
+        KomariChatConfigSchema,
+    )
+    from komari_bot.plugins.komari_context.config_schema import (
+        KomariContextConfigSchema,
+    )
+
+    chat_config = KomariChatConfigSchema(
+        proactive_cooldown=44,
+        reply_fulfillment_batch_size=17,
+    )
+    context_config = KomariContextConfigSchema(
+        global_interaction_enabled=False,
+        global_interaction_trigger_size=9,
+    )
+    monkeypatch.setattr(chat_module, "get_config", lambda: chat_config)
+    monkeypatch.setattr(chat_module, "get_context_config", lambda: context_config)
+
+    fulfillment_config = chat_module._get_reply_fulfillment_config()
+
+    assert fulfillment_config.proactive_cooldown == 44
+    assert fulfillment_config.reply_fulfillment_batch_size == 17
+    assert fulfillment_config.global_interaction_enabled is False
+    assert fulfillment_config.global_interaction_trigger_size == 9

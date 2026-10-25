@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+from komari_bot.context.redis_store import MessageSchema
 from komari_bot.llm.content_budget import estimate_text_tokens
 from komari_bot.plugins.komari_memory.services.message_chunking import (
     MessageChunkBudgetError,
@@ -11,7 +12,6 @@ from komari_bot.plugins.komari_memory.services.message_chunking import (
     build_memory_external_context,
     chunk_messages_for_memory_processing,
 )
-from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
 
 
 def _message(

@@ -14,10 +14,7 @@ import komari_bot.plugins.komari_decision as decision_plugin
 
 
 def test_summary_dispatch_surface_is_top_level_import_identity() -> None:
-    assert (
-        summary_module.get_decision_dispatch
-        is decision_plugin.get_decision_dispatch
-    )
+    assert summary_module.get_decision_dispatch is decision_plugin.get_decision_dispatch
     assert summary_module.get_decision_engine is decision_plugin.get_decision_engine
 
 
@@ -65,26 +62,26 @@ def test_decision_dependency_declaration_kept() -> None:
     assert 'require("komari_decision")' in source
 
 
-def test_failure_notification_reads_memory_switch_through_top_level_export() -> None:
-    """失败通知开关经 komari_memory 顶层暴露面 + 既有 config_manager factory。"""
-    import komari_bot.plugins.komari_memory as memory_plugin
+def test_failure_notification_reads_context_switch_through_top_level_export() -> None:
+    """失败通知开关经 komari_context 顶层暴露面 + 既有 config_manager factory。"""
+    import komari_bot.plugins.komari_context as context_plugin
 
     assert (
-        summary_module.KomariMemoryConfigSchema
-        is memory_plugin.KomariMemoryConfigSchema
+        summary_module.KomariContextConfigSchema
+        is context_plugin.KomariContextConfigSchema
     )
     source = inspect.getsource(summary_module)
-    require_line = 'require("komari_memory")'
+    require_line = 'require("komari_context")'
     import_line = (
-        "from komari_bot.plugins.komari_memory import KomariMemoryConfigSchema"
+        "from komari_bot.plugins.komari_context import KomariContextConfigSchema"
     )
     assert require_line in source
     assert import_line in source
     assert source.index(require_line) < source.index(import_line)
     assert (
-        "_memory_config_manager = config_manager_plugin.get_config_manager("
-        in source
+        "_context_config_manager = config_manager_plugin.get_config_manager(" in source
     )
+    assert 'require("komari_memory")' not in source
 
 
 def test_legacy_scene_classification_notification_wrappers_are_removed() -> None:

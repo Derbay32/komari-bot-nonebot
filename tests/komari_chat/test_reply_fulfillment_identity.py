@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
+from komari_bot.context.redis_store import MessageSchema
 
 if TYPE_CHECKING:
     from nonebug import App

@@ -96,7 +96,7 @@ async def test_chat_ban_stores_message_without_attempting_reply(
 
     monkeypatch.setattr(
         message_handler_module,
-        "get_memory_config",
+        "get_context_config",
         lambda: SimpleNamespace(bot_nickname="小鞠", bot_aliases=[]),
     )
     monkeypatch.setattr(handler, "_attempt_reply", fail_attempt_reply)

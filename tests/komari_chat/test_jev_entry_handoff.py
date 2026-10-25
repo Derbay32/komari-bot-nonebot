@@ -297,9 +297,7 @@ class _BanPlugin:
     def __init__(self, banned: bool) -> None:  # noqa: FBT001 - 测试替身固定开关
         self.banned = banned
 
-    async def is_event_banned(
-        self, _bot: object, _event: object, _scope: str
-    ) -> bool:
+    async def is_event_banned(self, _bot: object, _event: object, _scope: str) -> bool:
         return self.banned
 
 
@@ -371,10 +369,10 @@ def _install_summary(monkeypatch: pytest.MonkeyPatch, world: _World) -> None:
         "config_manager",
         SimpleNamespace(get=lambda: summary_config),
     )
-    # TSK-188：总结失败通知经既有 config_manager factory 读取 komari_memory 资源。
+    # TSK-188：总结失败通知经既有 config_manager factory 读取 komari_context 资源。
     monkeypatch.setattr(
         summary_module,
-        "_memory_config_manager",
+        "_context_config_manager",
         SimpleNamespace(get=lambda: memory_config),
         raising=False,
     )
@@ -472,7 +470,10 @@ async def _world(
             "get_driver",
             lambda: SimpleNamespace(config=SimpleNamespace(superusers=recipients)),
         )
-        chat_config = SimpleNamespace(proactive_enabled=True)
+        memory_config.plugin_enable = True
+        memory_config.proactive_enabled = True
+        chat_config = memory_config
+
         async def _not_superuser(_bot: object, _event: object) -> bool:
             return False
 
@@ -484,11 +485,9 @@ async def _world(
         )
         monkeypatch.setattr(entry, "user_ban_plugin", _BanPlugin(ban))
         monkeypatch.setattr(entry, "adjudicate", _admit_all)
-        monkeypatch.setattr(entry, "get_memory_config", lambda: memory_config)
+        monkeypatch.setattr(entry, "get_context_config", lambda: memory_config)
         monkeypatch.setattr(entry, "get_config", lambda: chat_config)
-        monkeypatch.setattr(
-            handler_module, "get_memory_config", lambda: memory_config
-        )
+        monkeypatch.setattr(handler_module, "get_context_config", lambda: memory_config)
         monkeypatch.setattr(handler_module, "get_config", lambda: chat_config)
         _install_summary(monkeypatch, world)
         try:
@@ -572,9 +571,10 @@ async def test_text_addressed_summary_candidate_requests_noul_and_two_choices_on
     decision_database: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async with _world(
-        monkeypatch, decision_database, options=_summary_options()
-    ) as (world, harness):
+    async with _world(monkeypatch, decision_database, options=_summary_options()) as (
+        world,
+        harness,
+    ):
         event = world.event(text=_SUMMARY_TEXT, to_me=True)
 
         await _dispatch(world, event)
@@ -594,9 +594,10 @@ async def test_native_platform_summary_candidate_requests_only_noul_once(
     decision_database: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async with _world(
-        monkeypatch, decision_database, options=_summary_options()
-    ) as (world, harness):
+    async with _world(monkeypatch, decision_database, options=_summary_options()) as (
+        world,
+        harness,
+    ):
         event = world.event(
             segments=(MessageSegment.at(_BOT_SELF_ID), _SUMMARY_TEXT),
             to_me=True,
@@ -639,9 +640,10 @@ async def test_summary_hit_executes_only_summary_after_one_claim(
     decision_database: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async with _world(
-        monkeypatch, decision_database, options=_summary_options()
-    ) as (world, harness):
+    async with _world(monkeypatch, decision_database, options=_summary_options()) as (
+        world,
+        harness,
+    ):
         handler = world.entry._get_or_build_handler()
 
         async def _never(**_kwargs: object) -> None:
@@ -730,9 +732,10 @@ async def test_numeric_summary_never_bypasses_model_and_range_checked_after_clai
     text: str,
     count: int,
 ) -> None:
-    async with _world(
-        monkeypatch, decision_database, options=_summary_options()
-    ) as (world, harness):
+    async with _world(monkeypatch, decision_database, options=_summary_options()) as (
+        world,
+        harness,
+    ):
         event = world.event(text=text, to_me=True)
 
         await _dispatch(world, event)
@@ -1435,9 +1438,10 @@ async def test_ordinary_decision_failure_is_private_only_and_keeps_original_mess
 ) -> None:
     """普通判定技术失败：不发群错误、不生成，原消息继续既有保存处理。"""
     options = _exception_options(httpx2.ConnectError(_CANARY_ERROR))
-    async with _world(
-        monkeypatch, decision_database, options=options, notify=True
-    ) as (world, harness):
+    async with _world(monkeypatch, decision_database, options=options, notify=True) as (
+        world,
+        harness,
+    ):
         _enable_reaction(world)
         event = world.event(text=_CANARY_TEXT)
 
@@ -1531,9 +1535,10 @@ async def test_successive_summary_failures_share_private_cooldown_but_keep_group
 ) -> None:
     """同群同原因的连续新失败共享私聊冷却，但群内固定提示每次都发。"""
     options = _exception_options(httpx2.ConnectError(_TRANSPORT_DOWN))
-    async with _world(
-        monkeypatch, decision_database, options=options, notify=True
-    ) as (world, harness):
+    async with _world(monkeypatch, decision_database, options=options, notify=True) as (
+        world,
+        harness,
+    ):
         first = world.event(text=_SUMMARY_TEXT, to_me=True)
         second = world.event(text=_SUMMARY_TEXT, to_me=True)
 
@@ -1555,9 +1560,10 @@ async def test_successive_ordinary_failures_share_redis_cooldown(
 ) -> None:
     """普通判定失败复用既有 Redis 冷却：新事件两次尝试只投递一张私聊卡。"""
     options = _exception_options(httpx2.ConnectError(_TRANSPORT_DOWN))
-    async with _world(
-        monkeypatch, decision_database, options=options, notify=True
-    ) as (world, harness):
+    async with _world(monkeypatch, decision_database, options=options, notify=True) as (
+        world,
+        harness,
+    ):
         await _dispatch(world, world.event(text=_NORMAL_TEXT))
         await _dispatch(world, world.event(text=_NORMAL_TEXT))
 
@@ -1574,9 +1580,10 @@ async def test_platform_redelivery_does_not_resubmit_failure_notifications(
 ) -> None:
     """平台重投不得重复提交群内固定提示或私聊失败诊断。"""
     options = _exception_options(httpx2.ConnectError(_TRANSPORT_DOWN))
-    async with _world(
-        monkeypatch, decision_database, options=options, notify=True
-    ) as (world, harness):
+    async with _world(monkeypatch, decision_database, options=options, notify=True) as (
+        world,
+        harness,
+    ):
         event = world.event(text=_SUMMARY_TEXT, to_me=True)
 
         await _dispatch(world, event)
@@ -1631,6 +1638,7 @@ async def test_failure_notification_is_not_revived_by_admission_restore(
 ) -> None:
     """观察到的撤权会持久化；恢复准入后失败的迟到结果也不能补交通知。"""
     admitted = {"value": True}
+
     def _fail(_request: httpx2.Request, _index: int) -> Any:
         raise httpx2.ConnectError(_TRANSPORT_DOWN)
 

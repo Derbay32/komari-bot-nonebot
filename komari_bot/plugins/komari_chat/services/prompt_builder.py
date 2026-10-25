@@ -17,7 +17,9 @@ from komari_bot.llm.untrusted_context import (
     render_untrusted_context,
 )
 from komari_bot.memory.profile_operations import profile_traits_to_list
-from komari_bot.plugins.komari_memory import KomariMemoryConfigSchema  # noqa: TC001
+from komari_bot.plugins.komari_chat.config_schema import (
+    KomariChatConfigSchema,  # noqa: TC001
+)
 
 from .prompt_template import get_template
 from .reply_context import ReplyContext  # noqa: TC001
@@ -57,12 +59,18 @@ def _format_time(value: object) -> str | None:
     if isinstance(value, datetime):
         return value.astimezone().strftime("%Y-%m-%d %H:%M")
     if isinstance(value, int | float):
-        return datetime.fromtimestamp(float(value)).astimezone().strftime("%Y-%m-%d %H:%M")
+        return (
+            datetime.fromtimestamp(float(value)).astimezone().strftime("%Y-%m-%d %H:%M")
+        )
     if isinstance(value, str) and value.strip():
         text = value.strip()
         try:
             normalized = text.replace("Z", "+00:00")
-            return datetime.fromisoformat(normalized).astimezone().strftime("%Y-%m-%d %H:%M")
+            return (
+                datetime.fromisoformat(normalized)
+                .astimezone()
+                .strftime("%Y-%m-%d %H:%M")
+            )
         except ValueError:
             return text[:16]
     return None
@@ -76,7 +84,11 @@ def _format_profile_traits_yaml(
 ) -> str:
     """将当前用户画像格式化为精简 YAML 风格文本。"""
     name = _clean_yaml_text(
-        profile.get("display_name") or profile.get("name") or fallback_name or fallback_user_id or "当前用户"
+        profile.get("display_name")
+        or profile.get("name")
+        or fallback_name
+        or fallback_user_id
+        or "当前用户"
     )
     traits = profile_traits_to_list(profile.get("traits"))
     lines = [f"name: {name}"]
@@ -206,7 +218,7 @@ def get_festival_info() -> str | None:
 async def build_prompt(
     user_message: str,
     memories: list[dict],
-    config: KomariMemoryConfigSchema,
+    config: KomariChatConfigSchema,
     recent_messages: list | None = None,
     current_user_id: str | None = None,
     current_user_nickname: str | None = None,
@@ -506,7 +518,9 @@ async def build_prompt(
                 )
 
     # 当前触发用户画像：只注入当前用户，其他用户由 read_profile 工具按需读取。
-    if current_user_profile and profile_traits_to_list(current_user_profile.get("traits")):
+    if current_user_profile and profile_traits_to_list(
+        current_user_profile.get("traits")
+    ):
         profile_text = _format_profile_traits_yaml(
             current_user_profile,
             fallback_user_id=current_user_id,
@@ -520,13 +534,17 @@ async def build_prompt(
     if visible_users_text:
         dynamic_parts.append(f"<visible_users>\n{visible_users_text}\n</visible_users>")
 
-    interaction_memory_text = _format_interaction_memories_yaml(interaction_memories or [])
+    interaction_memory_text = _format_interaction_memories_yaml(
+        interaction_memories or []
+    )
     if interaction_memory_text:
         dynamic_parts.append(
             f"<interaction_memory>\n{interaction_memory_text}\n</interaction_memory>"
         )
 
-    recent_interaction_text = _format_interaction_records_yaml(interaction_records or [])
+    recent_interaction_text = _format_interaction_records_yaml(
+        interaction_records or []
+    )
     if recent_interaction_text:
         dynamic_parts.append(
             f"<recent_interaction_history>\n{recent_interaction_text}\n</recent_interaction_history>"
@@ -535,12 +553,10 @@ async def build_prompt(
     del memory_service
 
     if favorability is not None:
-        favor_display_name = (
-            character_binding.get_character_name(
-                group_id=lookup_group_id,
-                user_id=favorability.user_id,
-                fallback_nickname=current_user_nickname,
-            )
+        favor_display_name = character_binding.get_character_name(
+            group_id=lookup_group_id,
+            user_id=favorability.user_id,
+            fallback_nickname=current_user_nickname,
         )
         dynamic_parts.append(
             "\n".join(
@@ -630,7 +646,9 @@ async def build_prompt(
             vision_lines.append(
                 f"- 当前用户发送了 {current_image_count} 张图片，可用 read_image 查看，索引范围为 {current_start_index} 到 {current_end_index}。"
             )
-        text_parts = [part for part in [reply_intro_text, current_text, *vision_lines] if part]
+        text_parts = [
+            part for part in [reply_intro_text, current_text, *vision_lines] if part
+        ]
         messages.append({"role": "user", "content": "\n".join(text_parts)})
     elif has_multimodal_content:
         content_parts: list[dict[str, Any]] = []

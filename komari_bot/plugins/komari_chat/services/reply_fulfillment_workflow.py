@@ -48,7 +48,7 @@ from .reply_fulfillment_alert import (
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
 
-    from komari_bot.plugins.komari_memory import MessageSchema
+    from komari_bot.context.redis_store import MessageSchema
 
 ReplySender = Callable[[object], Awaitable[object]]
 BotIdentity = tuple[str, str]

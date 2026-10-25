@@ -25,7 +25,9 @@ from uuid import uuid4
 
 from nonebot import logger
 
-from ..core.retry import get_retry_attempts, retry_async
+from komari_bot.context.redis_store import MessageSchema
+from komari_bot.core.retry import get_retry_attempts, retry_async
+
 from .admission import memory_conversation_business_admitted
 from .conversation_processing import (
     ConversationLeaseLostError,
@@ -34,7 +36,6 @@ from .conversation_processing import (
 from .conversation_processing import (
     InvalidChunkLedgerError as _InvalidChunkLedgerError,
 )
-from .redis_manager import MessageSchema
 
 
 class _ProcessingStorage(Protocol):

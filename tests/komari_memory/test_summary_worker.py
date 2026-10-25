@@ -27,6 +27,7 @@ from typing import Any
 import pytest
 from apscheduler.jobstores.base import JobLookupError
 
+from komari_bot.context.redis_store import MessageSchema
 from komari_bot.plugins.komari_memory.config_schema import KomariMemoryConfigSchema
 from komari_bot.plugins.komari_memory.handlers import (
     summary_worker as summary_worker_module,
@@ -43,7 +44,6 @@ from komari_bot.plugins.komari_memory.services.conversation_processing import (
 from komari_bot.plugins.komari_memory.services.conversation_processing_lifecycle import (
     ProcessingSession,
 )
-from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
 
 
 def _make_message(
@@ -262,16 +262,20 @@ def _two_chunk_messages() -> list[MessageSchema]:
 
 @pytest.fixture(autouse=True)
 def _stub_config(monkeypatch: pytest.MonkeyPatch) -> None:
-    """把 worker 命名空间内的 get_config 换成固定配置（bot_nickname 供分块与渲染）。"""
+    """Pin memory config and context-owned bot identity for the worker."""
 
     monkeypatch.setattr(
         summary_worker_module,
         "get_config",
         lambda: KomariMemoryConfigSchema(
-            bot_nickname="小鞠知花",
             summary_max_buffer_size=100,
             profile_trait_limit=20,
         ),
+    )
+    monkeypatch.setattr(
+        summary_worker_module,
+        "get_context_config",
+        lambda: SimpleNamespace(bot_nickname="小鞠知花"),
     )
 
 
@@ -451,7 +455,7 @@ async def test_profile_cache_miss_runs_agent_and_writes_committed_state(
     expected_text = "\n".join(
         summary_worker_module.format_message_line(
             message,
-            bot_nickname=call["config"].bot_nickname,
+            bot_nickname="小鞠知花",
         )
         for message in session.messages
     )

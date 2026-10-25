@@ -30,8 +30,8 @@ from typing import Any
 import pytest
 
 import komari_bot.plugins as plugins_package
+from komari_bot.context.redis_store import MessageSchema
 from komari_bot.plugins.agent_run_logger.diagnostic import AgentRunCollector
-from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
 from komari_bot.plugins.llm_provider.base_client import (
     LLMCompletionResultSchema,
     LLMProviderContinuationSchema,
@@ -39,7 +39,7 @@ from komari_bot.plugins.llm_provider.base_client import (
     LLMToolCallSchema,
 )
 
-retry_module = import_module("komari_bot.plugins.komari_memory.core.retry")
+retry_module = import_module("komari_bot.core.retry")
 agent_budget_module = import_module(
     "komari_bot.plugins.komari_chat.services.agent_budget"
 )
@@ -260,7 +260,7 @@ def _build_config(**overrides: Any) -> SimpleNamespace:
 
 
 def _build_chat_config_stub(**overrides: Any) -> SimpleNamespace:
-    """handler 级测试使用的合并配置替身（get_config 与 get_memory_config 共用）。"""
+    """handler 级测试使用的合并配置替身（get_config 与 get_context_config 共用）。"""
     values: dict[str, Any] = {
         "proactive_enabled": False,
         "context_messages_limit": 10,
@@ -274,7 +274,7 @@ def _build_chat_config_stub(**overrides: Any) -> SimpleNamespace:
         "global_interaction_trigger_size": 20,
         "face_reaction_enabled": False,
         "face_reaction_id": "76",
-        # TSK-194：图片理解模式（合并替身承载 get_config/get_memory_config）
+        # TSK-194：图片理解模式（合并替身承载 get_config/get_context_config）
         "image_understanding_mode": "delegated",
         "error_notify_enabled": False,
         "knowledge_enabled": False,
@@ -319,7 +319,7 @@ def _wire_handler(
     handler._reaction_tasks = set()
 
     monkeypatch.setattr(message_handler_module, "get_config", lambda: config)
-    monkeypatch.setattr(message_handler_module, "get_memory_config", lambda: config)
+    monkeypatch.setattr(message_handler_module, "get_context_config", lambda: config)
     monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
     monkeypatch.setattr(
         message_handler_module,

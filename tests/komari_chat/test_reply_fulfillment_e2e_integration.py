@@ -36,6 +36,7 @@ import pytest
 import redis.asyncio as aioredis
 from sqlalchemy import text
 
+from komari_bot.context.redis_store import MessageSchema
 from komari_bot.plugins.komari_chat.handlers import message_handler as handler_module
 from komari_bot.plugins.komari_chat.repositories.reply_fulfillment_repository import (
     ReplyFulfillmentRepository,
@@ -56,12 +57,8 @@ from komari_bot.plugins.komari_chat.services.reply_fulfillment_workflow import (
     ReplyFulfillmentWorkflow,
     build_reply_fulfillment_id,
 )
-from komari_bot.plugins.komari_memory.config_schema import KomariMemoryConfigSchema
 from komari_bot.plugins.komari_memory.services.redis_keys import RedisKeys
-from komari_bot.plugins.komari_memory.services.redis_manager import (
-    MessageSchema,
-    RedisManager,
-)
+from komari_bot.plugins.komari_memory.services.redis_manager import RedisManager
 from komari_bot.plugins.user_data.config_schema import DynamicConfigSchema
 from komari_bot.plugins.user_data.database import UserDataDB
 from komari_bot.plugins.user_data.orm_models import (
@@ -237,8 +234,7 @@ async def _stack(
     await user_data.initialize()
     try:
         await _assert_live_gate(pool)
-        redis_manager = RedisManager(KomariMemoryConfigSchema())
-        redis_manager._redis = cast("Any", redis_client)
+        redis_manager = RedisManager(cast("Any", redis_client))
         reservation_service = proactive_module.ProactiveReservationService(
             cast("Any", redis_client)
         )

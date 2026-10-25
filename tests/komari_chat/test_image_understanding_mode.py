@@ -130,7 +130,7 @@ class _FakeUserData:
 
 
 def _chat_config_stub(**overrides: object) -> SimpleNamespace:
-    """合并 get_config / get_memory_config 字段的配置替身。"""
+    """合并 get_config / get_context_config 字段的配置替身。"""
     values: dict[str, object] = {
         "proactive_enabled": False,
         "context_messages_limit": 10,
@@ -152,7 +152,7 @@ def _chat_config_stub(**overrides: object) -> SimpleNamespace:
 
 
 def _make_message(message_id: str = "img-msg-1") -> Any:
-    from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
+    from komari_bot.context.redis_store import MessageSchema
 
     return MessageSchema(
         user_id="user-1",
@@ -201,7 +201,7 @@ def _wire_generate_core(
     handler.query_rewrite = _FakeQueryRewrite()
 
     monkeypatch.setattr(message_handler_module, "get_config", lambda: config)
-    monkeypatch.setattr(message_handler_module, "get_memory_config", lambda: config)
+    monkeypatch.setattr(message_handler_module, "get_context_config", lambda: config)
     monkeypatch.setattr(message_handler_module, "user_data_plugin", _FakeUserData())
     monkeypatch.setattr(
         message_handler_module,
@@ -496,7 +496,7 @@ def test_delegated_mode_quoted_images_first_stable_indexes(
     handler.memory = _FakeMemory()
     handler.query_rewrite = _FakeQueryRewrite()
     monkeypatch.setattr(message_handler_module, "get_config", lambda: config)
-    monkeypatch.setattr(message_handler_module, "get_memory_config", lambda: config)
+    monkeypatch.setattr(message_handler_module, "get_context_config", lambda: config)
     monkeypatch.setattr(message_handler_module, "user_data_plugin", _FakeUserData())
     monkeypatch.setattr(
         message_handler_module,
@@ -617,7 +617,7 @@ def test_native_mode_chat_provider_image_failure_fails_explicitly(
     handler.query_rewrite = _FakeQueryRewrite()
 
     monkeypatch.setattr(message_handler_module, "get_config", lambda: config)
-    monkeypatch.setattr(message_handler_module, "get_memory_config", lambda: config)
+    monkeypatch.setattr(message_handler_module, "get_context_config", lambda: config)
     monkeypatch.setattr(message_handler_module, "user_data_plugin", _FakeUserData())
     monkeypatch.setattr(
         message_handler_module,
@@ -785,7 +785,7 @@ def test_generate_core_freezes_image_policy_snapshot_across_tasks(
         return original_policy_from_config(cfg)  # type: ignore[no-any-return]
 
     monkeypatch.setattr(message_handler_module, "get_config", _get_config_spy)
-    monkeypatch.setattr(message_handler_module, "get_memory_config", lambda: config)
+    monkeypatch.setattr(message_handler_module, "get_context_config", lambda: config)
     monkeypatch.setattr(
         agent_budget_module.AgentExecutionBudget,
         "from_config",

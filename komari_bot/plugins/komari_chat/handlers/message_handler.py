@@ -33,13 +33,17 @@ from komari_bot.onebot import (
     RedisFailureNotificationCooldown,
     image_failure_reason_code,
 )
-from komari_bot.plugins.komari_memory import MessageSchema, RedisManager
+from komari_bot.plugins.komari_context import (
+    MessageSchema,
+    RecentContextStore,
+    get_context_config,
+)
 from komari_bot.plugins.llm_provider.config_schema import DynamicConfigSchema
 
 from ..reply_fulfillment_domain import build_reply_fulfillment_id
 from ..services.admission_gate import effect_business_admitted
 from ..services.agent_budget import AgentExecutionBudget
-from ..services.config_interface import get_config, get_memory_config
+from ..services.config_interface import get_config
 from ..services.image_downloader import (
     download_images_as_base64_aligned,
     extract_image_sources,
@@ -247,7 +251,7 @@ class MessageHandler:
 
     def __init__(
         self,
-        redis: RedisManager,
+        redis: RecentContextStore,
         memory: MemoryService,
         reply_fulfillment: ReplyFulfillmentQueryProtocol,
         proactive_reservation: ProactiveReservationService,
@@ -579,9 +583,7 @@ class MessageHandler:
             # 表示不逐条刷群）。资格与重复事实由判定引擎的持久行拥有；设置/投递
             # 失败只记录安全诊断，绝不产生群错误、重试或第二条业务路径。
             try:
-                claimed = await decision_dispatch.claim_handoff(
-                    "failure_notification"
-                )
+                claimed = await decision_dispatch.claim_handoff("failure_notification")
             except Exception:
                 claimed = False
                 logger.error("[KomariChat] 判定失败通知资格领取异常")
@@ -594,14 +596,11 @@ class MessageHandler:
             notify_superusers = False
             chat_enabled = False
             try:
-                memory_config = get_memory_config()
-                notify_superusers = bool(memory_config.error_notify_enabled)
-                chat_enabled = bool(memory_config.plugin_enable)
+                notify_superusers = bool(get_context_config().error_notify_enabled)
+                chat_enabled = bool(get_config().plugin_enable)
             except Exception:
                 # 读取失败只静默私聊诊断（不打印原始异常，避免泄漏运行环境细节）。
-                logger.debug(
-                    "[KomariChat] 失败通知配置读取失败，静默 SUPERUSER 私聊"
-                )
+                logger.debug("[KomariChat] 失败通知配置读取失败，静默 SUPERUSER 私聊")
             if notify_superusers:
                 try:
                     # 通知前最后复检：聊天功能开关与目标群 BUSINESS 准入。
@@ -628,9 +627,7 @@ class MessageHandler:
                             ),
                         )
                     else:
-                        logger.debug(
-                            "[KomariChat] 判定失败通知复检未通过，保持静默"
-                        )
+                        logger.debug("[KomariChat] 判定失败通知复检未通过，保持静默")
                 except Exception:
                     logger.error("[KomariChat] 判定失败通知上报异常")
             return None
@@ -803,7 +800,7 @@ class MessageHandler:
         TSK-225：chat.reaction——表情 fire-and-forget 派发前按该群裁决；
         受限时在 ``asyncio.create_task`` 前同步判定并返回未派发，不启动回调。
         """
-        config = get_memory_config()
+        config = get_config()
         if (
             callback is None
             or not config.face_reaction_enabled
@@ -841,7 +838,7 @@ class MessageHandler:
         任务取消（CancelledError）继续向上传播，不吞没。
         """
         try:
-            notify_superusers = get_memory_config().error_notify_enabled
+            notify_superusers = get_context_config().error_notify_enabled
         except Exception:
             logger.exception(
                 "[KomariChat] 回复失败通知配置读取失败，静默 SUPERUSER 私聊"
@@ -866,7 +863,9 @@ class MessageHandler:
                 mapping_failed = True
                 # 不捕获 exc_info：本函数作用域可能持有 image_failure_summary，
                 # 避免任何含 URL/base64 的帧被写入日志（TSK-196 复审）。
-                logger.error("[KomariChat] 图片失败摘要→诊断映射失败，静默 SUPERUSER 私聊")
+                logger.error(
+                    "[KomariChat] 图片失败摘要→诊断映射失败，静默 SUPERUSER 私聊"
+                )
         try:
             notifier = GroupTaskFailureNotifier(
                 cooldown=RedisFailureNotificationCooldown(
@@ -932,11 +931,9 @@ class MessageHandler:
             diagnostic = _to_image_diagnostic(summary)
             if diagnostic is None:
                 return
-            notify_superusers = get_memory_config().error_notify_enabled
+            notify_superusers = get_context_config().error_notify_enabled
         except Exception:
-            logger.error(
-                "[KomariChat] 图片失败汇总配置/映射失败，静默 SUPERUSER 私聊"
-            )
+            logger.error("[KomariChat] 图片失败汇总配置/映射失败，静默 SUPERUSER 私聊")
             return
         try:
             notifier = GroupTaskFailureNotifier(
@@ -1008,7 +1005,7 @@ class MessageHandler:
         Returns:
             (recent_messages, interaction_records, stored)
         """
-        config = get_memory_config()
+        config = get_config()
         stored = False
 
         context_messages_limit = int(getattr(config, "context_messages_limit", 10))
@@ -1061,16 +1058,12 @@ class MessageHandler:
 
         不执行任何副作用：不写 Redis、不调好感度、不写互动历史、不设冷却。
         """
-        config = get_memory_config()
-        # TSK-192：任务起点从 komari_chat 配置冻结回复 Agent 执行预算，
-        # 普通 / debug / 简单三条入口共享同一份冻结快照；
-        # 任务中配置变更不影响当前任务，只作用于下一个任务。
-        # TSK-194 / ADR-0010：图片理解模式与下载预算同为任务级冻结值——
-        # 普通 / debug 入口都在此处读取一次；原生模式图片直接交给聊天模型
-        # 多模态输入，委托模式暴露 read_image 工具。
-        chat_config = get_config()
-        agent_budget = AgentExecutionBudget.from_config(chat_config)
-        image_policy = ImageUnderstandingPolicy.from_config(chat_config)
+        # TSK-192：任务起点从 komari_chat 配置冻结回复 Agent 执行预算、
+        # 图片理解/下载预算、上下文检索限制与生成槽位；普通 / debug / 简单
+        # 三条入口共享同一份冻结快照，任务中配置变更只作用于下一个任务。
+        config = get_config()
+        agent_budget = AgentExecutionBudget.from_config(config)
+        image_policy = ImageUnderstandingPolicy.from_config(config)
 
         # 查询重写（带 trace）
         if collector is not None:
@@ -1200,20 +1193,14 @@ class MessageHandler:
                 len(combined_sources), image_policy.download.max_images
             )
             native_download_failures = sum(
-                1
-                for image in aligned_images[:effective_total]
-                if image is None
+                1 for image in aligned_images[:effective_total] if image is None
             )
             reply_boundary = len(reply_sources)
             reply_image_urls = [
-                image
-                for image in aligned_images[:reply_boundary]
-                if image is not None
+                image for image in aligned_images[:reply_boundary] if image is not None
             ] or None
             base64_image_urls = [
-                image
-                for image in aligned_images[reply_boundary:]
-                if image is not None
+                image for image in aligned_images[reply_boundary:] if image is not None
             ] or None
             if effective_total > 0 and not reply_image_urls and not base64_image_urls:
                 # TSK-196 复审：不在此直接 raise（该 frame 仍持有 raw locals）；
@@ -1226,17 +1213,15 @@ class MessageHandler:
                 )
 
         if _image_failure_summary is None:
-            use_search_tool = bool(
-                komari_search_plugin.is_search_available()
-            )
-            use_fetch_tool = bool(
-                komari_search_plugin.is_fetch_available()
-            )
+            use_search_tool = bool(komari_search_plugin.is_search_available())
+            use_fetch_tool = bool(komari_search_plugin.is_fetch_available())
             allowed_profile_user_ids = {message.user_id}
             allowed_profile_user_ids.update(
                 item.user_id
                 for item in recent_messages
-                if not item.is_bot and item.group_id == message.group_id and item.user_id
+                if not item.is_bot
+                and item.group_id == message.group_id
+                and item.user_id
             )
             if (
                 reply_context is not None
@@ -1293,7 +1278,9 @@ class MessageHandler:
                 )
 
             try:
-                favorability = await user_data_plugin.get_user_favorability(message.user_id)
+                favorability = await user_data_plugin.get_user_favorability(
+                    message.user_id
+                )
             except Exception as exc:
                 logger.warning("[KomariChat] 获取当前好感度失败，终止本次回复: {}", exc)
                 raise _FavorabilityReadError(str(exc)) from exc
@@ -1327,7 +1314,10 @@ class MessageHandler:
                 fetch_tool_mode=use_fetch_tool,
             )
 
-            tools: list[dict[str, Any]] = [READ_PROFILE_TOOL, RECORD_FAVORABILITY_DELTA_TOOL]
+            tools: list[dict[str, Any]] = [
+                READ_PROFILE_TOOL,
+                RECORD_FAVORABILITY_DELTA_TOOL,
+            ]
             if use_vision_tool:
                 tools.append(READ_IMAGE_TOOL)
             if use_search_tool:
@@ -1464,7 +1454,7 @@ class MessageHandler:
             频控冷却/超限/重复等正常控制流返回 (None, False, None)。
         """
         config = get_config()
-        memory_config = get_memory_config()
+        context_config = get_context_config()
         reservation_id: str | None = None
         request_trace_id = f"chat-{message.message_id}"
 
@@ -1482,12 +1472,16 @@ class MessageHandler:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                return None, False, ReplyFailureInfo(
-                    stage="reserve",
-                    error_type=type(exc).__name__,
-                    summary=str(exc),
-                    request_trace_id=request_trace_id,
-                    reaction_sent=False,
+                return (
+                    None,
+                    False,
+                    ReplyFailureInfo(
+                        stage="reserve",
+                        error_type=type(exc).__name__,
+                        summary=str(exc),
+                        request_trace_id=request_trace_id,
+                        reaction_sent=False,
+                    ),
                 )
             if isinstance(reserve_result, ReservationDenied):
                 match reserve_result.reason:
@@ -1498,12 +1492,16 @@ class MessageHandler:
                     case "duplicate":
                         logger.debug("[KomariChat] 主动回复消息已预占或已送达")
                     case _:
-                        return None, False, ReplyFailureInfo(
-                            stage="reserve",
-                            error_type="UnknownReservationStatusError",
-                            summary=f"未知的主动回复预占状态: {reserve_result.reason}",
-                            request_trace_id=request_trace_id,
-                            reaction_sent=False,
+                        return (
+                            None,
+                            False,
+                            ReplyFailureInfo(
+                                stage="reserve",
+                                error_type="UnknownReservationStatusError",
+                                summary=f"未知的主动回复预占状态: {reserve_result.reason}",
+                                request_trace_id=request_trace_id,
+                                reaction_sent=False,
+                            ),
                         )
                 return None, False, None
             lease = reserve_result
@@ -1529,12 +1527,16 @@ class MessageHandler:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                return None, False, ReplyFailureInfo(
-                    stage="read_buffers",
-                    error_type=type(exc).__name__,
-                    summary=str(exc),
-                    request_trace_id=request_trace_id,
-                    reaction_sent=False,
+                return (
+                    None,
+                    False,
+                    ReplyFailureInfo(
+                        stage="read_buffers",
+                        error_type=type(exc).__name__,
+                        summary=str(exc),
+                        request_trace_id=request_trace_id,
+                        reaction_sent=False,
+                    ),
                 )
 
             # === 生成前贴出“生成中”表情（与生成并列，fire-and-forget） ===
@@ -1583,12 +1585,16 @@ class MessageHandler:
                     status="error",
                     error=exc,
                 )
-                return None, stored, ReplyFailureInfo(
-                    stage="generate",
-                    error_type=type(exc).__name__,
-                    summary=str(exc),
-                    request_trace_id=request_trace_id,
-                    reaction_sent=reaction_sent,
+                return (
+                    None,
+                    stored,
+                    ReplyFailureInfo(
+                        stage="generate",
+                        error_type=type(exc).__name__,
+                        summary=str(exc),
+                        request_trace_id=request_trace_id,
+                        reaction_sent=reaction_sent,
+                    ),
                 )
             except Exception as exc:
                 await agent_run_logger_plugin.finalize_collector(
@@ -1596,16 +1602,20 @@ class MessageHandler:
                     status="error",
                     error=exc,
                 )
-                return None, stored, ReplyFailureInfo(
-                    stage="generate",
-                    error_type=type(exc).__name__,
-                    summary=str(exc),
-                    request_trace_id=request_trace_id,
-                    reaction_sent=reaction_sent,
-                    image_failure_summary=(
-                        exc.summary
-                        if isinstance(exc, ImageUnderstandingFailureError)
-                        else None
+                return (
+                    None,
+                    stored,
+                    ReplyFailureInfo(
+                        stage="generate",
+                        error_type=type(exc).__name__,
+                        summary=str(exc),
+                        request_trace_id=request_trace_id,
+                        reaction_sent=reaction_sent,
+                        image_failure_summary=(
+                            exc.summary
+                            if isinstance(exc, ImageUnderstandingFailureError)
+                            else None
+                        ),
                     ),
                 )
             else:
@@ -1622,22 +1632,30 @@ class MessageHandler:
                     message.group_id,
                     reason,
                 )
-                return None, stored, ReplyFailureInfo(
-                    stage="generate",
-                    error_type="EmptyReplyError",
-                    summary="LLM 返回空回复",
-                    request_trace_id=request_trace_id,
-                    reaction_sent=reaction_sent,
+                return (
+                    None,
+                    stored,
+                    ReplyFailureInfo(
+                        stage="generate",
+                        error_type="EmptyReplyError",
+                        summary="LLM 返回空回复",
+                        request_trace_id=request_trace_id,
+                        reaction_sent=reaction_sent,
+                    ),
                 )
 
             if reply_result.favorability_delta is None:
                 logger.warning("[KomariChat] 回复缺少好感度变化记录，按生成失败处理")
-                return None, stored, ReplyFailureInfo(
-                    stage="generate",
-                    error_type="FavorabilityDeltaMissingError",
-                    summary="回复缺少好感度变化记录",
-                    request_trace_id=request_trace_id,
-                    reaction_sent=reaction_sent,
+                return (
+                    None,
+                    stored,
+                    ReplyFailureInfo(
+                        stage="generate",
+                        error_type="FavorabilityDeltaMissingError",
+                        summary="回复缺少好感度变化记录",
+                        request_trace_id=request_trace_id,
+                        reaction_sent=reaction_sent,
+                    ),
                 )
 
             # === 生成完成：内联一次续租裁决，成功后才移交窄凭据 ===
@@ -1648,22 +1666,30 @@ class MessageHandler:
                     logger.warning(
                         "[KomariChat] 主动回复生成完成时预占租约已丢失，取消发送"
                     )
-                    return None, stored, ReplyFailureInfo(
-                        stage="generate",
-                        error_type="ProactiveReservationLostError",
-                        summary="生成完成时主动回复预占租约已丢失",
-                        request_trace_id=request_trace_id,
-                        reaction_sent=reaction_sent,
+                    return (
+                        None,
+                        stored,
+                        ReplyFailureInfo(
+                            stage="generate",
+                            error_type="ProactiveReservationLostError",
+                            summary="生成完成时主动回复预占租约已丢失",
+                            request_trace_id=request_trace_id,
+                            reaction_sent=reaction_sent,
+                        ),
                     )
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    return None, stored, ReplyFailureInfo(
-                        stage="generate",
-                        error_type=type(exc).__name__,
-                        summary=str(exc),
-                        request_trace_id=request_trace_id,
-                        reaction_sent=reaction_sent,
+                    return (
+                        None,
+                        stored,
+                        ReplyFailureInfo(
+                            stage="generate",
+                            error_type=type(exc).__name__,
+                            summary=str(exc),
+                            request_trace_id=request_trace_id,
+                            reaction_sent=reaction_sent,
+                        ),
                     )
             else:
                 handoff = None
@@ -1679,7 +1705,7 @@ class MessageHandler:
                 message=message,
                 reply_result=reply_result,
                 force_reply=force_reply,
-                bot_nickname=memory_config.bot_nickname,
+                bot_nickname=context_config.bot_nickname,
                 bot_self_id=bot_self_id,
                 adapter_name=adapter_name,
                 reason=reason,

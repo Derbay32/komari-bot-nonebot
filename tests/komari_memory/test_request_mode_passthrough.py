@@ -17,17 +17,16 @@ from typing import Any, cast
 import nonebot.plugin
 import pytest
 
+from komari_bot.context.redis_store import MessageSchema
 from komari_bot.plugins.komari_memory.config_schema import KomariMemoryConfigSchema
 from komari_bot.plugins.komari_memory.services import llm_service as llm_service_module
 from komari_bot.plugins.komari_memory.services.llm_service import (
     summarize_conversation,
 )
-from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
 
 
 def _make_config(**overrides: Any) -> KomariMemoryConfigSchema:
     base: dict[str, Any] = {
-        "bot_nickname": "小鞠知花",
         "llm_model_summary": "summary-model",
         "llm_temperature_summary": 0.3,
         "llm_max_tokens_summary": 2048,
@@ -58,6 +57,7 @@ def _make_message(
 
 async def _run_summarize(**kwargs: Any) -> Any:
     """await 重试装饰器包装后的 summarize_conversation（Awaitable 转协程）。"""
+    kwargs.setdefault("bot_nickname", "小鞠知花")
     return await summarize_conversation(**kwargs)
 
 
@@ -128,7 +128,10 @@ def test_summary_tool_calling_layer_passes_summary_slot_request_mode(
                 function=SimpleNamespace(name="output_summary_result"),
                 parsed_arguments={
                     "memories": [
-                        {"content": "工具调用生成了一条大家约好周末一起吃拉面", "importance": 4}
+                        {
+                            "content": "工具调用生成了一条大家约好周末一起吃拉面",
+                            "importance": 4,
+                        }
                     ]
                 },
             )
@@ -220,7 +223,11 @@ def test_summary_direct_output_layer_passes_summary_slot_request_mode(
     monkeypatch: Any,
 ) -> None:
     direct_payload = json.dumps(
-        {"memories": [{"content": "直接输出的大家约好周末一起吃拉面", "importance": 3}]},
+        {
+            "memories": [
+                {"content": "直接输出的大家约好周末一起吃拉面", "importance": 3}
+            ]
+        },
         ensure_ascii=False,
     )
     fake_provider = _RecordingLLMProvider(["__raise__", "__raise__", direct_payload])
@@ -343,7 +350,9 @@ def _load_profile_agent_service(monkeypatch: Any) -> Any:
         if name == "llm_provider"
         else object(),
     )
-    sys.modules.pop("komari_bot.plugins.komari_memory.agent.profile_agent_service", None)
+    sys.modules.pop(
+        "komari_bot.plugins.komari_memory.agent.profile_agent_service", None
+    )
     return importlib.import_module(
         "komari_bot.plugins.komari_memory.agent.profile_agent_service"
     )
@@ -407,7 +416,9 @@ def test_profile_agent_passes_summary_slot_request_mode(monkeypatch: Any) -> Non
         return _final_completion()
 
     monkeypatch.setattr(
-        module, "llm_provider", SimpleNamespace(generate_messages_completion=_fake_completion)
+        module,
+        "llm_provider",
+        SimpleNamespace(generate_messages_completion=_fake_completion),
     )
 
     class _Staging:
@@ -446,7 +457,9 @@ def test_profile_agent_plain_mode_keeps_auto_tool_choice(monkeypatch: Any) -> No
         return _final_completion()
 
     monkeypatch.setattr(
-        module, "llm_provider", SimpleNamespace(generate_messages_completion=_fake_completion)
+        module,
+        "llm_provider",
+        SimpleNamespace(generate_messages_completion=_fake_completion),
     )
 
     class _Staging:
@@ -487,7 +500,9 @@ def test_profile_agent_thinking_mode_omits_tool_choice(monkeypatch: Any) -> None
         return _final_completion()
 
     monkeypatch.setattr(
-        module, "llm_provider", SimpleNamespace(generate_messages_completion=_fake_completion)
+        module,
+        "llm_provider",
+        SimpleNamespace(generate_messages_completion=_fake_completion),
     )
 
     class _Staging:
@@ -541,7 +556,9 @@ def test_profile_agent_attaches_continuation_to_assistant_message(
         return completions.pop(0)
 
     monkeypatch.setattr(
-        module, "llm_provider", SimpleNamespace(generate_messages_completion=_fake_completion)
+        module,
+        "llm_provider",
+        SimpleNamespace(generate_messages_completion=_fake_completion),
     )
 
     class _Staging:
@@ -572,8 +589,7 @@ def test_profile_agent_attaches_continuation_to_assistant_message(
     assistant_with_continuation = [
         message
         for message in second_round_messages
-        if message.get("role") == "assistant"
-        and CONTINUATION_METADATA_KEY in message
+        if message.get("role") == "assistant" and CONTINUATION_METADATA_KEY in message
     ]
     assert len(assistant_with_continuation) == 1
     assert assistant_with_continuation[0][CONTINUATION_METADATA_KEY] == {

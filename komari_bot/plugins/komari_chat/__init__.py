@@ -10,6 +10,7 @@ from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
 from nonebot.plugin import PluginMetadata, require
 from nonebot.typing import T_State
 
+from komari_bot.db.orm_connection import get_shared_orm_connection_pool
 from komari_bot.decision.dispatch import DecisionDispatchUnavailableError
 from komari_bot.onebot.onebot_rules import group_message_rule
 
@@ -40,11 +41,13 @@ from .services.reply_fulfillment_workflow import (
 # 依赖插件
 require("embedding_provider")
 require("user_ban")
+require("komari_context")
 require("komari_memory")
 require("komari_decision")
 require("user_data")
 require("group_admission")
 
+from komari_bot.plugins import komari_context as context_plugin
 from komari_bot.plugins import komari_memory as memory_plugin
 from komari_bot.plugins import user_ban as user_ban_plugin
 from komari_bot.plugins import user_data as user_data_plugin
@@ -52,18 +55,18 @@ from komari_bot.plugins.group_admission import (
     AdmissionQualification,
     adjudicate,
 )
-
-get_memory_plugin_manager = memory_plugin.get_plugin_manager
+from komari_bot.plugins.komari_chat.services.config_interface import get_config
+from komari_bot.plugins.komari_context import get_context_config
 
 
 def _get_reply_fulfillment_config() -> Any:
-    """合并聊天配置与记忆配置中履约需要的只读字段。"""
+    """Read fulfillment policy from its actual chat/context owners."""
     config = get_config()
-    memory_config = get_memory_config()
+    context_config = get_context_config()
     return SimpleNamespace(
         proactive_cooldown=config.proactive_cooldown,
-        global_interaction_enabled=memory_config.global_interaction_enabled,
-        global_interaction_trigger_size=memory_config.global_interaction_trigger_size,
+        global_interaction_enabled=context_config.global_interaction_enabled,
+        global_interaction_trigger_size=context_config.global_interaction_trigger_size,
         reply_fulfillment_lease_seconds=config.reply_fulfillment_lease_seconds,
         reply_fulfillment_max_attempts=config.reply_fulfillment_max_attempts,
         reply_fulfillment_retry_base_seconds=config.reply_fulfillment_retry_base_seconds,
@@ -77,10 +80,7 @@ def _get_reply_fulfillment_config() -> Any:
         ),
     )
 
-from komari_bot.plugins.komari_chat.services.config_interface import (
-    get_config,
-    get_memory_config,
-)
+
 from komari_bot.plugins.komari_decision import (
     get_decision_dispatch,
     get_decision_engine,
@@ -97,41 +97,41 @@ matcher = on_message(rule=group_message_rule(), priority=10, block=False)
 _handler: MessageHandler | None = None
 _handler_workflow: ReplyFulfillmentWorkflow | None = None
 _reply_fulfillment: ReplyFulfillmentWorkflow | None = None
-_reply_fulfillment_components: tuple[Any, Any, Any] | None = None
+_reply_fulfillment_components: tuple[Any, Any] | None = None
 _reply_fulfillment_ops: ReplyFulfillmentOpsService | None = None
 _reply_fulfillment_ops_components: tuple[Any, Any] | None = None
 _reply_fulfillment_worker_task: asyncio.Task[None] | None = None
 
 
 def _resolve_runtime_components() -> tuple[Any, Any, Any] | None:
-    memory_manager = get_memory_plugin_manager()
-    if (
-        memory_manager is None
-        or memory_manager.redis is None
-        or memory_manager.memory is None
-    ):
-        return None
+    """Resolve the ordinary reply generation boundary.
+
+    Reply generation still needs recent context, old memory, and the decision
+    engine at this intermediate stage.
+    """
+    context_store = context_plugin.get_context_store()
+    memory_service = memory_plugin.get_memory_service()
     decision_engine = get_decision_engine()
-    if decision_engine is None:
+    if context_store is None or memory_service is None or decision_engine is None:
         return None
-    return memory_manager.redis, memory_manager.memory, decision_engine
+    return context_store, memory_service, decision_engine
+
+
+def _resolve_fulfillment_components() -> tuple[Any, Any] | None:
+    """Resolve the fulfillment boundary without old-memory/decision readiness.
+
+    Fulfillment recovery and ops need only the context Redis store and the
+    nonebot-plugin-orm shared engine.
+    """
+    context_store = context_plugin.get_context_store()
+    if context_store is None:
+        return None
+    return context_store, get_shared_orm_connection_pool()
 
 
 def _resolve_ops_components() -> tuple[Any, Any] | None:
-    """履约运维的窄运行时边界：只依赖 PostgreSQL 与 Redis。
-
-    判定引擎只服务聊天判定与旧 workflow 的 gating，运维对账不需要它；
-    本边界不触碰 ``_resolve_runtime_components`` 的 decision-engine
-    gating，避免影响 handler / legacy workflow 既有就绪语义。
-    """
-    memory_manager = get_memory_plugin_manager()
-    if (
-        memory_manager is None
-        or memory_manager.redis is None
-        or memory_manager.memory is None
-    ):
-        return None
-    return memory_manager.redis, memory_manager.memory
+    """履约运维的窄运行时边界：只依赖 PostgreSQL 与 Redis。"""
+    return _resolve_fulfillment_components()
 
 
 def _get_or_build_handler() -> MessageHandler | None:
@@ -144,6 +144,8 @@ def _get_or_build_handler() -> MessageHandler | None:
     if (
         _handler is not None
         and _handler.decision_engine is decision_engine
+        and _handler.redis is redis
+        and _handler.memory is memory
         and _handler_workflow is _reply_fulfillment
         and _reply_fulfillment is not None
     ):
@@ -157,6 +159,8 @@ def _get_or_build_handler() -> MessageHandler | None:
         _handler is None
         or _handler_workflow is not workflow
         or _handler.decision_engine is not decision_engine
+        or _handler.redis is not redis
+        or _handler.memory is not memory
     ):
         _handler = MessageHandler(
             redis=redis,
@@ -177,9 +181,7 @@ def _get_recovery_senders() -> dict[tuple[str, str], ReplySender]:
     的隐式事件上下文。
     """
     return {
-        (str(bot.self_id), str(bot.type)): cast(
-            "ReplySender", OneBotReplySender(bot)
-        )
+        (str(bot.self_id), str(bot.type)): cast("ReplySender", OneBotReplySender(bot))
         for bot in get_bots().values()
     }
 
@@ -188,10 +190,10 @@ def _get_or_build_reply_fulfillment() -> ReplyFulfillmentWorkflow | None:
     """构建并缓存回复履约工作流及其私有持久化 adapter。"""
     global _reply_fulfillment, _reply_fulfillment_components  # noqa: PLW0603
 
-    components = _resolve_runtime_components()
+    components = _resolve_fulfillment_components()
     if components is None:
         return None
-    redis, memory, _decision_engine = components
+    redis, pg_pool = components
 
     current_components = _reply_fulfillment_components
     same_components = current_components is not None and all(
@@ -199,10 +201,10 @@ def _get_or_build_reply_fulfillment() -> ReplyFulfillmentWorkflow | None:
         for current, actual in zip(current_components, components, strict=True)
     )
     if _reply_fulfillment is None or not same_components:
-        redis_client = getattr(redis, "redis", redis)
+        redis_client = redis.redis
         proactive_reservation = ProactiveReservationService(redis_client)
         _reply_fulfillment = build_reply_fulfillment_workflow(
-            pg_pool=memory.pg_pool,
+            pg_pool=pg_pool,
             redis=redis,
             proactive_reservation=proactive_reservation,
             user_data=user_data_plugin,
@@ -232,7 +234,7 @@ def get_reply_fulfillment_ops_service() -> ReplyFulfillmentOpsService | None:
     components = _resolve_ops_components()
     if components is None:
         return None
-    redis, memory = components
+    redis, pg_pool = components
 
     current_components = _reply_fulfillment_ops_components
     same_components = current_components is not None and all(
@@ -240,9 +242,9 @@ def get_reply_fulfillment_ops_service() -> ReplyFulfillmentOpsService | None:
         for current, actual in zip(current_components, components, strict=True)
     )
     if _reply_fulfillment_ops is None or not same_components:
-        redis_client = getattr(redis, "redis", redis)
+        redis_client = redis.redis
         _reply_fulfillment_ops = build_reply_fulfillment_ops_service(
-            pg_pool=memory.pg_pool,
+            pg_pool=pg_pool,
             redis_client=redis_client,
         )
         _reply_fulfillment_ops_components = components
@@ -293,7 +295,7 @@ driver.on_shutdown(_stop_reply_fulfillment_worker)
 
 async def _send_face_reaction(bot: Bot, event: GroupMessageEvent) -> None:
     """在开始生成回复时，对触发消息添加表情反应（提示“正在生成”）。"""
-    config = get_memory_config()
+    config = get_config()
     if not config.face_reaction_enabled or not config.face_reaction_id:
         return
 
@@ -378,7 +380,7 @@ async def handle_group_message(  # noqa: PLR0911 - 每个入口门禁都是独�
     state: T_State,
 ) -> None:
     """处理群聊消息。"""
-    config = get_memory_config()
+    config = get_config()
     if not config.plugin_enable:
         return
 
@@ -479,9 +481,7 @@ async def handle_group_message(  # noqa: PLR0911 - 每个入口门禁都是独�
                     else None
                 ),
                 reaction_sent=(
-                    pending_reply.reaction_sent
-                    if pending_reply is not None
-                    else False
+                    pending_reply.reaction_sent if pending_reply is not None else False
                 ),
             ),
             reason=pending_reply.reason if pending_reply is not None else None,

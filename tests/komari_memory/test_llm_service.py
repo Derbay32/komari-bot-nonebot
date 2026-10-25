@@ -5,10 +5,10 @@ import json
 from types import SimpleNamespace
 from typing import Any
 
+from komari_bot.context.redis_store import MessageSchema
 from komari_bot.plugins.komari_memory.config_schema import KomariMemoryConfigSchema
 from komari_bot.plugins.komari_memory.services import llm_service as llm_service_module
 from komari_bot.plugins.komari_memory.services.llm_service import summarize_conversation
-from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
 from tests.config.prompt_field_contract import prompt_marker_values
 
 
@@ -48,7 +48,10 @@ class _ToolFakeLLMProvider(_FakeLLMProvider):
                     function=SimpleNamespace(name="output_summary_result"),
                     parsed_arguments={
                         "memories": [
-                            {"content": "工具调用生成了一条有效总结记忆", "importance": 4}
+                            {
+                                "content": "工具调用生成了一条有效总结记忆",
+                                "importance": 4,
+                            }
                         ]
                     },
                 )
@@ -58,7 +61,6 @@ class _ToolFakeLLMProvider(_FakeLLMProvider):
 
 def _make_config(**overrides: Any) -> KomariMemoryConfigSchema:
     base = {
-        "bot_nickname": "小鞠知花",
         "llm_model_summary": "summary-model",
         "llm_temperature_summary": 0.3,
         "llm_max_tokens_summary": 2048,
@@ -97,6 +99,7 @@ async def _run_summarize_conversation(
         config=config,
         participants=participants or ["10001"],
         display_name_map=display_name_map or {"10001": "阿明"},
+        bot_nickname="小鞠知花",
     )
 
 
@@ -104,7 +107,11 @@ def test_summarize_conversation_uses_json_mode_messages(monkeypatch: Any) -> Non
     fake_provider = _FakeLLMProvider(
         [
             json.dumps(
-                {"memories": [{"content": "大家约好周末一起吃拉面。", "importance": 4}]},
+                {
+                    "memories": [
+                        {"content": "大家约好周末一起吃拉面。", "importance": 4}
+                    ]
+                },
                 ensure_ascii=False,
             )
         ]
@@ -134,7 +141,9 @@ def test_summarize_conversation_uses_json_mode_messages(monkeypatch: Any) -> Non
         )
     )
 
-    assert result == {"memories": [{"content": "大家约好周末一起吃拉面。", "importance": 4}]}
+    assert result == {
+        "memories": [{"content": "大家约好周末一起吃拉面。", "importance": 4}]
+    }
     assert len(fake_provider.messages_calls) == 1
     call = fake_provider.messages_calls[0]
     assert call["response_format"] == {"type": "json_object"}
@@ -212,11 +221,18 @@ def test_normalize_summary_result_filters_and_limits_memories() -> None:
     )
 
     assert len(normalized["memories"]) == 8
-    assert normalized["memories"][0] == {"content": "这是一条有效的总结记忆", "importance": 5}
-    assert all(set(memory) == {"content", "importance"} for memory in normalized["memories"])
+    assert normalized["memories"][0] == {
+        "content": "这是一条有效的总结记忆",
+        "importance": 5,
+    }
+    assert all(
+        set(memory) == {"content", "importance"} for memory in normalized["memories"]
+    )
 
 
-def test_build_summary_messages_keeps_profile_agent_user_prefix(monkeypatch: Any) -> None:
+def test_build_summary_messages_keeps_profile_agent_user_prefix(
+    monkeypatch: Any,
+) -> None:
     async def _template() -> dict[str, str]:
         return {
             "memory_summary_common_system": "共用系统提示",
@@ -275,19 +291,3 @@ def test_build_summary_messages_does_not_truncate_valid_chunk_after_twelve_thous
 
     assert tail_canary in messages[1]["content"]
     assert 'truncated="false"' in messages[1]["content"]
-
-
-def test_generate_reply_marks_memory_reply_phase(monkeypatch: Any) -> None:
-    fake_provider = _FakeLLMProvider(["<content>记忆回复</content>"])
-    monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
-
-    async def _run() -> str:
-        return await llm_service_module.generate_reply(
-            config=_make_config(response_tag="content"),
-            messages=[{"role": "user", "content": "你好"}],
-        )
-
-    result = asyncio.run(_run())
-
-    assert result == "记忆回复"
-    assert fake_provider.messages_calls[0]["request_phase"] == "memory_reply"

@@ -2,7 +2,7 @@
 
 覆盖契约要求的数据库侧证据：
 
-1. 全新库 ``upgrade head`` 停在 0025，四张场景表不存在，判定配置表只剩
+1. 全新库 ``upgrade head`` 停在 0027（0025 退役后），四张场景表不存在，判定配置表只剩
    3 个存储字段 + 13 个保留字段，且 ``orm_bootstrap check`` 零漂移；
 2. 0024 存量库（四表按链接关系写入真实数据 + 两行判定配置：显式关闭与
    显式开启）升级后**只有**四表与 38 个字段消失，其他 schema 对象、其他
@@ -332,10 +332,12 @@ async def test_populated_0024_upgrade_retires_only_scene_storage() -> None:
                 await connection.fetchval("SELECT version_num FROM alembic_version")
                 == HEAD_REVISION
             )
-            # 1. 恰好那四张表消失，其余表一个不少
+            # 1. 四张退役表消失；0026 新增的 context 表属于后续契约。
             after_tables = await _public_tables(connection)
-            assert after_tables == before_tables - set(RETIRED_TABLES)
-            # 2. 其余 schema 对象逐列不变（列名/类型/可空/默认值）
+            assert after_tables == (before_tables - set(RETIRED_TABLES)) | {
+                "komari_context_config"
+            }
+            # 2. 历史表逐列不变；chat 既有列前缀不变并允许 0027 追加列。
             after_schema = await _schema_snapshot(connection)
             expected_schema = {
                 table: definition
@@ -347,6 +349,22 @@ async def test_populated_0024_upgrade_retires_only_scene_storage() -> None:
                 for definition in before_schema[DECISION_CONFIG_TABLE]
                 if definition[0] not in set(RETIRED_DECISION_CONFIG_FIELDS)
             )
+            # 0026/0027 迁移把 memory 的 Redis 与 chat/context 字段迁出；
+            # 历史列只要仍存在就必须保持原定义。
+            memory_table = "komari_memory_config"
+            surviving_memory_columns = {
+                definition[0] for definition in after_schema[memory_table]
+            }
+            expected_schema[memory_table] = tuple(
+                definition
+                for definition in before_schema[memory_table]
+                if definition[0] in surviving_memory_columns
+            )
+            chat_table = "komari_chat_config"
+            chat_prefix = expected_schema.pop(chat_table)
+            after_chat_schema = after_schema.pop(chat_table)
+            assert after_chat_schema[: len(chat_prefix)] == chat_prefix
+            assert after_schema.pop("komari_context_config") is not None
             assert after_schema == expected_schema
             # 3. 判定配置表恰好少 38 列，剩下的就是存储 + 保留字段
             after_config_columns = await _columns(connection, DECISION_CONFIG_TABLE)
@@ -365,8 +383,9 @@ async def test_populated_0024_upgrade_retires_only_scene_storage() -> None:
                 assert after_config[row_id]["updated_at"] == before_row["updated_at"]
             assert after_config[1]["plugin_enable"] is False
             assert after_config[2]["plugin_enable"] is True
-            # 5. 兄弟配置表数据不变
-            assert await _first_chat_row(connection) == before_chat
+            # 5. 兄弟配置表既有列数据不变（0027 追加字段另行验收）
+            after_chat = await _first_chat_row(connection)
+            assert {key: after_chat[key] for key in before_chat} == before_chat
             assert await connection.fetchval(
                 "SELECT count(*) FROM komari_decision_config"
             ) == len(before_config)

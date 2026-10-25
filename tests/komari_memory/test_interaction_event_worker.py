@@ -129,13 +129,23 @@ class _FakeMemory:
         return event_id
 
 
-def _patch_config(monkeypatch: Any) -> None:
+def _patch_config(
+    monkeypatch: Any,
+    *,
+    global_interaction_enabled: bool = True,
+) -> None:
     monkeypatch.setattr(
         worker_module,
         "get_config",
         lambda: SimpleNamespace(
-            global_interaction_enabled=True,
             global_interaction_processing_lease_seconds=120,
+        ),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "get_context_config",
+        lambda: SimpleNamespace(
+            global_interaction_enabled=global_interaction_enabled,
         ),
     )
 
@@ -148,7 +158,9 @@ def test_duplicate_snapshot_is_stored_only_once(monkeypatch: Any) -> None:
 
     async def _summarize(**kwargs: Any) -> SimpleNamespace:
         summarize_calls.append(str(kwargs["user_id"]))
-        return SimpleNamespace(event_summary="阿明分享轻小说并得到认真回应。", importance=4)
+        return SimpleNamespace(
+            event_summary="阿明分享轻小说并得到认真回应。", importance=4
+        )
 
     monkeypatch.setattr(worker_module, "summarize_interaction_events", _summarize)
 
@@ -247,9 +259,13 @@ def test_disabled_interaction_worker_is_registered_dormant_for_hot_enable(
         worker_module,
         "get_config",
         lambda: SimpleNamespace(
-            global_interaction_enabled=False,
             global_interaction_summary_interval_minutes=3,
         ),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "get_context_config",
+        lambda: SimpleNamespace(global_interaction_enabled=False),
     )
 
     worker_module.register_interaction_event_task(

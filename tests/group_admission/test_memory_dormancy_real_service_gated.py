@@ -47,10 +47,8 @@ async def test_ac4_dormancy_freezes_snapshot_ttl_real_redis(
         pytest.skip("未配置真实 Redis")
     import redis.asyncio as aioredis
 
-    from komari_bot.plugins.komari_memory.services.redis_manager import (
-        MessageSchema,
-        RedisManager,
-    )
+    from komari_bot.context.redis_store import MessageSchema
+    from komari_bot.plugins.komari_memory.services.redis_manager import RedisManager
 
     client = aioredis.from_url(REDIS_URL, decode_responses=True)
     group_id = f"tsk230-{uuid4().hex[:10]}"
@@ -62,8 +60,7 @@ async def test_ac4_dormancy_freezes_snapshot_ttl_real_redis(
         from komari_bot.plugins.komari_memory.services import redis_manager as rm
 
         monkeypatch.setattr(rm, "get_config", lambda: cfg)
-        mgr = RedisManager(cfg)  # type: ignore[arg-type] -- 真实连接配置简化
-        mgr._redis = client
+        mgr = RedisManager(client)
         await client.flushdb()
         msg = MessageSchema(
             user_id="u1",
@@ -101,10 +98,8 @@ async def test_ac4_resume_restores_remaining_time_not_reset_to_full(
         pytest.skip("未配置真实 Redis")
     import redis.asyncio as aioredis
 
-    from komari_bot.plugins.komari_memory.services.redis_manager import (
-        MessageSchema,
-        RedisManager,
-    )
+    from komari_bot.context.redis_store import MessageSchema
+    from komari_bot.plugins.komari_memory.services.redis_manager import RedisManager
 
     client = aioredis.from_url(REDIS_URL, decode_responses=True)
     group_id = f"tsk230b-{uuid4().hex[:10]}"
@@ -116,8 +111,7 @@ async def test_ac4_resume_restores_remaining_time_not_reset_to_full(
         from komari_bot.plugins.komari_memory.services import redis_manager as rm
 
         monkeypatch.setattr(rm, "get_config", lambda: cfg)
-        mgr = RedisManager(cfg)  # type: ignore[arg-type] -- 真实连接配置简化
-        mgr._redis = client
+        mgr = RedisManager(client)
         await client.flushdb()
         msg = MessageSchema(
             user_id="u1",
@@ -163,10 +157,8 @@ async def test_ac9_fresh_process_restores_real_redis_and_writes_no_lkg(
         pytest.skip("未配置真实 Redis")
     import redis.asyncio as aioredis
 
-    from komari_bot.plugins.komari_memory.services.redis_manager import (
-        MessageSchema,
-        RedisManager,
-    )
+    from komari_bot.context.redis_store import MessageSchema
+    from komari_bot.plugins.komari_memory.services.redis_manager import RedisManager
 
     cfg = SimpleNamespace(
         conversation_processing_lease_seconds=60,
@@ -179,8 +171,7 @@ async def test_ac9_fresh_process_restores_real_redis_and_writes_no_lkg(
     group_id = f"tsk230a-{uuid4().hex[:10]}"
     try:
         await client.flushdb()
-        proc_a = RedisManager(cfg)  # type: ignore[arg-type] -- 真实连接配置简化
-        proc_a._redis = client
+        proc_a = RedisManager(client)
         msg = MessageSchema(
             user_id="u1",
             user_nickname="阿明",
@@ -195,8 +186,7 @@ async def test_ac9_fresh_process_restores_real_redis_and_writes_no_lkg(
         key = _processing_key(group_id, "toka")
 
         # 进程 B：全新实例（无进程内状态），从 Redis 读回同一快照。
-        proc_b = RedisManager(cfg)  # type: ignore[arg-type] -- 真实连接配置简化
-        proc_b._redis = client
+        proc_b = RedisManager(client)
         got = await proc_b.get_processing_conversation_buffer(
             group_id, key, "owner-a"
         )

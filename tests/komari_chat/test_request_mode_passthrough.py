@@ -7,8 +7,12 @@ from importlib import import_module
 from types import SimpleNamespace
 from typing import Any
 
-llm_service_module = import_module("komari_bot.plugins.komari_chat.services.llm_service")
-vision_service_module = import_module("komari_bot.plugins.komari_chat.services.vision_service")
+llm_service_module = import_module(
+    "komari_bot.plugins.komari_chat.services.llm_service"
+)
+vision_service_module = import_module(
+    "komari_bot.plugins.komari_chat.services.vision_service"
+)
 query_rewrite_module = import_module(
     "komari_bot.plugins.komari_chat.services.query_rewrite_service"
 )
@@ -132,7 +136,6 @@ def _build_real_reading_session(
         vision_reasoning_effort=vision_reasoning_effort,
     )
     return session, read_images_calls
-
 
 
 def _tool_call(
@@ -275,7 +278,9 @@ def test_tool_loop_read_image_tool_forwards_vision_mode(monkeypatch: Any) -> Non
     provider.completions = [
         base_client_module.LLMCompletionResultSchema(
             content="",
-            tool_calls=[_tool_call("read_image", '{"image_index": 0}', {"image_index": 0})],
+            tool_calls=[
+                _tool_call("read_image", '{"image_index": 0}', {"image_index": 0})
+            ],
             finish_reason="tool_calls",
         ),
         _final_response_completion(),
@@ -347,9 +352,7 @@ def test_tool_loop_freezes_request_mode_across_rounds(monkeypatch: Any) -> None:
         config.llm_stream_enabled_chat = False
         return await original_execute(**kwargs)
 
-    monkeypatch.setattr(
-        llm_service_module, "_execute_business_tool", _mutating_execute
-    )
+    monkeypatch.setattr(llm_service_module, "_execute_business_tool", _mutating_execute)
 
     asyncio.run(
         llm_service_module.generate_reply_with_tools(
@@ -378,7 +381,9 @@ def test_tool_loop_attaches_continuation_to_assistant_message(monkeypatch: Any) 
     provider.completions = [
         base_client_module.LLMCompletionResultSchema(
             content="",
-            tool_calls=[_tool_call("read_image", '{"image_index": 0}', {"image_index": 0})],
+            tool_calls=[
+                _tool_call("read_image", '{"image_index": 0}', {"image_index": 0})
+            ],
             finish_reason="tool_calls",
             continuation=continuation,
         ),
@@ -452,13 +457,11 @@ def test_tool_loop_no_tool_retry_discards_content_and_continuation(
         message for message in second_round_messages if message["role"] == "assistant"
     ]
     assert assistant_messages == [], "裸文本轮不得作为 assistant 消息进入下一轮"
-    assert not any(
-        CONTINUATION_KEY in message for message in second_round_messages
-    ), "裸文本 continuation 不得进入下一轮 request messages"
+    assert not any(CONTINUATION_KEY in message for message in second_round_messages), (
+        "裸文本 continuation 不得进入下一轮 request messages"
+    )
     correction = [
-        message
-        for message in second_round_messages
-        if message.get("role") == "user"
+        message for message in second_round_messages if message.get("role") == "user"
     ]
     assert correction, "裸文本轮后必须追加代码拥有的短纠错 user 指令"
     assert "必须调用" in str(correction[-1].get("content", ""))
@@ -493,9 +496,9 @@ def test_tool_loop_empty_content_retry_discards_continuation(
 
     assert len(provider.completion_calls) == 2
     second_round_messages = provider.completion_calls[1]["messages"]
-    assert not any(
-        CONTINUATION_KEY in message for message in second_round_messages
-    ), "空内容无工具轮的 continuation 不得进入下一轮"
+    assert not any(CONTINUATION_KEY in message for message in second_round_messages), (
+        "空内容无工具轮的 continuation 不得进入下一轮"
+    )
 
 
 def test_tool_loop_discards_reasoning_content_of_no_tool_completion(
@@ -527,39 +530,8 @@ def test_tool_loop_discards_reasoning_content_of_no_tool_completion(
     assert "秘密推理内容" not in rendered, "裸文本轮的 reasoning 不得进入下一轮"
 
 
-def test_summarize_conversation_passes_summary_slot_mode(monkeypatch: Any) -> None:
-    """聊天记忆总结显式透传 summary 槽位模式。"""
-    provider = _RecordingProvider()
-    monkeypatch.setattr(llm_service_module, "llm_provider", provider)
-
-    message = SimpleNamespace(
-        user_id="10001",
-        user_nickname="阿明",
-        group_id="114514",
-        content="周末一起吃拉面吧",
-        is_bot=False,
-        message_id="1",
-        timestamp=1.0,
-    )
-
-    asyncio.run(
-        llm_service_module.summarize_conversation(
-            messages=[message],
-            config=_build_config(
-                llm_request_api_summary="responses",
-                llm_stream_enabled_summary=True,
-            ),
-        )
-    )
-
-    assert len(provider.text_calls) == 1
-    call = provider.text_calls[0]
-    assert call["request_api"] == "responses"
-    assert call["stream_enabled"] is True
-
-
 def test_query_rewrite_passes_summary_slot_mode(monkeypatch: Any) -> None:
-    """查询重写使用 summary 槽位模式。"""
+    """查询重写使用专用 query_rewrite 槽位模式。"""
     captured: list[dict[str, Any]] = []
 
     class _Provider:
@@ -570,13 +542,13 @@ def test_query_rewrite_passes_summary_slot_mode(monkeypatch: Any) -> None:
     monkeypatch.setattr(query_rewrite_module, "llm_provider", _Provider())
     monkeypatch.setattr(
         query_rewrite_module,
-        "get_memory_config",
+        "get_config",
         lambda: SimpleNamespace(
-            llm_model_summary="summary-model",
-            llm_thinking_mode_summary=False,
-            llm_reasoning_effort_summary="",
-            llm_request_api_summary="responses",
-            llm_stream_enabled_summary=True,
+            query_rewrite_model="summary-model",
+            query_rewrite_thinking_mode=False,
+            query_rewrite_reasoning_effort="",
+            query_rewrite_request_api="responses",
+            query_rewrite_stream_enabled=True,
         ),
     )
 

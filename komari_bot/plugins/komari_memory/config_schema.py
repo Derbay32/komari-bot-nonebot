@@ -15,6 +15,7 @@ class KomariMemoryConfigSchema(TypedConfigModel, table=True):
 
     plugin_name: ClassVar[str] = "komari_memory"
     __tablename__ = "komari_memory_config"
+    startup_required: ClassVar[bool] = False
 
     model_config = typed_model_config(
         json_schema_extra={"default_apply_mode": "immediate"},
@@ -27,70 +28,9 @@ class KomariMemoryConfigSchema(TypedConfigModel, table=True):
         json_schema_extra={"apply_mode": "restart"},
     )
 
-    # 白名单配置
-    # Redis 配置
-    redis_db: int = Field(
-        default=1,
-        description="Redis 数据库编号 (避免与其他插件冲突)",
-        json_schema_extra={"apply_mode": "rebuild"},
-    )
-
-    # LLM 配置 - 对话模型（用于生成回复）
-    llm_model_chat: str = Field(
-        default="gemini-3-flash-preview", description="对话使用模型"
-    )
-    llm_temperature_chat: float = Field(
-        default=1.0, ge=0.0, le=2.0, description="对话模型温度参数"
-    )
-    llm_max_tokens_chat: int = Field(
-        default=4000, ge=20, le=8192, description="对话模型最大 token 数"
-    )
-    llm_request_api_chat: RequestApi = Field(
-        default="chat_completions",
-        sa_column=Column(String(32), nullable=False, default="chat_completions"),
-        description=(
-            "对话模型请求 API：chat_completions=OpenAI Chat Completions，"
-            "responses=OpenAI Responses。修改后从下一个业务任务开始生效。"
-        ),
-    )
-    llm_stream_enabled_chat: bool = Field(
-        default=False,
-        description=(
-            "对话模型是否启用流式传输（仅在网关内部聚合，业务插件无感知）。"
-            "修改后从下一个业务任务开始生效。"
-        ),
-    )
-    llm_thinking_mode_chat: bool = Field(
-        default=False,
-        description=(
-            "聊天主模型是否处于思考模式。"
-            "deepseek-v4 系模型默认开启思考，置 False 会注入 thinking:disabled 关闭；"
-            "其他模型置 True 时按 llm_reasoning_effort_chat 开启思考。"
-            "思考模式启用时将跳过 tool_choice 注入。"
-        ),
-    )
-    llm_reasoning_effort_chat: str = Field(
-        default="",
-        description=(
-            "聊天主模型思考强度（仅 thinking_mode=True 且非 deepseek-v4 系时生效）。"
-            "可选：minimal/low/medium/high；为空时不发送 reasoning_effort。"
-        ),
-    )
-    assistant_prefill_enabled: bool = Field(
-        default=False,
-        description="是否启用旧版 assistant 预填充消息（memory_ack 与 cot_prefix）",
-    )
-    dsv4_roleplay_instruct_mode: str = Field(
-        default="auto",
-        description=(
-            "DeepSeek V4 角色扮演思考指令注入模式："
-            "disabled=关闭，auto=仅 deepseek-v4 模型注入角色沉浸指令，"
-            "inner_os=强制角色沉浸，no_inner_os=强制纯分析"
-        ),
-    )
-    # TSK-194：旧 vision_tool_enabled 开关与 8 项图片下载预算已整体迁入
-    # komari_chat_config（image_understanding_mode + vision_image_download_*），
-    # memory 侧不保留 alias / 双读 / fallback。
+    # TSK-192 phase B：聊天生成、常识库、上下文预算、表情反应与聊天检索
+    # 字段已迁入 komari_chat_config；共享身份/通知/互动策略已迁入
+    # komari_context_config。memory 保留旧记忆算法自己的总结槽位与开关。
 
     # LLM 配置 - 总结模型（用于总结对话，区别于对话模型）
     llm_model_summary: str = Field(
@@ -118,12 +58,6 @@ class KomariMemoryConfigSchema(TypedConfigModel, table=True):
     llm_reasoning_effort_summary: str = Field(
         default="",
         description="总结/记忆/画像模型思考强度。语义同 llm_reasoning_effort_chat。",
-    )
-
-    # 常识库集成配置
-    knowledge_enabled: bool = Field(default=True, description="是否启用常识库集成")
-    knowledge_limit: int = Field(
-        default=3, ge=1, le=10, description="常识库检索数量限制"
     )
 
     # 记忆管理配置
@@ -209,34 +143,6 @@ class KomariMemoryConfigSchema(TypedConfigModel, table=True):
         le=3600,
         description="记忆 Agent 生命周期锁等待超时；为空表示一直等待",
     )
-    memory_search_limit: int = Field(
-        default=3, ge=1, le=10, description="检索相关记忆的最大数量"
-    )
-    context_messages_limit: int = Field(
-        default=10, ge=5, le=50, description="获取最近消息上下文的最大数量"
-    )
-    context_max_utf8_bytes: int = Field(
-        default=24_000,
-        ge=1_024,
-        le=131_072,
-        description="单次聊天近期消息上下文的 UTF-8 字节预算",
-    )
-    context_max_estimated_tokens: int = Field(
-        default=6_000,
-        ge=256,
-        le=32_000,
-        description="单次聊天近期消息上下文的估算 token 预算",
-    )
-    global_interaction_enabled: bool = Field(
-        default=True,
-        description="是否启用跨群互动事件缓冲",
-    )
-    global_interaction_trigger_size: int = Field(
-        default=20,
-        ge=5,
-        le=200,
-        description="触发事件总结的 Redis 缓冲条数阈值，不是 LIST 最大长度",
-    )
     global_interaction_summary_interval_minutes: int = Field(
         default=1,
         ge=1,
@@ -251,10 +157,6 @@ class KomariMemoryConfigSchema(TypedConfigModel, table=True):
         description="互动事件 processing 租约的可见性超时（秒）",
         json_schema_extra={"apply_mode": "immediate"},
     )
-
-    # 提示词模板配置
-    # 机器人昵称
-    bot_nickname: str = Field(default="小鞠知花", description="机器人昵称")
 
     # 回复提取配置
     response_tag: str = Field(
@@ -301,23 +203,6 @@ class KomariMemoryConfigSchema(TypedConfigModel, table=True):
         description="机器人别名列表（用于机器人身份识别）",
     )
 
-    # 表情反应配置
-    face_reaction_enabled: bool = Field(
-        default=False,
-        description="是否在触发聊天回复后对用户消息添加表情反应，用于提示正在生成回复",
-    )
-    face_reaction_id: str = Field(
-        default="76",
-        description="表情反应的 Face ID（QQ 表情 ID），如 76=赞。仅 face_reaction_enabled=true 时生效",
-    )
-
-    # 回复失败通知配置
-    error_notify_enabled: bool = Field(
-        default=True,
-        json_schema_extra={"apply_mode": "immediate"},
-        description="回复生成失败时是否向 SUPERUSER 私聊发送极简诊断通知（群内错误提示不受此开关影响）",
-    )
-
     @field_validator("bot_aliases", mode="before")
     @classmethod
     def parse_list_string(cls, v: Any) -> Any:
@@ -338,15 +223,6 @@ class KomariMemoryConfigSchema(TypedConfigModel, table=True):
             except (json.JSONDecodeError, TypeError):
                 return [item.strip() for item in v.split(",") if item.strip()]
         return v
-
-    @field_validator("dsv4_roleplay_instruct_mode", mode="before")
-    @classmethod
-    def normalize_dsv4_roleplay_instruct_mode(cls, value: Any) -> str:
-        """规范化 DeepSeek V4 角色扮演指令注入模式。"""
-        normalized = str(value or "auto").strip().lower()
-        if normalized not in {"disabled", "auto", "inner_os", "no_inner_os"}:
-            return "auto"
-        return normalized
 
     # TSK-194：图片预算跨字段校验已随字段迁入 komari_chat_config
     # （见 KomariChatConfigSchema._validate_image_download_budget）。

@@ -17,9 +17,9 @@ from __future__ import annotations
 import dataclasses
 import inspect
 
+from komari_bot.context.redis_store import MessageSchema
 from komari_bot.plugins.komari_chat.handlers import message_handler
 from komari_bot.plugins.komari_chat.services import reply_fulfillment_workflow
-from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
 
 
 def _pending_reply_field_names() -> set[str]:

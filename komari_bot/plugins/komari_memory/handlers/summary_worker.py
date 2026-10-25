@@ -19,6 +19,8 @@ from nonebot import logger
 from nonebot.plugin import require
 from nonebot_plugin_apscheduler import scheduler
 
+from komari_bot.plugins.komari_context import get_context_config
+
 from ..agent import run_profile_agent
 from ..services.config_interface import get_config
 from ..services.conversation_processing import InvalidChunkLedgerError
@@ -227,13 +229,14 @@ class ConversationSummaryProcessor:
     def __init__(self, redis: Any, memory: Any) -> None:
         # 依赖类型放宽为 Any：业务 seam 只消费 redis.redis 与
         # memory.store_conversation 最小形状，测试以协议级 fake 注入
-        #（pyright 1.1.409 对可变协议成员双向互检的限制同 module 的处理）。
+        # （pyright 1.1.409 对可变协议成员双向互检的限制同 module 的处理）。
         self._redis = redis
         self._memory = memory
 
     async def process(self, session: ProcessingSession) -> None:
         """围绕同一个 processing 快照执行一次总结流程。"""
         config = get_config()
+        bot_nickname = get_context_config().bot_nickname
 
         messages_buffer = session.messages
         if not messages_buffer:
@@ -257,7 +260,7 @@ class ConversationSummaryProcessor:
         chunks = chunk_messages_for_memory_processing(
             messages_buffer,
             snapshot_fingerprint=snapshot_fingerprint,
-            bot_nickname=config.bot_nickname,
+            bot_nickname=bot_nickname,
         )
         manifest = build_chunk_manifest(
             snapshot_fingerprint=snapshot_fingerprint,
@@ -287,6 +290,7 @@ class ConversationSummaryProcessor:
                     config,
                     participants=participants,
                     display_name_map=nickname_map,
+                    bot_nickname=bot_nickname,
                     collector=collector,
                 )
                 normalized_memories = _normalize_summary_memories(summary_result)
@@ -301,7 +305,7 @@ class ConversationSummaryProcessor:
             cached_profile = await session.ledger.get(profile_field)
             if cached_profile is None:
                 conversation_text = "\n".join(
-                    format_message_line(message, bot_nickname=config.bot_nickname)
+                    format_message_line(message, bot_nickname=bot_nickname)
                     for message in chunk_messages
                 )
                 profile_result = await run_profile_agent(

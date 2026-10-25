@@ -124,10 +124,7 @@ def _build_group_receipt(
         f"完整结果: {'已私聊' if private_delivered else '私聊投递失败'}",
     ]
     if public_requested:
-        lines.append(
-            "公开脱敏摘要: "
-            + ("已发送" if public_delivered else "发送失败")
-        )
+        lines.append("公开脱敏摘要: " + ("已发送" if public_delivered else "发送失败"))
     return "\n".join(lines)
 
 
@@ -279,7 +276,9 @@ def _build_reply_context_from_event(event: GroupMessageEvent) -> ReplyContext | 
             bot_self_id = str(event.self_id)
 
         return ReplyContext(
-            source_side="assistant" if (bot_self_id is not None and user_id == bot_self_id) else "user",
+            source_side="assistant"
+            if (bot_self_id is not None and user_id == bot_self_id)
+            else "user",
             message_id=message_id,
             user_id=user_id,
             user_nickname=user_nickname,
@@ -324,7 +323,9 @@ async def handle_favor_get(
 
     user_id = _parse_user_id(arg_text)
     if user_id is None:
-        await debug_favor_get.finish("❌ 请提供有效的用户 ID（正整数）\n用法: .debug favor get <用户ID>")
+        await debug_favor_get.finish(
+            "❌ 请提供有效的用户 ID（正整数）\n用法: .debug favor get <用户ID>"
+        )
 
     request_id = f"debug-favor-get-{uuid.uuid4().hex[:12]}"
     try:
@@ -556,9 +557,7 @@ async def handle_debug_bind_list(
 
     public_requested, remaining = _extract_public_flag(arg_text)
     if remaining:
-        await debug_bind_list.finish(
-            "❌ 参数过多\n用法: .debug bind list [--public]"
-        )
+        await debug_bind_list.finish("❌ 参数过多\n用法: .debug bind list [--public]")
     if public_requested and not isinstance(event, GroupMessageEvent):
         await debug_bind_list.finish("❌ --public 仅可在群聊中使用")
 
@@ -580,8 +579,7 @@ async def handle_debug_bind_list(
         private_delivered = await send_private_message(
             bot,
             int(event.user_id),
-            f"❌ 查询绑定列表失败\n请求 ID: {request_id}\n"
-            "错误码: bind_list_failed",
+            f"❌ 查询绑定列表失败\n请求 ID: {request_id}\n错误码: bind_list_failed",
         )
         receipt = _build_group_receipt(
             request_id=request_id,
@@ -954,11 +952,11 @@ async def handle_debug_summary(
 
 debug_notify = on_command(("debug", "notify"), priority=2, block=True)
 
-from komari_bot.plugins.komari_memory.config_schema import KomariMemoryConfigSchema
+from komari_bot.plugins.komari_context import KomariContextConfigSchema
 
-_komari_memory_config_mgr = get_config_manager(
-    "komari_memory",
-    KomariMemoryConfigSchema,
+_komari_context_config_mgr = get_config_manager(
+    "komari_context",
+    KomariContextConfigSchema,
 )
 
 
@@ -977,7 +975,7 @@ async def handle_debug_notify(
 
     enabled = arg == "on"
     try:
-        updated = await _komari_memory_config_mgr.update_field_async(
+        updated = await _komari_context_config_mgr.update_field_async(
             "error_notify_enabled",
             enabled,
         )

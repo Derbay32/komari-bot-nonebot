@@ -27,7 +27,7 @@ import asyncpg
 from nonebot import logger
 from redis.exceptions import RedisError
 
-from komari_bot.plugins.komari_memory import MessageSchema
+from komari_bot.context.redis_store import MessageSchema
 
 from ..reply_fulfillment_domain import (
     _COMMITMENT_PAYLOAD_TYPES,

@@ -14,7 +14,9 @@ from nonebot import logger
 from nonebot.plugin import require
 from nonebot_plugin_apscheduler import scheduler
 
-from ..core.retry import retry_async
+from komari_bot.core.retry import retry_async
+from komari_bot.plugins.komari_context import get_context_config
+
 from ..services.admission import memory_admitted_partition_groups
 from ..services.config_interface import get_config
 from ..services.interaction_event_summary_service import (
@@ -91,7 +93,7 @@ async def interaction_event_worker_task(
 ) -> None:
     """轮询 pending 集合并总结跨群互动事件。"""
     config = get_config()
-    if not config.global_interaction_enabled:
+    if not get_context_config().global_interaction_enabled:
         return
 
     owner_token = uuid4().hex
@@ -375,15 +377,16 @@ async def _summarize_processing_key(
 
 async def daily_enqueue_global_interactions(redis: RedisManager) -> None:
     """每日 4 点兜底：把所有非空跨群互动缓冲加入 pending。"""
-    config = get_config()
-    if not config.global_interaction_enabled:
+    if not get_context_config().global_interaction_enabled:
         return
 
     user_ids = await redis.get_users_with_global_interaction_buffer()
     for user_id in user_ids:
         await redis.add_pending_interaction_summary(user_id)
     if user_ids:
-        logger.info("[KomariMemory] 4 点兜底加入跨群互动总结 pending: {} 个用户", len(user_ids))
+        logger.info(
+            "[KomariMemory] 4 点兜底加入跨群互动总结 pending: {} 个用户", len(user_ids)
+        )
 
 
 def register_interaction_event_task(redis: RedisManager, memory: MemoryService) -> None:
@@ -406,7 +409,7 @@ def register_interaction_event_task(redis: RedisManager, memory: MemoryService) 
         id=_DAILY_JOB_ID,
         replace_existing=True,
     )
-    if config.global_interaction_enabled:
+    if get_context_config().global_interaction_enabled:
         logger.info("[KomariMemory] 跨群互动事件总结任务已注册")
     else:
         logger.info("[KomariMemory] 跨群互动事件总结任务已休眠注册，启用后即时生效")

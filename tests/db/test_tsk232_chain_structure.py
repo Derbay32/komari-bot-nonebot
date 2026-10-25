@@ -1,7 +1,7 @@
 """TSK-232 —— 迁移链重排的结构面静态守卫（无需真实数据库）。
 
 本轮（结构面）红基线刷新 ``migrations/versions`` 版本链的验收契约。目标链
-（单主干、head=0025）按 ADR-0012 「破坏性迁移后果」重排为：
+（单主干、head=0027）按 ADR-0012 「破坏性迁移后果」重排为：
 
 - ``0001`` ``0001_fresh_marker``　fresh marker，不再是一次性全量基线
   （仅空库身份，不含任何 legacy 大表/扩展）；
@@ -35,7 +35,9 @@
 - ``0022``　Jev 请求配置列（TSK-181）。
 - ``0023``　Jev 判定存储与执行配置（TSK-182）。
 - ``0024``　Jev 近期输入结算事实（TSK-182）。
-- ``0025``　判定场景存储四表与 38 个判定配置字段退役（TSK-190，head）。
+- ``0025``　判定场景存储四表与 38 个判定配置字段退役（TSK-190）。
+- ``0026``　最近上下文 Redis 资源所有权（TSK-192 phase A）。
+- ``0027``　聊天/上下文中性配置所有权（TSK-192 phase B，head）。
 
 编号映射理由（每行附于映射常量）：先按 ADR 把四个准入/履约锚点固定到
 0010-0013，再向上/向下保持原内容相对次序折叠填充，0018 保留为绑定迁移，
@@ -109,9 +111,13 @@ NEW_CHAIN = (
     ("0024", "jev_recent_settlement", "recent_retained"),
     # 0025 TSK-190 判定场景存储退役（不可逆：删四表 + 38 列）
     ("0025", "scene_storage_retirement", "komari_memory_scene_item"),
+    # 0026 TSK-192 phase A 最近上下文 Redis 资源所有权
+    ("0026", "context_resource_ownership", "komari_context_config"),
+    # 0027 TSK-192 phase B 聊天/上下文中性配置所有权
+    ("0027", "chat_configuration_ownership", "komari_context_config"),
 )
 
-assert len(NEW_CHAIN) == 25
+assert len(NEW_CHAIN) == 27
 
 #: 标注 forward-only / IRREVERSIBLE 的 revision（实现源文本必须含该标记）。
 FORWARD_ONLY_REVISIONS = ("0012", "0013")
@@ -132,13 +138,13 @@ def _migration_file(revision: str) -> Path:
     return match[0]
 
 
-def test_chain_is_single_trunk_head_0025() -> None:
-    """新链单主干、无 alias、head=0025。"""
+def test_chain_is_single_trunk_head_0027() -> None:
+    """新链单主干、无 alias、head=0027。"""
     script = _load_script_directory()
     revisions = list(script.walk_revisions())
     heads = script.get_heads()
     assert len(heads) == 1
-    assert heads[0] == "0025"
+    assert heads[0] == "0027"
 
     baselines = [rev for rev in revisions if rev.down_revision is None]
     assert len(baselines) == 1
@@ -147,9 +153,14 @@ def test_chain_is_single_trunk_head_0025() -> None:
     legacy_files = [
         name
         for name in sorted(VERSIONS_DIR.glob("*.py"))
-        if re.search(r"^(?:0002_typed_plugin_config|0010_reply_fulfillment|0011_reply_fulfillment_cutover)_", name.name)
+        if re.search(
+            r"^(?:0002_typed_plugin_config|0010_reply_fulfillment|0011_reply_fulfillment_cutover)_",
+            name.name,
+        )
     ]
-    assert legacy_files == [], f"旧编号迁移文件必须被重排/移除，不得保留: {legacy_files}"
+    assert legacy_files == [], (
+        f"旧编号迁移文件必须被重排/移除，不得保留: {legacy_files}"
+    )
 
 
 def test_fresh_marker_is_not_full_baseline() -> None:
@@ -228,6 +239,10 @@ def test_no_legacy_jsonb_list_loader_seam_in_chain() -> None:
     offending = []
     for index, source in enumerate(verdict_sources):
         lower = source.lower()
-        if "user_whitelist" in lower and "group_whitelist" in lower and "merge" in lower:
+        if (
+            "user_whitelist" in lower
+            and "group_whitelist" in lower
+            and "merge" in lower
+        ):
             offending.append(index)
     assert offending == [], "迁移 0010/0012/0013 不得出现自动合并旧名单逻辑"

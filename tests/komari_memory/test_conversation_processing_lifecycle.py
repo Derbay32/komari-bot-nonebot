@@ -22,7 +22,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine
     from typing import Any
 
-from komari_bot.plugins.komari_memory.core.retry import get_retry_attempts
+from komari_bot.context.redis_store import MessageSchema
+from komari_bot.core.retry import get_retry_attempts
 from komari_bot.plugins.komari_memory.services import (
     conversation_processing_lifecycle as lifecycle_module,
 )
@@ -34,7 +35,6 @@ from komari_bot.plugins.komari_memory.services.conversation_processing import (
 from komari_bot.plugins.komari_memory.services.conversation_processing_lifecycle import (
     ConversationProcessingLifecycle,
 )
-from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
 
 _VALID_MESSAGE: dict[str, object] = {
     "user_id": "10001",

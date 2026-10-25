@@ -10,6 +10,7 @@ from typing import ClassVar
 
 import pytest
 
+from komari_bot.context.redis_store import MessageSchema
 from komari_bot.onebot import (
     GroupTaskFailureNotification,
     ImageFailureDiagnostic,
@@ -65,9 +66,7 @@ class _FakeBot:
         user_id: int,
         message: str,
     ) -> None:
-        self.send_private_msg_calls.append(
-            {"user_id": user_id, "message": message}
-        )
+        self.send_private_msg_calls.append({"user_id": user_id, "message": message})
         if user_id in self.private_error_user_ids:
             msg = "模拟私聊投递失败"
             raise RuntimeError(msg)
@@ -153,10 +152,8 @@ def _configure_runtime(
         bot_nickname="小鞠",
         bot_aliases=[],
     )
-    monkeypatch.setattr(message_handler_module, "get_memory_config", lambda: config)
-    driver = SimpleNamespace(
-        config=SimpleNamespace(superusers=superusers or {"10001"})
-    )
+    monkeypatch.setattr(message_handler_module, "get_context_config", lambda: config)
+    driver = SimpleNamespace(config=SimpleNamespace(superusers=superusers or {"10001"}))
     monkeypatch.setattr(shared_notify_module, "get_driver", lambda: driver)
     return config
 
@@ -270,7 +267,7 @@ async def test_config_read_failure_only_mutes_private_notification(
 
     monkeypatch.setattr(
         message_handler_module,
-        "get_memory_config",
+        "get_context_config",
         _raise_config_error,
     )
     bot = _FakeBot()
@@ -477,7 +474,10 @@ async def test_invalid_image_summary_mapping_failure_keeps_group_apology(
     _assert_group_reply(bot)
     assert bot.send_private_msg_calls == []
     # 不合法摘要绝不降级为 generic 私聊摘要（fail-closed）
-    assert all("图片理解失败" not in str(call["message"]) for call in bot.send_private_msg_calls)
+    assert all(
+        "图片理解失败" not in str(call["message"])
+        for call in bot.send_private_msg_calls
+    )
 
 
 @pytest.mark.asyncio
@@ -613,9 +613,7 @@ async def test_process_message_success_with_image_failures_notifies_once(
     handler = _build_handler()
     handler.memory = SimpleNamespace()
     handler.decision_engine = SimpleNamespace()
-    handler.reply_fulfillment = SimpleNamespace(
-        is_duplicate_event=_is_duplicate_event
-    )
+    handler.reply_fulfillment = SimpleNamespace(is_duplicate_event=_is_duplicate_event)
 
     notifications: list[GroupTaskFailureNotification] = []
 
@@ -772,9 +770,7 @@ def test_normal_reservation_control_flow_is_not_a_failure(
         """租约形态 fake：正常频控拒绝返回真实 ReservationDenied 对象。"""
 
         @staticmethod
-        async def reserve(
-            group_id: str, reservation_id: str
-        ) -> ReservationDenied:
+        async def reserve(group_id: str, reservation_id: str) -> ReservationDenied:
             return ReservationDenied(
                 group_id=group_id,
                 reservation_id=reservation_id,
@@ -790,13 +786,10 @@ def test_normal_reservation_control_flow_is_not_a_failure(
     )
     monkeypatch.setattr(
         message_handler_module,
-        "get_memory_config",
+        "get_context_config",
         lambda: SimpleNamespace(),
     )
-    message_schema = import_module(
-        "komari_bot.plugins.komari_memory"
-    ).MessageSchema
-    message = message_schema(
+    message = MessageSchema(
         user_id="10000",
         user_nickname="测试用户",
         group_id="12345",
