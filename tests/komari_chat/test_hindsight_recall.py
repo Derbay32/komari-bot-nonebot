@@ -16,6 +16,7 @@ from komari_bot.plugins.komari_memory.services.hindsight_service import (
 )
 from tests.komari_chat.hindsight_recall_support import (
     FakeHindsightMemory,
+    fake_recall_session,
     recall_response,
 )
 
@@ -271,7 +272,7 @@ async def test_attempt_reply_reports_hindsight_failure_as_generation_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     memory = FakeHindsightMemory(
-        open_error=HindsightUnavailableError("bank_identity_mismatch")
+        recall_error=HindsightUnavailableError("bank_identity_mismatch")
     )
     handler = _handler(memory, _Rewrite())
     prompt_calls: list[dict[str, Any]] = []
@@ -294,6 +295,7 @@ async def test_attempt_reply_reports_hindsight_failure_as_generation_failure(
         reply_context_refetched=False,
         force_reply=True,
         reason="platform_summon",
+        recall_session=fake_recall_session(memory),
         store_current=False,
     )
 
