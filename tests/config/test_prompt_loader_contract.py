@@ -1,4 +1,4 @@
-"""TSK-191 三个 Prompt 资源公开 loader 冷启动/缓存契约测试。
+"""TSK-191/TSK-197 两个必需 Prompt 资源公开 loader 冷启动/缓存契约测试。
 
 在公开 loader seam（``<插件>.get_template``）上验证 AC4/AC5/AC9：
 
@@ -9,11 +9,10 @@
 - 模板值完全来自 PostgreSQL 快照，不并入任何默认正文（AC2/AC3）；
 - 完整性校验按 resource_id 对应 Schema 执行：stored row 混入其他资源
   专属字段时即使本资源字段齐全也必须点名拒绝（跨资源拒绝，证明不是
-  三资源字段的全局 union）。
+  多资源字段的全局 union）。
 
 存储缝只替换 ``prompt_storage.get_prompt_storage``，loader 走生产加载路径
-（当前实现会拿 memory/group 的 ``DEFAULTS`` 合并补全不完整快照，因此
-memory/group 的冷启动用例是 TSK-191 的可解释 RED）。字段集合从强类型
+（TSK-191 的冷启动用例曾是可解释 RED；当前实现只读 PostgreSQL 快照）。字段集合从强类型
 Schema 派生，输入用测试自有 marker，不复制生产/seed 正文。
 """
 
@@ -37,9 +36,6 @@ from tests.config.prompt_field_contract import (
 
 _LOADER_MODULE_NAMES: dict[str, str] = {
     "komari_chat": "komari_bot.plugins.komari_chat.services.prompt_template",
-    "komari_memory_summary": (
-        "komari_bot.plugins.komari_memory.services.summary_prompt_template"
-    ),
     "group_history_summary": "komari_bot.plugins.group_history_summary.prompt_template",
 }
 
@@ -197,10 +193,8 @@ async def test_get_template_rejects_cross_resource_foreign_field(
 ) -> None:
     """AC3/AC4(TSK-191)：stored row 混入其他资源专属字段必须点名拒绝。
 
-    完整性/白名单按 resource_id 对应 Schema 校验，不是三资源字段的全局
-    union：本资源字段齐全但携带异资源字段时也必须失败。当前 chat gate
-    只查缺失/空白、memory/group 无 gate，都会放行，因此本用例是
-    TSK-191 的可解释 RED。
+    完整性/白名单按 resource_id 对应 Schema 校验，不是多资源字段的全局
+    union：本资源字段齐全但携带异资源字段时也必须失败。
     """
     _reset_all_loaders()
     foreign_field = CROSS_RESOURCE_FOREIGN_FIELDS[resource_id]

@@ -373,8 +373,7 @@ def ensure_typed_prompt_model(
 ) -> type[TypedPromptModel] | None:
     """返回 Prompt 资源的强类型表模型；缺失时安全扫描全部 prompt_schema。
 
-    Prompt 资源 ID 与插件目录名不必一一对应（如 ``komari_memory_summary``
-    的 prompt_schema 位于 ``komari_memory`` 目录），因此不按名字定向加载，
+    Prompt 资源 ID 与插件目录名不保证一一对应，因此不按名字定向加载，
     而是扫描全部插件目录的 ``prompt_schema.py`` 源文件。
     """
     model = TYPED_PROMPT_MODEL_REGISTRY.get(resource_id)

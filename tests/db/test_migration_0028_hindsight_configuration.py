@@ -118,10 +118,10 @@ async def test_0028_adds_defaulted_hindsight_columns_and_downgrades_cleanly() ->
         finally:
             await connection.close()
 
-        result = run_bootstrap(db_url, "upgrade", "head")
+        # Historical invariant at 0028's intended revision: Hindsight
+        # defaults exist and the then-surviving legacy columns are untouched.
+        result = run_bootstrap(db_url, "upgrade", "0028")
         assert result.returncode == 0, result.stderr
-        check = run_bootstrap(db_url, "check")
-        assert check.returncode == 0, f"{check.stdout}\n{check.stderr}"
 
         connection = await asyncpg.connect(**scratch)
         try:
@@ -142,13 +142,30 @@ async def test_0028_adds_defaulted_hindsight_columns_and_downgrades_cleanly() ->
         finally:
             await connection.close()
 
-        result = run_bootstrap(db_url, "upgrade", "head")
+        result = run_bootstrap(db_url, "upgrade", "0028")
         assert result.returncode == 0, result.stderr
         connection = await asyncpg.connect(**scratch)
         try:
             row = await _row(connection)
             for column, expected in _HINDSIGHT_DEFAULTS.items():
                 assert row[column] == expected, column
+        finally:
+            await connection.close()
+
+        # Advance to the current head: Hindsight values survive while 0030
+        # removes the retired legacy column set.
+        result = run_bootstrap(db_url, "upgrade", "head")
+        assert result.returncode == 0, result.stderr
+        check = run_bootstrap(db_url, "check")
+        assert check.returncode == 0, f"{check.stdout}\n{check.stderr}"
+        connection = await asyncpg.connect(**scratch)
+        try:
+            columns = await _columns(connection)
+            row = await _row(connection)
+            assert "llm_model_summary" not in columns
+            for column, expected in _HINDSIGHT_DEFAULTS.items():
+                assert row[column] == expected, column
+            assert row["revision"] == _EXISTING_SENTINEL_REVISION
         finally:
             await connection.close()
     finally:

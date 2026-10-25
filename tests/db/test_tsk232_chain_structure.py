@@ -1,7 +1,7 @@
 """TSK-232 —— 迁移链重排的结构面静态守卫（无需真实数据库）。
 
 本轮（结构面）红基线刷新 ``migrations/versions`` 版本链的验收契约。目标链
-（单主干、head=0029）按 ADR-0012 「破坏性迁移后果」重排为：
+（单主干、head=0030）按 ADR-0012 「破坏性迁移后果」重排为：
 
 - ``0001`` ``0001_fresh_marker``　fresh marker，不再是一次性全量基线
   （仅空库身份，不含任何 legacy 大表/扩展）；
@@ -39,7 +39,8 @@
 - ``0026``　最近上下文 Redis 资源所有权（TSK-192 phase A）。
 - ``0027``　聊天/上下文中性配置所有权（TSK-192 phase B）。
 - ``0028``　Hindsight 共享记忆连接配置（TSK-193）。
-- ``0029``　回复履约 Hindsight 送达记忆承诺与旧输出协议退役（TSK-195，head）。
+- ``0029``　回复履约 Hindsight 送达记忆承诺与旧输出协议退役（TSK-195）。
+- ``0030``　旧记忆运行面与配置/Prompt 退役（TSK-197，head）。
 
 编号映射理由（每行附于映射常量）：先按 ADR 把四个准入/履约锚点固定到
 0010-0013，再向上/向下保持原内容相对次序折叠填充，0018 保留为绑定迁移，
@@ -121,9 +122,11 @@ NEW_CHAIN = (
     ("0028", "hindsight_memory_configuration", "komari_memory_config"),
     # 0029 TSK-195 Hindsight 送达记忆承诺与旧输出协议退役
     ("0029", "hindsight_reply_commitment", "hindsight_memory"),
+    # 0030 TSK-197 旧记忆运行面与配置/Prompt 退役
+    ("0030", "hindsight_memory_retirement", "komari_prompt_memory_summary"),
 )
 
-assert len(NEW_CHAIN) == 29
+assert len(NEW_CHAIN) == 30
 
 #: 标注 forward-only / IRREVERSIBLE 的 revision（实现源文本必须含该标记）。
 FORWARD_ONLY_REVISIONS = ("0012", "0013")
@@ -144,13 +147,13 @@ def _migration_file(revision: str) -> Path:
     return match[0]
 
 
-def test_chain_is_single_trunk_head_0029() -> None:
-    """新链单主干、无 alias、head=0029。"""
+def test_chain_is_single_trunk_head_0030() -> None:
+    """新链单主干、无 alias、head=0030。"""
     script = _load_script_directory()
     revisions = list(script.walk_revisions())
     heads = script.get_heads()
     assert len(heads) == 1
-    assert heads[0] == "0029"
+    assert heads[0] == "0030"
 
     baselines = [rev for rev in revisions if rev.down_revision is None]
     assert len(baselines) == 1

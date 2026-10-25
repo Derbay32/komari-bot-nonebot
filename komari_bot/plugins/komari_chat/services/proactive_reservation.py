@@ -25,7 +25,7 @@ from .config_interface import get_config
 
 ReservationDeniedReason = Literal["cooldown", "rate_limited", "duplicate"]
 
-# 一小时滑动窗口与 slots TTL 宽限，语义与旧实现（redis_manager.py）一致
+# 一小时滑动窗口与 slots TTL 宽限，语义与旧回复频控实现一致
 _PROACTIVE_RATE_WINDOW_MS = 3_600_000
 _PROACTIVE_SLOTS_TTL_GRACE_MS = 60_000
 
@@ -33,8 +33,8 @@ _PROACTIVE_SLOTS_TTL_GRACE_MS = 60_000
 _PROACTIVE_COOLDOWN_KEY_PREFIX = "komari_chat:proactive:cd:"
 _PROACTIVE_SLOTS_KEY_PREFIX = "komari_chat:proactive:slots:"
 
-# 脚本与 komari_memory.services.redis_manager 的 _PROACTIVE_* 一一对应，
-# 文本原样保留（脚本内不含键名，仅归属改变）；行首标记注释
+# 脚本由 komari_chat 配置与 Redis 客户端拥有，旧记忆模块已退役；
+# 行首标记注释
 # （-- proactive_reserve 等）为测试 fake 客户端的分发约定，必须保留。
 _PROACTIVE_RESERVE_SCRIPT = """
 -- proactive_reserve

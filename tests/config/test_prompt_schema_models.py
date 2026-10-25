@@ -1,7 +1,7 @@
 """Prompt 强类型表 Schema 契约测试。
 
-TSK-191：三个 Prompt 资源（chat / memory summary / group history summary）
-全部以 PostgreSQL 为运行时真源，字段集合由强类型 Schema 决定；三者都不再
+TSK-191：Prompt 资源（chat / group history summary，以及独立的判定资源）
+全部以 PostgreSQL 为运行时真源，字段集合由强类型 Schema 决定；它们都不再
 定义 Python 长文本 ``DEFAULTS``（AC2），旧的默认机制与临时兼容分支被物理
 删除（AC8：``ManagedPromptResource`` 不再有 ``defaults`` 字段、
 ``PromptTemplateLoader`` 构造不再接受 ``defaults`` 参数）。因此本文件不再
@@ -32,9 +32,6 @@ from komari_bot.plugins.komari_chat.prompt_schema import (
     KomariChatPromptSchema,
 )
 from komari_bot.plugins.komari_decision.prompt_schema import KomariDecisionPromptSchema
-from komari_bot.plugins.komari_memory.prompt_schema import (
-    KomariMemorySummaryPromptSchema,
-)
 
 #: 每项 (resource_id, 表名, 模型)。
 RESOURCE_MODELS: tuple[
@@ -48,11 +45,6 @@ RESOURCE_MODELS: tuple[
         KomariChatPromptSchema,
     ),
     (
-        "komari_memory_summary",
-        "komari_prompt_memory_summary",
-        KomariMemorySummaryPromptSchema,
-    ),
-    (
         "group_history_summary",
         "komari_prompt_group_history_summary",
         GroupHistorySummaryPromptSchema,
@@ -63,7 +55,6 @@ RESOURCE_MODELS: tuple[
 PROMPT_SCHEMA_MODULE_NAMES: tuple[str, ...] = (
     "komari_bot.plugins.komari_decision.prompt_schema",
     "komari_bot.plugins.komari_chat.prompt_schema",
-    "komari_bot.plugins.komari_memory.prompt_schema",
     "komari_bot.plugins.group_history_summary.prompt_schema",
 )
 
@@ -100,7 +91,7 @@ def test_load_all_typed_models_covers_config_and_prompt_schemas() -> None:
     # TSK-279 新增 komari_roulette 配置资源；TSK-192 phase A 新增
     # komari_context 配置资源（迁移 0026）。
     assert len(TYPED_CONFIG_MODEL_REGISTRY) == 18
-    assert len(TYPED_PROMPT_MODEL_REGISTRY) == 4
+    assert len(TYPED_PROMPT_MODEL_REGISTRY) == 3
 
 
 def test_every_prompt_resource_is_a_distinct_typed_table() -> None:
@@ -111,7 +102,6 @@ def test_every_prompt_resource_is_a_distinct_typed_table() -> None:
     assert table_names == {
         "komari_prompt_komari_decision",
         "komari_prompt_komari_chat",
-        "komari_prompt_memory_summary",
         "komari_prompt_group_history_summary",
     }
     assert table_names <= set(SQLModel.metadata.tables)
@@ -121,11 +111,7 @@ def test_every_prompt_resource_is_a_distinct_typed_table() -> None:
 def test_prompt_schema_no_longer_defines_python_defaults(
     module_name: str,
 ) -> None:
-    """AC2(TSK-191)：三个 Prompt 资源的 Python 长文本 DEFAULTS 全部移除。
-
-    当前 memory/group 的 prompt_schema 仍定义并导出 ``DEFAULTS``，因此
-    这些参数是 TSK-191 的可解释 RED。
-    """
+    """AC2(TSK-191)：Prompt 资源的 Python 长文本 DEFAULTS 全部移除。"""
     module = importlib.import_module(module_name)
 
     assert "DEFAULTS" not in vars(module), (

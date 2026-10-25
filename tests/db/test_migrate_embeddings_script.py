@@ -1,4 +1,4 @@
-"""独立迁移脚本测试。"""
+"""独立向量迁移脚本测试（TSK-197 后仅保留 knowledge 目标）。"""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ import importlib.util
 import sys
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_PATH = PROJECT_ROOT / "scripts/migrate_embeddings.py"
@@ -84,20 +86,33 @@ class _FakeConnection:
         return _FakeTransaction()
 
 
-def test_expand_memory_targets_contains_two_memory_tables() -> None:
+def test_expand_targets_selects_only_knowledge() -> None:
     module = _load_script_module()
 
-    targets = module.expand_targets({"memory"})
-
-    assert [target.name for target in targets] == [
-        "memory_conversations",
-        "memory_interactions",
+    assert [target.name for target in module.expand_targets({"knowledge"})] == [
+        "knowledge"
     ]
-    assert targets[0].embedding_table == "komari_memory_conversation_embeddings"
-    assert targets[1].embedding_table == "komari_memory_interaction_embeddings"
+    assert [target.name for target in module.expand_targets({"all"})] == ["knowledge"]
+    assert [target.name for target in module.expand_targets(set())] == ["knowledge"]
+    with pytest.raises(ValueError, match="不支持的迁移目标: memory"):
+        module.expand_targets({"memory"})
 
 
-def test_main_async_dry_run_reuses_pool_and_reports_memory_targets(monkeypatch: Any) -> None:
+def test_cli_rejects_memory_before_any_database_access(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_script_module("tests.scripts.migrate_embeddings_cli")
+    monkeypatch.setattr(sys, "argv", ["migrate_embeddings", "--target", "memory"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        module.parse_args()
+
+    assert exc_info.value.code == 2
+
+
+def test_main_async_dry_run_reuses_pool_and_reports_knowledge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     module = _load_script_module()
     conn = _FakeConnection()
     pool = _FakePool(conn)
@@ -111,7 +126,7 @@ def test_main_async_dry_run_reuses_pool_and_reports_memory_targets(monkeypatch: 
 
     asyncio.run(
         module.main_async(
-            targets={"memory"},
+            targets={"all"},
             apply=False,
             dsn="postgresql+asyncpg://user:pass@localhost:5432/komari_bot",
             embedding_config=module.EmbeddingConfig(
@@ -125,15 +140,14 @@ def test_main_async_dry_run_reuses_pool_and_reports_memory_targets(monkeypatch: 
 
     assert pool.closed is True
     assert [call[1][0] for call in conn.fetchval_calls if "to_regclass" in call[0]] == [
-        "komari_memory_conversations",
-        "komari_memory_conversation_embeddings",
-        "komari_memory_interaction_history",
-        "komari_memory_interaction_embeddings",
+        "komari_knowledge"
     ]
     assert conn.execute_calls == []
 
 
-def test_migrate_memory_target_apply_writes_embedding_side_table(monkeypatch: Any) -> None:
+def test_migrate_knowledge_target_apply_writes_source_column(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     module = _load_script_module()
     conn = _FakeConnection()
     pool = _FakePool(conn)
@@ -148,7 +162,7 @@ def test_migrate_memory_target_apply_writes_embedding_side_table(monkeypatch: An
     result = asyncio.run(
         module.migrate_target(
             pool,
-            target=module.CONVERSATION_MEMORY_TARGET,
+            target=module.KNOWLEDGE_TARGET,
             embedding_config=module.EmbeddingConfig(
                 model="test-model",
                 dimension=1536,
@@ -161,11 +175,11 @@ def test_migrate_memory_target_apply_writes_embedding_side_table(monkeypatch: An
 
     assert result.updated_rows == 1
     assert any(
-        "CREATE TABLE IF NOT EXISTS komari_memory_conversation_embeddings" in call[0]
+        "ALTER TABLE komari_knowledge ADD COLUMN embedding VECTOR(1536)" in call[0]
         for call in conn.execute_calls
     )
     assert any(
-        "INSERT INTO komari_memory_conversation_embeddings" in call[0]
+        "UPDATE komari_knowledge SET embedding = $1" in call[0]
         for call in conn.execute_calls
     )
 
@@ -180,7 +194,7 @@ def test_script_imports_without_komari_bot_package(monkeypatch: Any) -> None:
     module = _load_script_module("tests.scripts.migrate_embeddings_script_isolated")
 
     assert "komari_bot" not in sys.modules
-    assert module.expand_targets({"memory"})[0].source_table == "komari_memory_conversations"
+    assert module.expand_targets({"all"})[0].source_table == "komari_knowledge"
 
     sys.modules.clear()
     sys.modules.update(original_modules)

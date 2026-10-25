@@ -29,17 +29,5 @@ class KomariContextConfigSchema(TypedConfigModel, table=True):
         description="回复生成失败时是否向 SUPERUSER 私聊发送极简诊断通知（群内错误提示不受此开关影响）",
     )
 
-    # Still-active recent interaction-buffer controls.
-    global_interaction_enabled: bool = Field(
-        default=True,
-        description="是否启用跨群互动事件缓冲",
-    )
-    global_interaction_trigger_size: int = Field(
-        default=20,
-        ge=5,
-        le=200,
-        description="触发事件总结的 Redis 缓冲条数阈值，不是 LIST 最大长度",
-    )
-
 
 __all__ = ["KomariContextConfigSchema"]

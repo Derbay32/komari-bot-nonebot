@@ -1,7 +1,8 @@
 """独立向量嵌入迁移工具。
 
 默认 dry-run；实际写入必须显式传入 ``--apply``。本脚本刻意不导入 ``komari_bot`` 包，
-用于在运行时插件不可加载时仍能重建知识库与记忆向量。v2.0.0 起连接串统一读取
+用于在运行时插件不可加载时仍能重建知识库向量。记忆向量目标已随 TSK-197 退役，
+``--target memory`` 在 CLI 解析阶段被拒绝；v2.0.0 起连接串统一读取
 nonebot-plugin-orm 权威的 ``SQLALCHEMY_DATABASE_URL``（``--dsn`` 可显式覆盖）。
 """
 
@@ -9,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 import logging
 import os
 from dataclasses import dataclass
@@ -43,13 +43,8 @@ class MigrationTarget:
     source_table: str
     id_column: str
     text_column: str
-    embedding_table: str | None
-    embedding_owner_column: str | None
     embedding_column: str = "embedding"
-    content_hash_column: str = "content_hash"
-    embedding_dim_column: str = "embedding_dim"
     vector_index_name: str | None = None
-    conflict_column: str | None = None
 
 
 @dataclass(frozen=True)
@@ -66,40 +61,17 @@ class MigrationResult:
     failed_rows: int
 
 
-CONVERSATION_MEMORY_TARGET = MigrationTarget(
-    name="memory_conversations",
-    source_table="komari_memory_conversations",
-    id_column="id",
-    text_column="summary",
-    embedding_table="komari_memory_conversation_embeddings",
-    embedding_owner_column="conversation_id",
-    vector_index_name="idx_komari_memory_conv_embedding_vector",
-    conflict_column="conversation_id",
-)
-INTERACTION_MEMORY_TARGET = MigrationTarget(
-    name="memory_interactions",
-    source_table="komari_memory_interaction_history",
-    id_column="id",
-    text_column="event_summary",
-    embedding_table="komari_memory_interaction_embeddings",
-    embedding_owner_column="interaction_id",
-    vector_index_name="idx_komari_memory_interaction_embedding_vector",
-    conflict_column="interaction_id",
-)
 KNOWLEDGE_TARGET = MigrationTarget(
     name="knowledge",
     source_table="komari_knowledge",
     id_column="id",
     text_column="content",
-    embedding_table=None,
-    embedding_owner_column=None,
     vector_index_name="idx_komari_knowledge_embedding",
 )
 
 TARGET_GROUPS: dict[str, tuple[MigrationTarget, ...]] = {
-    "memory": (CONVERSATION_MEMORY_TARGET, INTERACTION_MEMORY_TARGET),
     "knowledge": (KNOWLEDGE_TARGET,),
-    "all": (CONVERSATION_MEMORY_TARGET, INTERACTION_MEMORY_TARGET, KNOWLEDGE_TARGET),
+    "all": (KNOWLEDGE_TARGET,),
 }
 
 
@@ -181,8 +153,8 @@ def parse_args() -> argparse.Namespace:
         "--target",
         dest="targets",
         action="append",
-        choices=("knowledge", "memory", "all"),
-        help="迁移目标，可重复传入；默认 all",
+        choices=("knowledge", "all"),
+        help="迁移目标，可重复传入；默认 all（当前仅含 knowledge）",
     )
     parser.add_argument(
         "--apply", action="store_true", help="执行数据库写入（默认 dry-run）"
@@ -216,10 +188,12 @@ def build_embedding_config(args: argparse.Namespace) -> EmbeddingConfig:
 
 def expand_targets(targets: set[str]) -> tuple[MigrationTarget, ...]:
     selected = targets or {"all"}
+    unknown = sorted(selected - set(TARGET_GROUPS))
+    if unknown:
+        msg = f"不支持的迁移目标: {', '.join(unknown)}"
+        raise ValueError(msg)
     expanded: list[MigrationTarget] = []
-    for target_name in (
-        ("memory", "knowledge") if "all" in selected else sorted(selected)
-    ):
+    for target_name in ("knowledge",) if "all" in selected else sorted(selected):
         for target in TARGET_GROUPS[target_name]:
             if target not in expanded:
                 expanded.append(target)
@@ -316,9 +290,7 @@ async def migrate_target(
             text = str(row["text"] or "")
             try:
                 embedding = await request_embedding(text, embedding_config)
-                await _write_embedding(
-                    conn, target, int(row["row_id"]), text, embedding
-                )
+                await _write_embedding(conn, target, int(row["row_id"]), embedding)
                 updated_rows += 1
             except Exception:
                 failed_rows += 1
@@ -358,32 +330,8 @@ async def _table_exists(conn: Any, table_name: str) -> bool:
     return bool(await conn.fetchval("SELECT to_regclass($1) IS NOT NULL", table_name))
 
 
-async def _column_exists(conn: Any, table_name: str, column_name: str) -> bool:
-    if not await _table_exists(conn, table_name):
-        return False
-
-    return bool(
-        await conn.fetchval(
-            """
-            SELECT EXISTS (
-                SELECT 1
-                FROM pg_attribute
-                WHERE attrelid = $1::regclass
-                  AND attname = $2
-                  AND NOT attisdropped
-            )
-            """,
-            table_name,
-            column_name,
-        )
-    )
-
-
 async def _current_dimension(conn: Any, target: MigrationTarget) -> int | None:
-    table_name = target.embedding_table or target.source_table
-    if not await _table_exists(conn, table_name):
-        return None
-
+    table_name = target.source_table
     row = await conn.fetchrow(
         """
         SELECT atttypmod
@@ -405,42 +353,19 @@ async def _ensure_target_schema(
     conn: Any, target: MigrationTarget, dimension: int
 ) -> None:
     await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
-    if target.embedding_table is None:
-        await conn.execute(
-            f"ALTER TABLE {target.source_table} DROP COLUMN IF EXISTS {target.embedding_column}"
-        )
-        await conn.execute(
-            f"ALTER TABLE {target.source_table} ADD COLUMN {target.embedding_column} VECTOR({dimension})"
-        )
-    else:
-        await conn.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {target.embedding_table} (
-                id BIGSERIAL PRIMARY KEY,
-                {target.embedding_owner_column} INT NOT NULL REFERENCES {target.source_table}({target.id_column}) ON DELETE CASCADE,
-                {target.content_hash_column} TEXT NOT NULL,
-                {target.embedding_column} VECTOR({dimension}) NOT NULL,
-                {target.embedding_dim_column} INT NOT NULL,
-                embedded_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE ({target.embedding_owner_column})
-            )
-            """
-        )
-        await conn.execute(
-            f"ALTER TABLE {target.embedding_table} ALTER COLUMN {target.embedding_column} TYPE VECTOR({dimension})"
-        )
-        if await _column_exists(conn, target.source_table, target.embedding_column):
-            await conn.execute(
-                f"ALTER TABLE {target.source_table} DROP COLUMN {target.embedding_column}"
-            )
+    await conn.execute(
+        f"ALTER TABLE {target.source_table} DROP COLUMN IF EXISTS {target.embedding_column}"
+    )
+    await conn.execute(
+        f"ALTER TABLE {target.source_table} ADD COLUMN {target.embedding_column} VECTOR({dimension})"
+    )
     if target.vector_index_name:
         await conn.execute(f"DROP INDEX IF EXISTS {target.vector_index_name}")
         if dimension <= PGVECTOR_VECTOR_HNSW_MAX_DIMENSIONS:
-            index_table = target.embedding_table or target.source_table
             await conn.execute(
                 f"""
                 CREATE INDEX IF NOT EXISTS {target.vector_index_name}
-                ON {index_table}
+                ON {target.source_table}
                 USING hnsw ({target.embedding_column} vector_cosine_ops)
                 WITH (m = 16, ef_construction = 64)
                 """
@@ -448,30 +373,12 @@ async def _ensure_target_schema(
 
 
 async def _write_embedding(
-    conn: Any, target: MigrationTarget, row_id: int, text: str, embedding: str
+    conn: Any, target: MigrationTarget, row_id: int, embedding: str
 ) -> None:
-    if target.embedding_table is None:
-        await conn.execute(
-            f"UPDATE {target.source_table} SET {target.embedding_column} = $1 WHERE {target.id_column} = $2",
-            embedding,
-            row_id,
-        )
-        return
-
     await conn.execute(
-        f"""
-        INSERT INTO {target.embedding_table}
-            ({target.embedding_owner_column}, {target.content_hash_column}, {target.embedding_column}, {target.embedding_dim_column})
-        VALUES ($1, $2, $3, vector_dims($3::vector))
-        ON CONFLICT ({target.conflict_column}) DO UPDATE SET
-            {target.content_hash_column} = EXCLUDED.{target.content_hash_column},
-            {target.embedding_column} = EXCLUDED.{target.embedding_column},
-            {target.embedding_dim_column} = EXCLUDED.{target.embedding_dim_column},
-            embedded_at = CURRENT_TIMESTAMP
-        """,
-        row_id,
-        hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        f"UPDATE {target.source_table} SET {target.embedding_column} = $1 WHERE {target.id_column} = $2",
         embedding,
+        row_id,
     )
 
 

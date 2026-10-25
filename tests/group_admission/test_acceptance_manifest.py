@@ -83,10 +83,6 @@ EXPECTED_EFFECT_CASE_IDS = {
     "group_admission.effect.fulfillment.reconcile",
     "group_admission.effect.fulfillment.commitment",
     "group_admission.effect.fulfillment.cleanup",
-    "group_admission.effect.memory.conversation_claim",
-    "group_admission.effect.memory.conversation_body_read",
-    "group_admission.effect.memory.interaction_global_commit",
-    "group_admission.effect.memory.forgetting_decay",
     # TSK-231 管理面群目标治理效果
     "group_admission.effect.management.reply_fulfillment_list",
     "group_admission.effect.management.reply_fulfillment_confirm_delivered",
@@ -95,9 +91,6 @@ EXPECTED_EFFECT_CASE_IDS = {
     "group_admission.effect.management.reply_fulfillment_reservation_release",
     "group_admission.effect.management.announcement_send",
     "group_admission.effect.management.announcement_replay",
-    "group_admission.effect.management.dead_letter_list",
-    "group_admission.effect.management.dead_letter_requeue",
-    "group_admission.effect.management.memory_conversation_write",
 }
 
 EXPECTED_MANAGEMENT_CASE_IDS = {
@@ -300,20 +293,6 @@ def test_fulfillment_effect_case_rows_are_attributed() -> None:
         assert case.attribution_source == "reply_fulfillment.group_id", case.effect_id
 
 
-def test_memory_effect_case_rows_are_attributed() -> None:
-    """TSK-230 记忆 dormancy 效果行归属 komari_memory，intent 受控。"""
-    memory_prefix = "group_admission.effect.memory."
-    memory_cases = [
-        case
-        for case in ADMISSION_EFFECT_CASES
-        if case.effect_id.startswith(memory_prefix)
-    ]
-    assert len(memory_cases) >= 4, "TSK-230 必须登记 memory 效果行"
-    for case in memory_cases:
-        assert case.owner_module == "komari_bot.plugins.komari_memory", case.effect_id
-        assert case.intent == "business", case.effect_id
-
-
 def test_management_effect_case_rows_are_attributed() -> None:
     """TSK-231 管理面效果行:owner 闭集 + intent 闭集 + 归属非空。"""
     prefix = "group_admission.effect.management."
@@ -322,10 +301,9 @@ def test_management_effect_case_rows_are_attributed() -> None:
     ]
     assert len(rows) >= 5, "TSK-231 必须登记管理面治理效果行"
     for case in rows:
-        assert case.owner_module in {
-            "komari_bot.plugins.komari_management",
-            "komari_bot.plugins.komari_memory",
-        }, case.effect_id
+        assert case.owner_module == "komari_bot.plugins.komari_management", (
+            case.effect_id
+        )
         assert case.intent in {
             "business",
             "fact_finalization",

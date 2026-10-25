@@ -25,7 +25,7 @@ from tests.db.tsk197_gate_support import (
 
 pytestmark = [SKIP_NO_POSTGRES, pytest.mark.asyncio]
 
-HEAD = "0029"
+HEAD = "0030"
 PREVIOUS = "0028"
 UNFINISHED_CODE = "TSK195_UNFINISHED_REPLY_FULFILLMENT"
 PARENT = "komari_chat_reply_fulfillments"
@@ -181,7 +181,7 @@ async def test_0029_upgrades_empty_database_to_head_with_zero_orm_drift() -> Non
     database = str(scratch["database"])
     try:
         _upgrade(database, PREVIOUS)
-        result = run_bootstrap(scratch_url(database), "upgrade", "head")
+        result = run_bootstrap(scratch_url(database), "upgrade", "0029")
 
         assert result.returncode == 0, result.stderr
         connection = await asyncpg.connect(**scratch)
@@ -191,7 +191,21 @@ async def test_0029_upgrades_empty_database_to_head_with_zero_orm_drift() -> Non
             )
         finally:
             await connection.close()
-        assert version == HEAD
+        assert version == "0029"
+        # Historical invariant holds at 0029; the current head must still be
+        # reachable with zero ORM drift.
+        head_result = run_bootstrap(scratch_url(database), "upgrade", "head")
+        assert head_result.returncode == 0, head_result.stderr
+        connection = await asyncpg.connect(**scratch)
+        try:
+            assert (
+                await connection.fetchval(
+                    "SELECT version_num FROM alembic_version"
+                )
+                == HEAD
+            )
+        finally:
+            await connection.close()
         check = run_bootstrap(scratch_url(database), "check")
         assert check.returncode == 0, f"{check.stdout}\n{check.stderr}"
     finally:
@@ -234,11 +248,11 @@ async def test_0029_preserves_terminal_history_and_allows_new_commitment() -> No
             await connection.close()
 
         before = await _snapshot(database)
-        result = run_bootstrap(scratch_url(database), "upgrade", "head")
+        result = run_bootstrap(scratch_url(database), "upgrade", "0029")
         assert result.returncode == 0, result.stderr
         after = await _snapshot(database)
 
-        assert after["version"] == HEAD
+        assert after["version"] == "0029"
         assert after["parents"] == before["parents"]
         assert after["children"] == before["children"]
         assert after["definition"] != before["definition"]
@@ -292,7 +306,7 @@ async def test_0029_refuses_downgrade_without_restoring_old_protocol() -> None:
     database = str(scratch["database"])
     try:
         _upgrade(database, PREVIOUS)
-        _upgrade(database, "head")
+        _upgrade(database, "0029")
         before = await _snapshot(database)
 
         result = run_bootstrap(scratch_url(database), "downgrade", PREVIOUS)

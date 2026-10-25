@@ -44,5 +44,6 @@ v2.0.0 起，数据库连接池、engine/session 生命周期与 Schema 迁移�
 - 基线 0001 实际建 **26 张表**（含保留的 `komari_plugin_configs` / `komari_prompt_configs` 两张 legacy 配置表，运行时不读写）；加上 0002 的 14 张配置表与 0003 的 3 张 Prompt 表，版本链共 43 张表。
 - 跨进程配置变更通知最终采用「应用事件循环亚秒级轮询 `revision`」而非 asyncpg LISTEN/NOTIFY（0002 迁移注释同步说明）；Prompt 变更传播依赖 `PromptTemplateLoader` 1 秒陈限上限 + 本进程写入即时失效回调。
 - `komari_memory/database/init_orm.sql` 与 `komari_knowledge/init_db.sql` 保留为 fail-closed 提示/运维参考文件，不再作为运行时 DDL 来源；手工建表只能使用 `scripts/render_memory_schema.py` 离线渲染。
+  > 当前退役说明（TSK-197 / ADR-0015 / 迁移 0030）：上述 `komari_memory/database/init_orm.sql` 与 `scripts/render_memory_schema.py` 已物理删除；结构唯一权威仍是 Alembic 版本链。该行保留为历史决策记录，不代表当前仍提供渲染脚本。
 - 旧脚本 `split_komari_memory_entity_tables.py`、`extract_komari_memory_profile_columns.py`、`drop_legacy_user_attributes_table.py` 已删除（其目标结构已由基线 0001 一次性覆盖）。
 - 管理 API 配置来源描述为 `postgresql:<强类型表名>`（如 `postgresql:komari_prompt_komari_chat:komari_chat`），不再使用 `komari_plugin_configs` / `komari_prompt_configs`。

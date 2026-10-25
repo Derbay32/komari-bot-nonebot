@@ -38,9 +38,6 @@ from komari_bot.plugins.komari_knowledge.config_schema import (
     DynamicConfigSchema as KnowledgeConfigSchema,
 )
 from komari_bot.plugins.komari_memory.config_schema import KomariMemoryConfigSchema
-from komari_bot.plugins.komari_memory.prompt_schema import (
-    DISPLAY_NAME as KOMARI_MEMORY_SUMMARY_PROMPT_DISPLAY_NAME,
-)
 from komari_bot.plugins.komari_roulette.config_schema import (
     DynamicConfigSchema as RouletteConfigSchema,
 )
@@ -260,10 +257,6 @@ def _load_management_components() -> ManagementApiComponents:
             ManagedPromptResource(
                 resource_id="komari_chat",
                 display_name=KOMARI_CHAT_PROMPT_DISPLAY_NAME,
-            ),
-            ManagedPromptResource(
-                resource_id="komari_memory_summary",
-                display_name=KOMARI_MEMORY_SUMMARY_PROMPT_DISPLAY_NAME,
             ),
             ManagedPromptResource(
                 resource_id="group_history_summary",

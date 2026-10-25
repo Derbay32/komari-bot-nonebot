@@ -18,7 +18,6 @@ from tests.db.tsk197_gate_support import (
     drop_scratch_database,
     recreate_scratch_database,
     run_bootstrap,
-    run_seed,
     scratch_url,
 )
 
@@ -164,9 +163,45 @@ async def _fetch_row(connection: asyncpg.Connection, table: str) -> dict[str, An
 async def _assert_prompt_row_unchanged(
     connection: asyncpg.Connection,
     before: dict[str, Any],
+    *,
+    retired_fields: frozenset[str] = frozenset(),
 ) -> None:
+    """Require exact preservation, with only explicitly retired columns removed."""
     after = await _fetch_row(connection, _PROMPT_TABLE)
-    assert after == before
+    expected = {
+        key: value for key, value in before.items() if key not in retired_fields
+    }
+    assert after == expected
+
+
+async def _insert_prompt_row(connection: asyncpg.Connection) -> None:
+    """Insert a chat prompt row without running the current seed CLI at 0026."""
+    rows = await connection.fetch(
+        "SELECT column_name, data_type, is_nullable "
+        "FROM information_schema.columns WHERE table_name = $1 "
+        "ORDER BY ordinal_position",
+        _PROMPT_TABLE,
+    )
+    values: dict[str, Any] = {}
+    for row in rows:
+        column = str(row["column_name"])
+        if column == "id":
+            values[column] = 1
+        elif column == "revision":
+            values[column] = 5
+        elif column == "updated_at":
+            values[column] = _UPDATED_AT
+        elif str(row["is_nullable"]) == "YES":
+            values[column] = None
+        else:
+            values[column] = f"admin-{column}"
+    columns = list(values)
+    placeholders = ", ".join(f"${index}" for index in range(1, len(columns) + 1))
+    await connection.execute(
+        f"INSERT INTO {_PROMPT_TABLE} ({', '.join(columns)}) "
+        f"VALUES ({placeholders}) ON CONFLICT (id) DO NOTHING",
+        *(values[column] for column in columns),
+    )
 
 
 async def test_migration_moves_every_owned_field_and_preserves_unrelated_data() -> None:
@@ -175,8 +210,6 @@ async def test_migration_moves_every_owned_field_and_preserves_unrelated_data() 
     try:
         result = run_bootstrap(db_url, "upgrade", "0026")
         assert result.returncode == 0, result.stderr
-        seed = run_seed(db_url)
-        assert seed.returncode == 0, f"{seed.stdout}\n{seed.stderr}"
 
         connection = await asyncpg.connect(**scratch)
         try:
@@ -208,15 +241,14 @@ async def test_migration_moves_every_owned_field_and_preserves_unrelated_data() 
                 "(group_id, summary, start_time, end_time) "
                 "VALUES ('g1', 'formal memory canary', now(), now())"
             )
+            await _insert_prompt_row(connection)
             prompt_before = await _fetch_row(connection, _PROMPT_TABLE)
         finally:
             await connection.close()
 
-        result = run_bootstrap(db_url, "upgrade", "head")
+        # Historical invariant at 0027's intended revision.
+        result = run_bootstrap(db_url, "upgrade", "0027")
         assert result.returncode == 0, result.stderr
-        check = run_bootstrap(db_url, "check")
-        assert check.returncode == 0, f"{check.stdout}\n{check.stderr}"
-
         connection = await asyncpg.connect(**scratch)
         try:
             chat = await _fetch_row(connection, _CHAT_TABLE)
@@ -292,6 +324,60 @@ async def test_migration_moves_every_owned_field_and_preserves_unrelated_data() 
             }
             assert not (set(MOVED_TO_CHAT) | set(QUERY_REWRITE_TARGET)) & chat_columns
             assert not set(MOVED_TO_CONTEXT) & context_columns
+        finally:
+            await connection.close()
+
+        # Advance to the current head: 0030 removes only the retired memory
+        # columns, while chat/context live values and admin prompts survive.
+        result = run_bootstrap(db_url, "upgrade", "head")
+        assert result.returncode == 0, result.stderr
+        check = run_bootstrap(db_url, "check")
+        assert check.returncode == 0, f"{check.stdout}\n{check.stderr}"
+        connection = await asyncpg.connect(**scratch)
+        try:
+            chat = await _fetch_row(connection, _CHAT_TABLE)
+            for field, expected in {**MOVED_TO_CHAT, **QUERY_REWRITE_TARGET}.items():
+                assert chat[field] == expected, field
+            for field, expected in CHAT_SENTINELS.items():
+                assert chat[field] == expected, field
+            assert chat["plugin_enable"] is True
+            assert chat["revision"] == _CHAT_REVISION
+            assert chat["updated_at"] == _UPDATED_AT
+
+            context = await _fetch_row(connection, _CONTEXT_TABLE)
+            for field in ("bot_nickname", "error_notify_enabled"):
+                assert context[field] == MOVED_TO_CONTEXT[field], field
+            assert context["redis_db"] == 6
+            assert context["revision"] == _CONTEXT_REVISION
+            assert context["updated_at"] == _UPDATED_AT
+            assert not {
+                "global_interaction_enabled",
+                "global_interaction_trigger_size",
+            } & set(context)
+
+            memory = await _fetch_row(connection, _MEMORY_TABLE)
+            assert memory["plugin_enable"] is True
+            assert memory["revision"] == _SOURCE_REVISION
+            assert memory["updated_at"] == _UPDATED_AT
+            retired_fields = {
+                *MOVED_TO_CHAT,
+                *QUERY_REWRITE_SOURCE,
+                *MEMORY_RETAINED_SENTINELS,
+                "bot_aliases",
+            } - {"plugin_enable"}
+            for field in retired_fields:
+                assert field not in memory, field
+            assert (
+                await connection.fetchval(
+                    "SELECT summary FROM komari_memory_conversations WHERE group_id = 'g1'"
+                )
+                == "formal memory canary"
+            )
+            await _assert_prompt_row_unchanged(
+                connection,
+                prompt_before,
+                retired_fields=frozenset({"profile_read_instruction"}),
+            )
         finally:
             await connection.close()
     finally:
@@ -388,8 +474,6 @@ async def test_migration_uses_source_row_when_both_target_rows_are_missing() -> 
     try:
         result = run_bootstrap(db_url, "upgrade", "0026")
         assert result.returncode == 0, result.stderr
-        seed = run_seed(db_url)
-        assert seed.returncode == 0, f"{seed.stdout}\n{seed.stderr}"
 
         connection = await asyncpg.connect(**scratch)
         try:
@@ -409,6 +493,7 @@ async def test_migration_uses_source_row_when_both_target_rows_are_missing() -> 
                 "(group_id, summary, start_time, end_time) "
                 "VALUES ('g1', 'source-only memory canary', now(), now())"
             )
+            await _insert_prompt_row(connection)
             prompt_before = await _fetch_row(connection, _PROMPT_TABLE)
             assert (
                 await connection.fetchval(
@@ -422,6 +507,43 @@ async def test_migration_uses_source_row_when_both_target_rows_are_missing() -> 
                 )
                 is False
             )
+        finally:
+            await connection.close()
+
+        # Historical invariant at 0027's intended revision (source-backed
+        # INSERT branch for both target singletons).
+        result = run_bootstrap(db_url, "upgrade", "0027")
+        assert result.returncode == 0, result.stderr
+        connection = await asyncpg.connect(**scratch)
+        try:
+            chat = await _fetch_row(connection, _CHAT_TABLE)
+            for field, expected in MOVED_TO_CHAT.items():
+                assert chat[field] == expected, field
+            for field, expected in QUERY_REWRITE_TARGET.items():
+                assert chat[field] == expected, field
+            assert chat["plugin_enable"] is True
+            assert chat["revision"] == _SOURCE_REVISION
+            assert chat["updated_at"] == _UPDATED_AT
+
+            context = await _fetch_row(connection, _CONTEXT_TABLE)
+            for field, expected in MOVED_TO_CONTEXT.items():
+                assert context[field] == expected, field
+            assert context["redis_db"] == 1
+            assert context["revision"] == 1
+
+            memory = await _fetch_row(connection, _MEMORY_TABLE)
+            for field in {*MOVED_TO_CHAT, *MOVED_TO_CONTEXT}:
+                assert field not in memory, field
+            for field, expected in {
+                **QUERY_REWRITE_SOURCE,
+                **MEMORY_RETAINED_SENTINELS,
+            }.items():
+                if field == "bot_aliases":
+                    continue
+                assert memory[field] == expected, field
+            assert json.loads(memory["bot_aliases"]) == ["phase-b", "小鞠"]
+            assert memory["revision"] == _SOURCE_REVISION
+            await _assert_prompt_row_unchanged(connection, prompt_before)
         finally:
             await connection.close()
 
@@ -451,32 +573,40 @@ async def test_migration_uses_source_row_when_both_target_rows_are_missing() -> 
             assert chat["updated_at"] == _UPDATED_AT
 
             context = await _fetch_row(connection, _CONTEXT_TABLE)
-            for field, expected in MOVED_TO_CONTEXT.items():
-                assert context[field] == expected, field
+            for field in ("bot_nickname", "error_notify_enabled"):
+                assert context[field] == MOVED_TO_CONTEXT[field], field
             assert context["redis_db"] == 1
             assert context["revision"] == 1
             assert isinstance(context["updated_at"], datetime)
             assert context["updated_at"].tzinfo is not None
+            assert not {
+                "global_interaction_enabled",
+                "global_interaction_trigger_size",
+            } & set(context)
 
             memory = await _fetch_row(connection, _MEMORY_TABLE)
-            for field in {*MOVED_TO_CHAT, *MOVED_TO_CONTEXT}:
-                assert field not in memory, field
-            for field, expected in {
-                **QUERY_REWRITE_SOURCE,
-                **MEMORY_RETAINED_SENTINELS,
-            }.items():
-                if field == "bot_aliases":
-                    continue
-                assert memory[field] == expected, field
-            assert json.loads(memory["bot_aliases"]) == ["phase-b", "小鞠"]
+            assert memory["plugin_enable"] is True
             assert memory["revision"] == _SOURCE_REVISION
+            retired_fields = {
+                *MOVED_TO_CHAT,
+                *MOVED_TO_CONTEXT,
+                *QUERY_REWRITE_SOURCE,
+                *MEMORY_RETAINED_SENTINELS,
+                "bot_aliases",
+            } - {"plugin_enable"}
+            for field in retired_fields:
+                assert field not in memory, field
             assert (
                 await connection.fetchval(
                     "SELECT summary FROM komari_memory_conversations WHERE group_id = 'g1'"
                 )
                 == "source-only memory canary"
             )
-            await _assert_prompt_row_unchanged(connection, prompt_before)
+            await _assert_prompt_row_unchanged(
+                connection,
+                prompt_before,
+                retired_fields=frozenset({"profile_read_instruction"}),
+            )
         finally:
             await connection.close()
     finally:

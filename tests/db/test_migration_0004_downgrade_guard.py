@@ -367,6 +367,36 @@ async def _ensure_memory_config_row(conn: asyncpg.Connection) -> bool:
             if column in table_columns and column not in value_columns:
                 value_columns.append(column)
                 values.append(value)
+    # TSK-197：历史 0003 结构仍持有已退役的 33 个旧算法列，head schema
+    # 不再声明它们。按真实列类型补齐合法占位值，保留 0004 downgrade
+    # 的值回填断言不被新 head 删除面破坏。
+    metadata_rows = await conn.fetch(
+        "SELECT column_name, data_type, is_nullable "
+        "FROM information_schema.columns WHERE table_name = 'komari_memory_config'"
+    )
+    metadata = {str(row["column_name"]): row for row in metadata_rows}
+    for column in table_columns:
+        if column in ("id", "revision", "updated_at") or column in value_columns:
+            continue
+        row = metadata[column]
+        data_type = str(row["data_type"])
+        nullable = str(row["is_nullable"]) == "YES"
+        if nullable:
+            value: object = None
+        elif data_type == "boolean":
+            value = False
+        elif data_type == "jsonb":
+            value = []
+        elif data_type in {"integer", "bigint"}:
+            value = 1
+        elif data_type in {"real", "double precision"}:
+            value = 1.0
+        elif data_type.startswith("timestamp"):
+            value = datetime.now(UTC)
+        else:
+            value = ""
+        value_columns.append(column)
+        values.append(value)
     # JSONB 列（白名单等列表/字典字段）必须序列化并显式 ::jsonb 转型，
     # 否则 asyncpg 把 list 当数组绑定而报 DataError
     serialized = [

@@ -1,10 +1,9 @@
-"""TSK-231 管理面群目标准入红基线测试共享基础设施（测试专用，不承载生产语义）。
+"""TSK-231 管理面群目标准入验收共享基础设施（测试专用，不承载生产语义）。
 
-本模块承载把真实管理 Router（reply_fulfillment / announce / dead-letter /
-komari_memory）装配为可测 FastAPI 应用所需的确定性依赖与 fake，并在内存中
-安装脚本化 ``adjudicate``（复用聊天验收的 ScriptedAdjudicate）。当前生产
-管理端点在处理群目标效果前不调用顶层 ``adjudicate``，因此受限/失败态下效果
-仍执行、列表仍回显受限群存在性，本工单验收用例以红态失败终止，证明接入缺失。
+本模块承载把真实管理 Router（reply_fulfillment / announce）装配为可测
+FastAPI 应用所需的确定性依赖与 fake，并在内存中安装脚本化 ``adjudicate``
+（复用聊天验收的 ScriptedAdjudicate）。旧记忆与 dead-letter 管理面已随
+TSK-197 退役，这里只保留仍存在的履约与公告验收依赖。
 
 本模块不新增任何生产文件或生产改动，只提供测试专用 fake / 装配 / helper。
 """
@@ -14,9 +13,6 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any
 
-from komari_bot.plugins.komari_memory.services.conversation_processing import (
-    ConversationDeadLetter,
-)
 from tests.group_admission.chat_admission_support import install_scripted_adjudicate
 
 if TYPE_CHECKING:
@@ -27,16 +23,6 @@ if TYPE_CHECKING:
 
 #: 管理凭据矩阵：资源读写 + 通配 SUPERUSER（只负责认证，不提供准入 bypass）。
 MANAGEMENT_CREDENTIALS: tuple[Mapping[str, object], ...] = (
-    {
-        "credential_id": "memory-reader",
-        "token": "memory-reader-token-0000",
-        "permissions": ["memory:read"],
-    },
-    {
-        "credential_id": "memory-writer",
-        "token": "memory-writer-token-0000",
-        "permissions": ["memory:write"],
-    },
     {
         "credential_id": "fulfillment-manager",
         "token": "fulfillment-manage-token-00",
@@ -186,101 +172,6 @@ class FakeOpsService:
             "commitment_type": commitment_type,
             "state": "PENDING",
         }
-
-
-# ---------------------------------------------------------------------------
-# dead-letter fake（Redis 摘要、无正文；list / requeue 计数）
-# ---------------------------------------------------------------------------
-class FakeDeadLetterManager:
-    """对话失败快照 Redis 管理器替身；记录 list / requeue 调用。"""
-
-    def __init__(self, *, group_ids: list[str] | None = None) -> None:
-        self.group_ids = group_ids or [ALLOWED_GROUP_ID, RESTRICTED_GROUP_ID]
-        self.list_calls: list[int] = []
-        self.requeue_calls: list[tuple[str, str]] = []
-        #: 无正文摘要：只含 group/snapshot/失败元数据（生产 REST 契约）。
-        self.items = [
-            ConversationDeadLetter(
-                group_id=group_id,
-                snapshot_id=f"snap-{group_id}",
-                failure_code="conversation_processing_failed",
-                attempt_count=2,
-                failed_at_ms=1_000_000,
-                message_count=0,
-                chunk_state_count=2,
-            )
-            for group_id in self.group_ids
-        ]
-
-    async def list_conversation_dead_letters(self, *, limit: int = 100) -> list[ConversationDeadLetter]:
-        self.list_calls.append(limit)
-        return list(self.items)
-
-    async def requeue_conversation_dead_letter(self, *, group_id: str, snapshot_id: str) -> int | None:
-        self.requeue_calls.append((group_id, snapshot_id))
-        if group_id not in self.group_ids:
-            return None  # 未找到 -> 404
-        return 3  # restored_message_count
-
-# ---------------------------------------------------------------------------
-# 群记忆服务 fake（create / list / get / update / delete conversation 计数）
-# ---------------------------------------------------------------------------
-def conversation_entry(*, conversation_id: int = 1, group_id: str = ALLOWED_GROUP_ID) -> dict[str, Any]:
-    """构造一条对话记忆条目（REST 契约形状）。"""
-    return {
-        "id": conversation_id,
-        "group_id": group_id,
-        "summary": "一起聊了布丁",
-        "participants": ["u1"],
-        "start_time": "2026-04-10T12:00:00+00:00",
-        "end_time": "2026-04-10T12:00:00+00:00",
-        "importance_initial": 4,
-        "importance_current": 4,
-        "last_accessed": "2026-04-10T12:00:00+00:00",
-        "created_at": "2026-04-10T12:00:00+00:00",
-    }
-
-
-class FakeMemoryService:
-    """komari_memory 服务替身；记录 create / delete / list 调用用于“已拦截”断言。"""
-
-    def __init__(self, *, group_ids: list[str] | None = None) -> None:
-        self.group_ids = group_ids or [ALLOWED_GROUP_ID, RESTRICTED_GROUP_ID]
-        self.rows: dict[int, dict[str, Any]] = {}
-        for idx, group_id in enumerate(self.group_ids, start=1):
-            self.rows[idx] = conversation_entry(conversation_id=idx, group_id=group_id)
-        self.create_calls: list[dict[str, Any]] = []
-        self.delete_calls: list[int] = []
-        self.list_calls: int = 0
-
-    async def list_conversations(
-        self, **kwargs: object
-    ) -> tuple[list[dict[str, Any]], int]:
-        del kwargs
-        self.list_calls += 1
-        return list(self.rows.values()), len(self.rows)
-
-    async def get_conversation_entry(
-        self, conversation_id: int
-    ) -> dict[str, Any] | None:
-        return self.rows.get(conversation_id)
-
-    async def create_conversation_entry(self, **kwargs: object) -> dict[str, Any]:
-        self.create_calls.append(kwargs)
-        new_id = max(self.rows, default=0) + 1
-        entry = conversation_entry(conversation_id=new_id, group_id=str(kwargs.get("group_id") or ALLOWED_GROUP_ID))
-        self.rows[new_id] = entry
-        return entry
-
-    async def update_conversation_entry(
-        self, conversation_id: int, **kwargs: object
-    ) -> dict[str, Any] | None:
-        del kwargs
-        return self.rows.get(conversation_id)
-
-    async def delete_conversation_entry(self, conversation_id: int) -> bool:
-        self.delete_calls.append(conversation_id)
-        return conversation_id in self.rows
 
 
 # ---------------------------------------------------------------------------

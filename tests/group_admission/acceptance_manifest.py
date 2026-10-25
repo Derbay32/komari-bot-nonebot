@@ -894,71 +894,10 @@ ADMISSION_EFFECT_CASES += (
 )
 
 
-# TSK-230 komari_memory 群工作休眠与归属传播的逐效果准入登记。每条受治理业务
-# 效果带独立 effect_id（前缀 ``group_admission.effect.memory.*``），owner_module
-# 均为 komari_memory，intent 覆盖 business；归属来自群对话/互动快照与 job
-# 的 group_id lineage。anchor 指向本票真实 pytest node（红基线测试驱动真实
-# worker/repository/manager 入口）。
-ADMISSION_EFFECT_CASES += (
-    AdmissionEffectCase(
-        effect_id="group_admission.effect.memory.conversation_claim",
-        owner_module="komari_bot.plugins.komari_memory",
-        source_symbol="ConversationProcessingLifecycle.process_conversation_snapshot",
-        sink_kind="conversation_buffer_claim_lease",
-        intent="business",
-        attribution_source="conversation_processing_snapshot.group_id",
-        work_category="persistent_group_work",
-        acceptance_anchor=(
-            "tests/group_admission/test_memory_dormancy_admission.py"
-            "::test_ac2_restricted_no_business_lease_no_failure_budget_no_dead_letter"
-        ),
-    ),
-    AdmissionEffectCase(
-        effect_id="group_admission.effect.memory.conversation_body_read",
-        owner_module="komari_bot.plugins.komari_memory",
-        source_symbol="ConversationProcessingLifecycle._run_processing_attempt",
-        sink_kind="conversation_buffer_body_reader",
-        intent="business",
-        attribution_source="conversation_processing_snapshot.group_id",
-        work_category="persistent_group_work",
-        acceptance_anchor=(
-            "tests/group_admission/test_memory_dormancy_admission.py"
-            "::test_ac1_restricted_conversation_reader_fail_if_called"
-        ),
-    ),
-    AdmissionEffectCase(
-        effect_id="group_admission.effect.memory.interaction_global_commit",
-        owner_module="komari_bot.plugins.komari_memory",
-        source_symbol="InteractionEventRepository.insert_interaction_event",
-        sink_kind="interaction_history_global_commit",
-        intent="business",
-        attribution_source="interaction_v2_associated_group_ids",
-        work_category="persistent_group_work",
-        acceptance_anchor=(
-            "tests/group_admission/test_interaction_v2_admission.py"
-            "::test_ac6_global_commit_adjudicates_full_associated_group_set"
-        ),
-    ),
-    AdmissionEffectCase(
-        effect_id="group_admission.effect.memory.forgetting_decay",
-        owner_module="komari_bot.plugins.komari_memory",
-        source_symbol="ForgettingService.decay_and_cleanup",
-        sink_kind="conversation_importance_decay",
-        intent="business",
-        attribution_source="forgetting_job_associated_group_ids",
-        work_category="persistent_group_work",
-        acceptance_anchor=(
-            "tests/group_admission/test_forgetting_admission.py"
-            "::test_ac7_forgetting_restricted_day_skips_and_no_backfill"
-        ),
-    ),
-)
-
-
 # TSK-231 管理面群目标治理业务效果登记（owner 为各管理插件；effect_id 前缀
 # ``group_admission.effect.management.*``）。这些是管理 HTTP 效果在准入接入后
-# 受治理的业务效果行：owner 分别为 komari_management（履约/公告）与
-# komari_memory（记忆/dead-letter），intent 按 ADR-0012 精确分类——列表/发送/
+# 受治理的业务效果行：owner 为 komari_management（履约/公告），intent 按
+# ADR-0012 精确分类——列表/发送/
 # 编辑写为 business，对账/续跑/幂等回放为 fact_finalization，资源释放/终态
 # 清理为 technical_cleanup。anchor 指向本票真实 pytest node（红基线）。
 ADMISSION_EFFECT_CASES += (
@@ -1051,45 +990,6 @@ ADMISSION_EFFECT_CASES += (
         acceptance_anchor=(
             "tests/group_admission/test_management_announce_admission.py"
             "::test_announce_replay_same_payload_never_resends"
-        ),
-    ),
-    AdmissionEffectCase(
-        effect_id="group_admission.effect.management.dead_letter_list",
-        owner_module="komari_bot.plugins.komari_memory",
-        source_symbol="create_memory_router.list_conversation_dead_letters",
-        sink_kind="dead_letter_http_read",
-        intent="business",
-        attribution_source="dead_letter.group_id",
-        work_category="transient_interaction",
-        acceptance_anchor=(
-            "tests/group_admission/test_management_dead_letter_admission.py"
-            "::test_dead_letter_list_consults_business_intent"
-        ),
-    ),
-    AdmissionEffectCase(
-        effect_id="group_admission.effect.management.dead_letter_requeue",
-        owner_module="komari_bot.plugins.komari_memory",
-        source_symbol="create_memory_router.requeue_conversation_dead_letter",
-        sink_kind="dead_letter_requeue",
-        intent="business",
-        attribution_source="dead_letter.group_id",
-        work_category="persistent_group_work",
-        acceptance_anchor=(
-            "tests/group_admission/test_management_dead_letter_admission.py"
-            "::test_dead_letter_requeue_restricted_forbidden"
-        ),
-    ),
-    AdmissionEffectCase(
-        effect_id="group_admission.effect.management.memory_conversation_write",
-        owner_module="komari_bot.plugins.komari_memory",
-        source_symbol="create_memory_router.create_conversation",
-        sink_kind="memory_persist_cas",
-        intent="business",
-        attribution_source="conversation.group_id",
-        work_category="persistent_group_work",
-        acceptance_anchor=(
-            "tests/group_admission/test_management_memory_group_admission.py"
-            "::test_create_conversation_admitted_executes"
         ),
     ),
 )

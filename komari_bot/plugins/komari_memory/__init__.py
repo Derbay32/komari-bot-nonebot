@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 
 from nonebot import get_driver, logger
-from nonebot.plugin import PluginMetadata, require
+from nonebot.plugin import PluginMetadata
 
 from .config_schema import KomariMemoryConfigSchema
 from .services.config_interface import get_config_async
@@ -15,10 +15,6 @@ from .services.hindsight_service import (
     HindsightRecallSession,
     HindsightUnavailableError,
 )
-
-# TSK-197 removes this declaration together with the legacy files.  It only
-# loads the admission plugin; no admission policy runs inside the SDK caller.
-require("group_admission")
 
 __plugin_meta__ = PluginMetadata(
     name="小鞠记忆",
