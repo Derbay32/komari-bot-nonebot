@@ -46,7 +46,8 @@ komari-bot/
 │       ├── 0023_jev_decision_storage.py #  判定调度、去重、日志与 Prompt
 │       ├── 0024_jev_recent_settlement.py # 判定近期上下文结算
 │       ├── 0025_scene_storage_retirement.py # 不可逆删除旧场景存储
-│       └── 0030_hindsight_memory_retirement.py # 旧记忆配置/Prompt 退役（不可逆）
+│       ├── 0030_hindsight_memory_retirement.py # 旧记忆配置/Prompt 退役（不可逆）
+│       └── 0031_unused_memory_search_limit.py # 删除无调用方的召回数量配置（不可逆）
 │
 ├── komari_bot/                           # ★ 核心代码
 │   ├── core/                             # 核心启动与平台基础件（依赖 NoneBot 运行时）
@@ -419,11 +420,16 @@ TSK-197 已物理删除旧四层运行代码、专用配置列与记忆总结 Pr
 - 召回失败停止本次回复；空召回是成功。
 - 召回内容经 `UntrustedContext(source_type="memory")` 进入非 system 上下文。
 - 当前群准入在打开会话前和自动召回前各检查一次。
+- 近期上下文写入前重新检查当前群准入。
+- 聊天知识检索通过 `embedding_guard` 在实际向量化前检查当前群准入。
 - 不按记忆来源群过滤；工具参数不能选择 bank、地址或凭据。
 - TSK-197 已删除旧总结、画像、互动与忘却 worker，插件启动不加载它们。
 - 旧四层表、向量表与 HNSW 索引仍由历史 Alembic 迁移链保留。
 - `0030` 只删除旧配置列、上下文互动列、聊天死 Prompt 列与记忆总结 Prompt 表。
 - `0030` 不删除正式来源记忆表、向量、来源索引或旧任务表。
+- `0031` 只删除无调用方的 `komari_chat_config.memory_search_limit`。
+- `0031` 拒绝降级。
+- 配置故障在新版本上向前修复。
 - 运行时仍不执行任何 DDL。
 
 ### 4.1 知识与帮助关键词索引
