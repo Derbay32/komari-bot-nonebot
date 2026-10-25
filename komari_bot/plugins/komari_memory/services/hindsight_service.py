@@ -23,6 +23,12 @@ from typing import Any, Literal, cast
 
 from hindsight_client import Hindsight, RecallResponse
 
+from .hindsight_retain import (
+    HindsightRetainRequest,
+    derive_target_fingerprint,
+    perform_retain,
+)
+
 HINDSIGHT_PROBE_QUERY = "记忆服务健康检查"
 HINDSIGHT_PROBE_BUDGET = "low"
 HINDSIGHT_PROBE_MAX_TOKENS = 1
@@ -30,6 +36,15 @@ HINDSIGHT_RECALL_BUDGET = "mid"
 HINDSIGHT_RECALL_MAX_TOKENS = 4096
 _CLOSE_TIMEOUT_SECONDS = 1.0
 _EMPTY_RECALL_QUERY_ERROR = "recall query must be a non-empty string"
+_RETAIN_TYPE_ERROR = "request must be a HindsightRetainRequest"
+_RETAIN_FAILURES_WITHOUT_COOLDOWN: frozenset[str] = frozenset(
+    {
+        "document_conflict",
+        "session_closed",
+        "submission_not_admitted",
+        "target_changed",
+    }
+)
 
 HindsightFailureCode = Literal[
     "configuration_unavailable",
@@ -45,6 +60,12 @@ HindsightFailureCode = Literal[
     "recall_failed",
     "request_timeout",
     "response_invalid",
+    "document_conflict",
+    "document_read_failed",
+    "retain_failed",
+    "submission_not_admitted",
+    "target_changed",
+    "target_version_unsupported",
 ]
 
 HINDSIGHT_FAILURE_CODES: frozenset[str] = frozenset(
@@ -62,6 +83,12 @@ HINDSIGHT_FAILURE_CODES: frozenset[str] = frozenset(
         "recall_failed",
         "request_timeout",
         "response_invalid",
+        "document_conflict",
+        "document_read_failed",
+        "retain_failed",
+        "submission_not_admitted",
+        "target_changed",
+        "target_version_unsupported",
     }
 )
 
@@ -157,6 +184,14 @@ class HindsightSettings:
             )
         )
         return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+    @property
+    def target_fingerprint(self) -> str:
+        """Stable identity of the normalized endpoint and bank only."""
+        return derive_target_fingerprint(
+            base_url=self.base_url,
+            bank_id=self.bank_id,
+        )
 
 
 def _valid_number(value: object, *, maximum: float) -> bool:
@@ -262,6 +297,12 @@ class HindsightRecallSession:
         self._on_close = on_close
         self._close_lock = asyncio.Lock()
         self._closed = False
+        self._version_verified = False
+
+    @property
+    def target_fingerprint(self) -> str:
+        """Read-only identity of this session's frozen target."""
+        return self._settings.target_fingerprint
 
     async def verify_bank(self) -> str | None:
         """Check bank existence and exact identity for this task session."""
@@ -290,6 +331,37 @@ class HindsightRecallSession:
         assert response is not None
         return response
 
+    async def retain(
+        self,
+        request: HindsightRetainRequest,
+        *,
+        submission_guard: Callable[[], bool],
+    ) -> None:
+        """Submit one immutable async retain and require a valid receipt."""
+        if self._closed:
+            raise HindsightUnavailableError("session_closed")
+        if not isinstance(request, HindsightRetainRequest):
+            raise TypeError(_RETAIN_TYPE_ERROR)
+        if request.target_fingerprint != self._settings.target_fingerprint:
+            raise HindsightUnavailableError("target_changed")
+
+        outcome = await perform_retain(
+            self._client,
+            bank_id=self._settings.bank_id,
+            request=request,
+            timeout_seconds=self._settings.request_timeout_seconds,
+            version_verified=self._version_verified,
+            submission_guard=submission_guard,
+            is_session_open=lambda: not self._closed,
+        )
+        self._version_verified = outcome.version_verified
+        failure = outcome.failure_code
+        if failure is None:
+            return
+        if failure not in _RETAIN_FAILURES_WITHOUT_COOLDOWN:
+            await self._on_failure(self._settings, failure)
+        raise HindsightUnavailableError(failure)
+
     async def aclose(self) -> None:
         """Close this session's owned client exactly once."""
         async with self._close_lock:
@@ -303,13 +375,21 @@ class HindsightRecallSession:
 class _HindsightSessionContext:
     """Project-owned async context manager for ``open_session``."""
 
-    def __init__(self, service: "HindsightMemoryService") -> None:
+    def __init__(
+        self,
+        service: "HindsightMemoryService",
+        *,
+        expected_target_fingerprint: str | None,
+    ) -> None:
         self._service = service
+        self._expected_target_fingerprint = expected_target_fingerprint
         self._session: HindsightRecallSession | None = None
 
     async def __aenter__(self) -> HindsightRecallSession:
         try:
-            self._session = await self._service._open_session()
+            self._session = await self._service._open_session(
+                expected_target_fingerprint=self._expected_target_fingerprint
+            )
         except BaseException:
             session = self._session
             if session is not None:
@@ -346,9 +426,16 @@ class HindsightMemoryService:
         self._failure_code: str | None = None
         self._next_retry_at = 0.0
 
-    def open_session(self) -> _HindsightSessionContext:
+    def open_session(
+        self,
+        *,
+        expected_target_fingerprint: str | None = None,
+    ) -> _HindsightSessionContext:
         """Return one reply task's async context manager."""
-        return _HindsightSessionContext(self)
+        return _HindsightSessionContext(
+            self,
+            expected_target_fingerprint=expected_target_fingerprint,
+        )
 
     async def startup_probe(self) -> None:
         """Attempt one bounded startup probe and isolate every failure."""
@@ -406,12 +493,21 @@ class HindsightMemoryService:
             raise HindsightUnavailableError("configuration_unavailable")
         return HindsightSettings.from_config(config)
 
-    async def _open_session(self) -> HindsightRecallSession:
+    async def _open_session(
+        self,
+        *,
+        expected_target_fingerprint: str | None = None,
+    ) -> HindsightRecallSession:
         async with self._state_lock:
             if self._closed:
                 raise HindsightUnavailableError("service_closed")
 
         settings = await self._load_settings()
+        if (
+            expected_target_fingerprint is not None
+            and settings.target_fingerprint != expected_target_fingerprint
+        ):
+            raise HindsightUnavailableError("target_changed")
         await self._ensure_ready(settings)
 
         client: Hindsight | None = None
