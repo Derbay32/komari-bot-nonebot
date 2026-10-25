@@ -190,9 +190,7 @@ async def _insert_legacy_memory_row(connection: asyncpg.Connection) -> None:
         "SELECT column_name, data_type, is_nullable FROM information_schema.columns"
         f" WHERE table_name = '{_MEMORY_TABLE}'"
     )
-    live_columns = {
-        str(row["column_name"]): row for row in rows
-    }
+    live_columns = {str(row["column_name"]): row for row in rows}
     assert "vision_tool_enabled" in live_columns, "0014 阶段 memory 应仍持有图片列"
     assert "image_understanding_mode" not in live_columns, "0014 阶段不应有新模式列"
 
@@ -278,7 +276,9 @@ async def _insert_chat_row_leaving_image_defaults(
         f" WHERE table_name = '{_CHAT_TABLE}'"
     )
     columns = _reread_columns(rows)
-    value_columns = sorted(columns - {"id", "revision", "updated_at"} - set(CHAT_IMAGE_COLUMNS))
+    value_columns = sorted(
+        columns - {"id", "revision", "updated_at"} - set(CHAT_IMAGE_COLUMNS)
+    )
     missing = [column for column in value_columns if column not in values]
     assert not missing, f"测试默认值字典缺少列: {missing}"
 
@@ -348,10 +348,7 @@ async def test_image_columns_migrate_memory_to_chat_and_downgrade_cleanly() -> N
                 f"SELECT revision FROM {_CHAT_TABLE} WHERE id = 1"
             )
             assert row[0] == "delegated", "vision_tool_enabled=true 应映射 delegated"
-            expected = tuple(
-                MEMORY_VISION_VALUES[column]
-                for column in _BUDGET_COLUMNS
-            )
+            expected = tuple(MEMORY_VISION_VALUES[column] for column in _BUDGET_COLUMNS)
             assert row[1:] == expected, "8 项预算应原样从 memory 复制到 chat"
             assert chat_revision == _CHAT_LEGACY_REVISION, "chat 存量数据必须保留"
 
@@ -369,11 +366,15 @@ async def test_image_columns_migrate_memory_to_chat_and_downgrade_cleanly() -> N
         conn = await asyncpg.connect(**scratch)
         try:
             chat_columns = await _chat_image_columns(conn)
-            assert not set(CHAT_IMAGE_COLUMNS) & chat_columns, "downgrade 必须删除 chat 新列"
+            assert not set(CHAT_IMAGE_COLUMNS) & chat_columns, (
+                "downgrade 必须删除 chat 新列"
+            )
             chat_revision = await conn.fetchval(
                 f"SELECT revision FROM {_CHAT_TABLE} WHERE id = 1"
             )
-            assert chat_revision == _CHAT_LEGACY_REVISION, "downgrade 不得删除 chat 存量行"
+            assert chat_revision == _CHAT_LEGACY_REVISION, (
+                "downgrade 不得删除 chat 存量行"
+            )
 
             memory_columns = await _memory_columns(conn)
             assert set(MEMORY_LEGACY_IMAGE_COLUMNS) <= memory_columns, (
@@ -391,14 +392,10 @@ async def test_image_columns_migrate_memory_to_chat_and_downgrade_cleanly() -> N
                 " vision_image_download_total_timeout_seconds"
                 f" FROM {_MEMORY_TABLE} WHERE id = 1"
             )
-            assert memory_row["vision_tool_enabled"] is True, (
-                "delegated 应回填为 true"
-            )
-            assert [
-                memory_row[key] for key in _BUDGET_COLUMNS
-            ] == [MEMORY_VISION_VALUES[key] for key in _BUDGET_COLUMNS], (
-                "预算应从 chat 原样回填到 memory"
-            )
+            assert memory_row["vision_tool_enabled"] is True, "delegated 应回填为 true"
+            assert [memory_row[key] for key in _BUDGET_COLUMNS] == [
+                MEMORY_VISION_VALUES[key] for key in _BUDGET_COLUMNS
+            ], "预算应从 chat 原样回填到 memory"
         finally:
             await conn.close()
 
@@ -408,8 +405,7 @@ async def test_image_columns_migrate_memory_to_chat_and_downgrade_cleanly() -> N
         conn = await asyncpg.connect(**scratch)
         try:
             await conn.execute(
-                f"UPDATE {_MEMORY_TABLE} SET vision_tool_enabled = false"
-                " WHERE id = 1"
+                f"UPDATE {_MEMORY_TABLE} SET vision_tool_enabled = false WHERE id = 1"
             )
             memory_revision = await conn.fetchval(
                 f"SELECT revision FROM {_MEMORY_TABLE} WHERE id = 1"
@@ -418,8 +414,7 @@ async def test_image_columns_migrate_memory_to_chat_and_downgrade_cleanly() -> N
                 "翻转旧开关不得改动 memory revision"
             )
             budget_row = await conn.fetchrow(
-                f"SELECT {', '.join(_BUDGET_COLUMNS)}"
-                f" FROM {_MEMORY_TABLE} WHERE id = 1"
+                f"SELECT {', '.join(_BUDGET_COLUMNS)} FROM {_MEMORY_TABLE} WHERE id = 1"
             )
             assert [budget_row[key] for key in _BUDGET_COLUMNS] == [
                 MEMORY_VISION_VALUES[key] for key in _BUDGET_COLUMNS
@@ -443,10 +438,7 @@ async def test_image_columns_migrate_memory_to_chat_and_downgrade_cleanly() -> N
             # bool 双分支 false → native；8 项预算原样复制
             row = await _fetched_image_row(conn)
             assert row[0] == "native", "vision_tool_enabled=false 应映射 native"
-            expected = tuple(
-                MEMORY_VISION_VALUES[column]
-                for column in _BUDGET_COLUMNS
-            )
+            expected = tuple(MEMORY_VISION_VALUES[column] for column in _BUDGET_COLUMNS)
             assert row[1:] == expected, "8 项预算应原样从 memory 复制到 chat"
             chat_revision = await conn.fetchval(
                 f"SELECT revision FROM {_CHAT_TABLE} WHERE id = 1"
@@ -483,12 +475,13 @@ async def test_image_columns_defaults_and_checks_at_head() -> None:
         assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
         conn = await asyncpg.connect(**scratch)
         try:
+            # 0027 会创建默认 chat 行；移除后插入只依赖图片列默认值的新行。
+            await conn.execute("DELETE FROM komari_chat_config")
             # 全新 chat 行只显式提供非图片列，图片列由数据库默认补齐
             await _insert_chat_row_leaving_image_defaults(conn)
             row = await _fetched_image_row(conn)
             assert tuple(row) == tuple(
-                CHAT_IMAGE_DEFAULT_VALUES[column]
-                for column in CHAT_IMAGE_COLUMNS
+                CHAT_IMAGE_DEFAULT_VALUES[column] for column in CHAT_IMAGE_COLUMNS
             ), "全新行图片列应使用数据库默认值"
 
             # 跨字段 CHECK：总字节 >= 单图字节

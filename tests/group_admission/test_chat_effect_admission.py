@@ -43,7 +43,7 @@ def _patch_chat_config(
     *,
     face_reaction: bool,
 ) -> None:
-    """patch message_handler 的 get_config / get_memory_config 为本地替身。"""
+    """patch message_handler 的 get_config / get_context_config 为本地替身。"""
     stub = SimpleNamespace(
         bot_nickname="小鞠",
         bot_aliases=["小鞠", "小鞠知花", "komari"],
@@ -52,7 +52,7 @@ def _patch_chat_config(
         error_notify_enabled=False,
     )
     monkeypatch.setattr(message_handler_module, "get_config", lambda: stub)
-    monkeypatch.setattr(message_handler_module, "get_memory_config", lambda: stub)
+    monkeypatch.setattr(message_handler_module, "get_context_config", lambda: stub)
 
 
 def _llm_config() -> SimpleNamespace:

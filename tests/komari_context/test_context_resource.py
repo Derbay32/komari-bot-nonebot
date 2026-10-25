@@ -245,6 +245,7 @@ async def test_registered_lifecycle_exposes_store_idempotently_and_closes_once(
 
         assert module.get_context_store() is None
         await ctx.startup()
+        assert module.get_context_config().redis_db == 6
         store = module.get_context_store()
         assert store is not None
         assert store.redis is client

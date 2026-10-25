@@ -260,7 +260,7 @@ def _build_config(**overrides: Any) -> SimpleNamespace:
 
 
 def _build_chat_config_stub(**overrides: Any) -> SimpleNamespace:
-    """handler 级测试使用的合并配置替身（get_config 与 get_memory_config 共用）。"""
+    """handler 级测试使用的合并配置替身（get_config 与 get_context_config 共用）。"""
     values: dict[str, Any] = {
         "proactive_enabled": False,
         "context_messages_limit": 10,
@@ -274,7 +274,7 @@ def _build_chat_config_stub(**overrides: Any) -> SimpleNamespace:
         "global_interaction_trigger_size": 20,
         "face_reaction_enabled": False,
         "face_reaction_id": "76",
-        # TSK-194：图片理解模式（合并替身承载 get_config/get_memory_config）
+        # TSK-194：图片理解模式（合并替身承载 get_config/get_context_config）
         "image_understanding_mode": "delegated",
         "error_notify_enabled": False,
         "knowledge_enabled": False,
@@ -319,7 +319,7 @@ def _wire_handler(
     handler._reaction_tasks = set()
 
     monkeypatch.setattr(message_handler_module, "get_config", lambda: config)
-    monkeypatch.setattr(message_handler_module, "get_memory_config", lambda: config)
+    monkeypatch.setattr(message_handler_module, "get_context_config", lambda: config)
     monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
     monkeypatch.setattr(
         message_handler_module,

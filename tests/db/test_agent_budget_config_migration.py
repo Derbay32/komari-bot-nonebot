@@ -74,6 +74,30 @@ _NON_BUDGET_COLUMN_DEFAULTS: dict[str, object] = {
     "vision_image_download_connect_timeout_seconds": 5.0,
     "vision_image_download_read_timeout_seconds": 30.0,
     "vision_image_download_total_timeout_seconds": 45.0,
+    # TSK-192 phase B：0027 新增 chat 列在 head 下需要显式填充。
+    "plugin_enable": False,
+    "llm_model_chat": "gemini-3-flash-preview",
+    "llm_temperature_chat": 1.0,
+    "llm_max_tokens_chat": 4000,
+    "llm_request_api_chat": "chat_completions",
+    "llm_stream_enabled_chat": False,
+    "llm_thinking_mode_chat": False,
+    "llm_reasoning_effort_chat": "",
+    "assistant_prefill_enabled": False,
+    "dsv4_roleplay_instruct_mode": "auto",
+    "knowledge_enabled": True,
+    "knowledge_limit": 3,
+    "memory_search_limit": 3,
+    "context_messages_limit": 10,
+    "context_max_utf8_bytes": 24_000,
+    "context_max_estimated_tokens": 6_000,
+    "face_reaction_enabled": False,
+    "face_reaction_id": "76",
+    "query_rewrite_model": "deepseek-v4-flash",
+    "query_rewrite_request_api": "chat_completions",
+    "query_rewrite_stream_enabled": False,
+    "query_rewrite_thinking_mode": False,
+    "query_rewrite_reasoning_effort": "",
 }
 
 
@@ -238,7 +262,9 @@ async def test_agent_budget_columns_defaults_check_constraint_and_zero_drift() -
                 "komari_chat_config 缺少同时引用三项预算列的 CHECK 约束"
             )
 
-            # 全新行使用默认值 10/4/20（预算列不显式赋值，验证 DB 默认生效）
+            # 0027 会为缺失目标创建默认行；本用例要验证裸 DB 默认值，
+            # 先移除该行再插入只依赖列默认值的历史形状行。
+            await conn.execute("DELETE FROM komari_chat_config")
             await _insert_row_without_budget_columns(conn)
             defaults_row = await conn.fetchrow(
                 "SELECT agent_max_rounds, agent_max_tool_calls_per_round,"

@@ -152,7 +152,9 @@ async def _insert_legacy_row(connection: asyncpg.Connection) -> None:
 @pytest.mark.skipif(
     not POSTGRES_URL, reason="未设置 KOMARI_TEST_POSTGRES_URL，跳过迁移集成测试"
 )
-async def test_agent_tool_call_mode_column_preserves_rows_and_downgrades_cleanly() -> None:
+async def test_agent_tool_call_mode_column_preserves_rows_and_downgrades_cleanly() -> (
+    None
+):
     """AC1：0014 新增非空默认 required 列；升级保留存量行，downgrade 显式回退。
 
     完整链路（TSK-232 新链编号）：upgrade 0010 后显式提交准入策略（operator
@@ -179,7 +181,7 @@ async def test_agent_tool_call_mode_column_preserves_rows_and_downgrades_cleanly
                 "INSERT INTO komari_group_admission_config"
                 " (id, revision, updated_at, policy)"
                 " VALUES (1, 1, NOW(),"
-                " '{\"mode\": \"blacklist\", \"group_ids\": []}'::jsonb)"
+                ' \'{"mode": "blacklist", "group_ids": []}\'::jsonb)'
                 " ON CONFLICT (id) DO NOTHING"
             )
         finally:
@@ -227,9 +229,12 @@ async def test_agent_tool_call_mode_column_preserves_rows_and_downgrades_cleanly
             assert tuple(budget_row) == AGENT_BUDGET_DEFAULTS, (
                 "0014 升级必须以默认值补齐存量行"
             )
-            assert await conn.fetchval(
-                "SELECT revision FROM komari_chat_config WHERE id = 1"
-            ) == 7, "存量行原有数据必须保留"
+            assert (
+                await conn.fetchval(
+                    "SELECT revision FROM komari_chat_config WHERE id = 1"
+                )
+                == 7
+            ), "存量行原有数据必须保留"
         finally:
             await conn.close()
 
@@ -264,10 +269,15 @@ async def test_agent_tool_call_mode_column_preserves_rows_and_downgrades_cleanly
                 "agent_max_tool_calls_per_round": 2,
                 "agent_max_total_tool_calls": 8,
             }
-            fresh_columns = sorted(explicit_values)
-            columns_sql = ", ".join(
-                ["id", "revision", "updated_at", *fresh_columns]
-            )
+            actual_columns = {
+                str(column_row["column_name"])
+                for column_row in await conn.fetch(
+                    "SELECT column_name FROM information_schema.columns"
+                    " WHERE table_name = 'komari_chat_config'"
+                )
+            }
+            fresh_columns = sorted(set(explicit_values) & actual_columns)
+            columns_sql = ", ".join(["id", "revision", "updated_at", *fresh_columns])
             placeholders = ", ".join(
                 f"${index}" for index in range(1, 4 + len(fresh_columns))
             )

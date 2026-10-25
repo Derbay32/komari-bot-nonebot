@@ -41,11 +41,13 @@ async def _no_sleep(_delay: float) -> None:
 def _patch_config(monkeypatch: Any) -> None:
     monkeypatch.setattr(
         query_rewrite_module,
-        "get_memory_config",
+        "get_config",
         lambda: SimpleNamespace(
-            llm_model_summary="summary-model",
-            llm_thinking_mode_summary=False,
-            llm_reasoning_effort_summary="",
+            query_rewrite_model="rewrite-model",
+            query_rewrite_request_api="responses",
+            query_rewrite_stream_enabled=True,
+            query_rewrite_thinking_mode=True,
+            query_rewrite_reasoning_effort="high",
         ),
     )
     monkeypatch.setattr(retry_module.asyncio, "sleep", _no_sleep)
@@ -148,3 +150,24 @@ def test_rewrite_query_records_trace_in_collector(monkeypatch: Any) -> None:
     assert len(collector.calls) == 1
     assert collector.calls[0].phase == "query_rewrite"
     assert collector.calls[0].parent_call_id == "parent-qr"
+
+
+def test_rewrite_query_uses_dedicated_query_rewrite_config_fields(
+    monkeypatch: Any,
+) -> None:
+    """TSK-192 phase B: model, protocol and thinking come from chat ownership."""
+    _patch_config(monkeypatch)
+    fake_provider = _FakeLLMProvider(["重写结果"])
+    monkeypatch.setattr(query_rewrite_module, "llm_provider", fake_provider)
+
+    service = query_rewrite_module.QueryRewriteService()
+    assert asyncio.run(service.rewrite_query("原问题")) == "重写结果"
+
+    request = fake_provider.completion_calls[0]
+    assert request["model"] == "rewrite-model"
+    assert request["request_api"] == "responses"
+    assert request["stream_enabled"] is True
+    assert request["thinking_mode"] is True
+    assert request["reasoning_effort"] == "high"
+    assert request["temperature"] == 0.3
+    assert request["max_tokens"] == 256

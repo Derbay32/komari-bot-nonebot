@@ -143,22 +143,16 @@ def test_vision_image_download_budget_no_longer_lives_in_memory() -> None:
 def test_config_schema_request_protocol_defaults() -> None:
     config = KomariMemoryConfigSchema()
 
-    assert config.llm_request_api_chat == "chat_completions"
-    assert config.llm_stream_enabled_chat is False
     assert config.llm_request_api_summary == "chat_completions"
     assert config.llm_stream_enabled_summary is False
 
 
 def test_config_schema_accepts_responses_request_api() -> None:
     config = KomariMemoryConfigSchema(
-        llm_request_api_chat="responses",
-        llm_stream_enabled_chat=True,
         llm_request_api_summary="responses",
         llm_stream_enabled_summary=True,
     )
 
-    assert config.llm_request_api_chat == "responses"
-    assert config.llm_stream_enabled_chat is True
     assert config.llm_request_api_summary == "responses"
     assert config.llm_stream_enabled_summary is True
 
@@ -168,6 +162,66 @@ def test_config_schema_rejects_invalid_request_api() -> None:
     from pydantic import ValidationError
 
     with pytest.raises(ValidationError):
-        KomariMemoryConfigSchema(llm_request_api_chat="websocket")  # type: ignore[arg-type]
-    with pytest.raises(ValidationError):
         KomariMemoryConfigSchema(llm_request_api_summary="websocket")  # type: ignore[arg-type]
+
+
+TSK192_MOVED_TO_CHAT_FIELDS = {
+    "llm_model_chat",
+    "llm_temperature_chat",
+    "llm_max_tokens_chat",
+    "llm_request_api_chat",
+    "llm_stream_enabled_chat",
+    "llm_thinking_mode_chat",
+    "llm_reasoning_effort_chat",
+    "assistant_prefill_enabled",
+    "dsv4_roleplay_instruct_mode",
+    "knowledge_enabled",
+    "knowledge_limit",
+    "context_messages_limit",
+    "context_max_utf8_bytes",
+    "context_max_estimated_tokens",
+    "face_reaction_enabled",
+    "face_reaction_id",
+    "memory_search_limit",
+}
+
+TSK192_MOVED_TO_CONTEXT_FIELDS = {
+    "bot_nickname",
+    "error_notify_enabled",
+    "global_interaction_enabled",
+    "global_interaction_trigger_size",
+}
+
+
+def test_phase_b_moved_fields_have_no_memory_alias_or_dual_read() -> None:
+    fields = set(KomariMemoryConfigSchema.model_fields)
+    dumped = set(KomariMemoryConfigSchema().model_dump())
+
+    assert not (TSK192_MOVED_TO_CHAT_FIELDS | TSK192_MOVED_TO_CONTEXT_FIELDS) & fields
+    assert not (TSK192_MOVED_TO_CHAT_FIELDS | TSK192_MOVED_TO_CONTEXT_FIELDS) & dumped
+
+
+def test_memory_keeps_only_its_active_old_algorithm_fields() -> None:
+    fields = set(KomariMemoryConfigSchema.model_fields)
+
+    assert {
+        "plugin_enable",
+        "llm_model_summary",
+        "llm_temperature_summary",
+        "llm_max_tokens_summary",
+        "llm_request_api_summary",
+        "llm_stream_enabled_summary",
+        "llm_thinking_mode_summary",
+        "llm_reasoning_effort_summary",
+        "response_tag",
+        "bot_aliases",
+        "query_rewrite_history_limit",
+        "global_interaction_summary_interval_minutes",
+        "global_interaction_processing_lease_seconds",
+    } <= fields
+
+
+def test_memory_config_resource_is_optional_at_startup() -> None:
+    assert KomariMemoryConfigSchema.startup_required is False
+    assert "startup_required" not in KomariMemoryConfigSchema.model_fields
+    assert "startup_required" not in KomariMemoryConfigSchema().model_dump()

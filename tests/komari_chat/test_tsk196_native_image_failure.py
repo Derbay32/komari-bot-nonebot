@@ -130,7 +130,7 @@ class _FakeUserData:
 
 
 def _chat_config_stub(**overrides: object) -> SimpleNamespace:
-    """合并 get_config / get_memory_config 字段的配置替身。"""
+    """合并 get_config / get_context_config 字段的配置替身。"""
     values: dict[str, object] = {
         "proactive_enabled": False,
         "context_messages_limit": 10,
@@ -211,7 +211,7 @@ def _wire_native_core(
     handler.query_rewrite = _FakeQueryRewrite()
 
     monkeypatch.setattr(message_handler_module, "get_config", lambda: config)
-    monkeypatch.setattr(message_handler_module, "get_memory_config", lambda: config)
+    monkeypatch.setattr(message_handler_module, "get_context_config", lambda: config)
     monkeypatch.setattr(message_handler_module, "user_data_plugin", _FakeUserData())
     monkeypatch.setattr(
         message_handler_module,

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from nonebot import logger
@@ -99,28 +99,20 @@ def _extract_json_from_markdown(text: str) -> str:
     return text.strip()
 
 
-def _extract_tag_content(text: str, tag: str) -> str:
-    """从 LLM 回复中提取指定 XML 标签内的内容。"""
-    pattern = rf"<{tag}>([\s\S]*)</{tag}>"
-    match = re.search(pattern, text)
-    if match:
-        return match.group(1).strip()
-
-    logger.warning("[KomariMemory] 未找到 <{}> 标签，使用原始回复", tag)
-    return re.sub(r"<think>[\s\S]*?</think>", "", text).strip()
-
-
 def _format_messages_for_summary(
     messages: list["MessageSchema"],
-    config: KomariMemoryConfigSchema,
+    *,
+    bot_nickname: str,
 ) -> str:
     """将消息缓冲格式化为总结/画像 Agent 共用的群聊记录文本。"""
     lines: list[str] = []
     for message in messages:
         if message.is_bot:
-            lines.append(f"[bot] {config.bot_nickname}: {message.content}")
+            lines.append(f"[bot] {bot_nickname}: {message.content}")
         else:
-            lines.append(f"[user_id:{message.user_id}] {message.user_nickname}: {message.content}")
+            lines.append(
+                f"[user_id:{message.user_id}] {message.user_nickname}: {message.content}"
+            )
     return "\n".join(lines)
 
 
@@ -132,7 +124,9 @@ def _build_user_message(
     """构建与画像 Agent 前缀一致的 user 消息前三段。"""
     parts: list[str] = []
     parts.append(f"【群聊记录】\n{conversation_text}")
-    parts.append(f"【参与用户 user_id】\n{json.dumps(participants, ensure_ascii=False)}")
+    parts.append(
+        f"【参与用户 user_id】\n{json.dumps(participants, ensure_ascii=False)}"
+    )
     parts.append(f"【昵称映射】\n{json.dumps(display_name_map, ensure_ascii=False)}")
     return "\n\n".join(parts)
 
@@ -174,7 +168,9 @@ async def _build_summary_messages(
 
 def _estimate_messages_tokens(messages: list[dict[str, str]]) -> int:
     """轻量估算 messages 文本 token，用于日志观测。"""
-    return sum(estimate_text_tokens(str(message.get("content", ""))) for message in messages)
+    return sum(
+        estimate_text_tokens(str(message.get("content", ""))) for message in messages
+    )
 
 
 def _normalize_summary_result(result: dict[str, Any]) -> dict[str, Any]:
@@ -500,51 +496,18 @@ async def _request_structured_summary(
     try:
         return await _request_via_json_mode(messages, config, trace_id, collector)
     except _SummaryFallbackError:
-        logger.info("[KomariMemory] Layer 1 (json_mode) 失败，降级到 Layer 2 (tool_calling)")
+        logger.info(
+            "[KomariMemory] Layer 1 (json_mode) 失败，降级到 Layer 2 (tool_calling)"
+        )
 
     try:
         return await _request_via_tool_calling(messages, config, trace_id, collector)
     except _SummaryFallbackError:
-        logger.info("[KomariMemory] Layer 2 (tool_calling) 失败，降级到 Layer 3 (direct_output)")
+        logger.info(
+            "[KomariMemory] Layer 2 (tool_calling) 失败，降级到 Layer 3 (direct_output)"
+        )
 
     return await _request_via_direct_output(messages, config, trace_id, collector)
-
-
-@retry_async(max_attempts=3, base_delay=1.0)
-async def generate_reply(
-    config: KomariMemoryConfigSchema,
-    messages: list[dict] | None = None,
-    user_message: str = "",
-    system_prompt: str = "",
-) -> str:
-    """生成回复（使用 OpenAI messages 格式，带重试机制，支持多模态）。"""
-    if messages is not None:
-        raw_response = await llm_provider.generate_text_with_messages(
-            messages=messages,
-            model=config.llm_model_chat,
-            temperature=config.llm_temperature_chat,
-            max_tokens=config.llm_max_tokens_chat,
-            request_api=config.llm_request_api_chat,
-            stream_enabled=config.llm_stream_enabled_chat,
-            thinking_mode=config.llm_thinking_mode_chat,
-            reasoning_effort=config.llm_reasoning_effort_chat,
-            request_phase="memory_reply",
-        )
-    else:
-        raw_response = await llm_provider.generate_text(
-            prompt=user_message,
-            model=config.llm_model_chat,
-            system_instruction=system_prompt,
-            temperature=cast("int | None", config.llm_temperature_chat),
-            max_tokens=config.llm_max_tokens_chat,
-            request_api=config.llm_request_api_chat,
-            stream_enabled=config.llm_stream_enabled_chat,
-            thinking_mode=config.llm_thinking_mode_chat,
-            reasoning_effort=config.llm_reasoning_effort_chat,
-            request_phase="memory_reply",
-        )
-
-    return _extract_tag_content(raw_response, config.response_tag)
 
 
 @retry_async(max_attempts=3, base_delay=1.0)
@@ -554,12 +517,16 @@ async def summarize_conversation(
     *,
     participants: list[str],
     display_name_map: dict[str, str],
+    bot_nickname: str,
     collector: AgentRunCollector | None = None,
 ) -> dict[str, Any]:
     """总结对话为多段独立记忆（oneshot，带三层 fallback + 重试）。"""
     trace_id = f"memsum-{uuid4().hex[:8]}"
     group_id = messages[0].group_id if messages else "-"
-    conversation_text = _format_messages_for_summary(messages, config)
+    conversation_text = _format_messages_for_summary(
+        messages,
+        bot_nickname=bot_nickname,
+    )
     summary_messages = await _build_summary_messages(
         conversation_text=conversation_text,
         participants=participants,

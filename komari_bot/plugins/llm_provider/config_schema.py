@@ -140,7 +140,7 @@ class DynamicConfigSchema(TypedConfigModel, table=True):
     )
     vision_reasoning_effort: str = Field(
         default="",
-        description="视觉模型思考强度。语义同 komari_memory.llm_reasoning_effort_chat；"
+        description="视觉模型思考强度。语义同 komari_chat.llm_reasoning_effort_chat；"
         " 仅作用于 read_image 视觉子调用（vision_service）的请求，主工具循环"
         " 恒使用 chat 槽位。",
     )

@@ -20,16 +20,17 @@ AGENTS_MD = PROJECT_ROOT / "AGENTS.md"
 
 MEMORY_PACKAGE = "komari_bot.plugins.komari_memory"
 CONTEXT_PACKAGE = "komari_bot.plugins.komari_context"
-CONTEXT_INIT = PROJECT_ROOT / "komari_bot" / "plugins" / "komari_context" / "__init__.py"
+CONTEXT_INIT = (
+    PROJECT_ROOT / "komari_bot" / "plugins" / "komari_context" / "__init__.py"
+)
 
 #: komari_chat 消费、且必须由 komari_memory 顶层暴露面提供的符号。
-REQUIRED_MEMORY_SYMBOLS = (
-    "KomariMemoryConfigSchema",
-    "MemoryService",
-)
+REQUIRED_MEMORY_SYMBOLS = ("MemoryService",)
 REQUIRED_CONTEXT_SYMBOLS = (
+    "KomariContextConfigSchema",
     "MessageSchema",
     "RecentContextStore",
+    "get_context_config",
     "get_context_store",
 )
 
@@ -53,8 +54,7 @@ def _all_symbols(path: Path) -> set[str]:
             all_names.update(
                 element.value
                 for element in node.value.elts
-                if isinstance(element, ast.Constant)
-                and isinstance(element.value, str)
+                if isinstance(element, ast.Constant) and isinstance(element.value, str)
             )
     return all_names
 
@@ -119,7 +119,11 @@ def test_komari_chat_imports_shared_symbols_from_top_level_packages() -> None:
                 context_imports.update(alias.name for alias in node.names)
 
     assert set(REQUIRED_MEMORY_SYMBOLS) <= memory_imports
-    assert {"MessageSchema", "RecentContextStore"} <= context_imports
+    assert {
+        "MessageSchema",
+        "RecentContextStore",
+        "get_context_config",
+    } <= context_imports
 
 
 def _agents_md_boundary_paragraph() -> str:
@@ -134,9 +138,8 @@ def _agents_md_boundary_paragraph() -> str:
 def test_agents_md_documents_the_adopted_boundary_scheme() -> None:
     """边界条款明文记载方案：顶层暴露面覆盖 komari_chat → komari_memory。
 
-    管理插件豁免条款保留；同时条款必须点名 komari_memory 的顶层暴露面
-    实践（配置 Schema 与共享工具符号），使 komari_chat 的配置读取不再
-    依赖管理插件豁免。
+    管理插件豁免条款保留；同时条款必须点名 komari_chat / komari_context
+    的顶层暴露面实践，使聊天配置读取不再依赖管理插件豁免。
     """
     paragraph = _agents_md_boundary_paragraph()
     assert "豁免" in paragraph, "管理插件豁免条款必须保留"

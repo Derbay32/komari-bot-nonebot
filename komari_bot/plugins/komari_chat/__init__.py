@@ -55,16 +55,18 @@ from komari_bot.plugins.group_admission import (
     AdmissionQualification,
     adjudicate,
 )
+from komari_bot.plugins.komari_chat.services.config_interface import get_config
+from komari_bot.plugins.komari_context import get_context_config
 
 
 def _get_reply_fulfillment_config() -> Any:
-    """合并聊天配置与记忆配置中履约需要的只读字段。"""
+    """Read fulfillment policy from its actual chat/context owners."""
     config = get_config()
-    memory_config = get_memory_config()
+    context_config = get_context_config()
     return SimpleNamespace(
         proactive_cooldown=config.proactive_cooldown,
-        global_interaction_enabled=memory_config.global_interaction_enabled,
-        global_interaction_trigger_size=memory_config.global_interaction_trigger_size,
+        global_interaction_enabled=context_config.global_interaction_enabled,
+        global_interaction_trigger_size=context_config.global_interaction_trigger_size,
         reply_fulfillment_lease_seconds=config.reply_fulfillment_lease_seconds,
         reply_fulfillment_max_attempts=config.reply_fulfillment_max_attempts,
         reply_fulfillment_retry_base_seconds=config.reply_fulfillment_retry_base_seconds,
@@ -78,10 +80,7 @@ def _get_reply_fulfillment_config() -> Any:
         ),
     )
 
-from komari_bot.plugins.komari_chat.services.config_interface import (
-    get_config,
-    get_memory_config,
-)
+
 from komari_bot.plugins.komari_decision import (
     get_decision_dispatch,
     get_decision_engine,
@@ -113,11 +112,7 @@ def _resolve_runtime_components() -> tuple[Any, Any, Any] | None:
     context_store = context_plugin.get_context_store()
     memory_service = memory_plugin.get_memory_service()
     decision_engine = get_decision_engine()
-    if (
-        context_store is None
-        or memory_service is None
-        or decision_engine is None
-    ):
+    if context_store is None or memory_service is None or decision_engine is None:
         return None
     return context_store, memory_service, decision_engine
 
@@ -186,9 +181,7 @@ def _get_recovery_senders() -> dict[tuple[str, str], ReplySender]:
     的隐式事件上下文。
     """
     return {
-        (str(bot.self_id), str(bot.type)): cast(
-            "ReplySender", OneBotReplySender(bot)
-        )
+        (str(bot.self_id), str(bot.type)): cast("ReplySender", OneBotReplySender(bot))
         for bot in get_bots().values()
     }
 
@@ -302,7 +295,7 @@ driver.on_shutdown(_stop_reply_fulfillment_worker)
 
 async def _send_face_reaction(bot: Bot, event: GroupMessageEvent) -> None:
     """在开始生成回复时，对触发消息添加表情反应（提示“正在生成”）。"""
-    config = get_memory_config()
+    config = get_config()
     if not config.face_reaction_enabled or not config.face_reaction_id:
         return
 
@@ -387,7 +380,7 @@ async def handle_group_message(  # noqa: PLR0911 - 每个入口门禁都是独�
     state: T_State,
 ) -> None:
     """处理群聊消息。"""
-    config = get_memory_config()
+    config = get_config()
     if not config.plugin_enable:
         return
 
@@ -488,9 +481,7 @@ async def handle_group_message(  # noqa: PLR0911 - 每个入口门禁都是独�
                     else None
                 ),
                 reaction_sent=(
-                    pending_reply.reaction_sent
-                    if pending_reply is not None
-                    else False
+                    pending_reply.reaction_sent if pending_reply is not None else False
                 ),
             ),
             reason=pending_reply.reason if pending_reply is not None else None,

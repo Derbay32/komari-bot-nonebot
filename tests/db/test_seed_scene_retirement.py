@@ -2,7 +2,7 @@
 
 覆盖契约要求的播种侧正向证据：
 
-1. 全新库 ``upgrade head``（0026）后执行真实播种 CLI：三项必需 Prompt 行与
+1. 全新库 ``upgrade head``（0027）后执行真实播种 CLI：三项必需 Prompt 行与
    可选判定 Prompt 行完整落库，4 张退役场景表仍不存在，且播种没有新建任何
    数据表；
 2. 重复播种：Prompt 行（正文 / revision / updated_at）零变化，退役场景表

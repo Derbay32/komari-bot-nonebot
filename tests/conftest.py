@@ -281,6 +281,15 @@ class _DummyContextPlugin:
     def get_context_store() -> object | None:
         return None
 
+    @staticmethod
+    def get_context_config() -> object:
+        return SimpleNamespace(
+            bot_nickname="小鞠知花",
+            error_notify_enabled=True,
+            global_interaction_enabled=True,
+            global_interaction_trigger_size=20,
+        )
+
 
 class _DummyKnowledgePlugin:
     @staticmethod
@@ -549,14 +558,19 @@ _inject_package_exports(
 # shim；符号取真实实现（shim 下子模块仍按真实路径加载），保证
 # komari_chat 经顶层包导入后测试中的构造与调用语义不变
 from komari_bot.context.redis_store import MessageSchema, RecentContextStore
+from komari_bot.plugins.komari_context.config_schema import (
+    KomariContextConfigSchema,
+)
 from komari_bot.plugins.komari_memory.config_schema import KomariMemoryConfigSchema
 from komari_bot.plugins.komari_memory.services.memory_service import MemoryService
 
 _inject_package_exports(
     "komari_context",
     {
+        "KomariContextConfigSchema": KomariContextConfigSchema,
         "MessageSchema": MessageSchema,
         "RecentContextStore": RecentContextStore,
+        "get_context_config": _DummyContextPlugin.get_context_config,
         "get_context_store": _DummyContextPlugin.get_context_store,
     },
 )

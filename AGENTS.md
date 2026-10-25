@@ -109,7 +109,7 @@ komari-bot/
 
 插件的 `require()` 声明就是硬依赖，修改前必须理解依赖链。
 
-跨插件 import 边界（ADR-0006）：`require()` 仅作依赖加载声明，实际引用一律走普通 import；import 只允许指向依赖插件的顶层包暴露面（`__all__`），禁止指向其内部子模块（`services` / `repositories` / `handlers` 等）。唯一豁免：管理插件 import 各插件配置 Schema 以注册管理资源。`komari_context` 是近期上下文与聊天履约证据 Redis 客户端的唯一所有者，顶层暴露 `RecentContextStore` / `MessageSchema` / `get_context_store`；`komari_memory` 顶层只暴露当前旧记忆 API 所需的 `KomariMemoryConfigSchema` / `MemoryService` / `get_memory_service` / `get_redis_manager`，其 `RedisManager` 仅借用 context 客户端；共享 `retry_async` 位于 `komari_bot.core.retry`。komari_chat 经自有 `config_interface` 与上述顶层暴露面读取配置和共享资源，不属于管理插件豁免。详见 `docs/adr/0006-cross-plugin-top-level-imports-decision-contracts.md`。
+跨插件 import 边界（ADR-0006）：`require()` 仅作依赖加载声明，实际引用一律走普通 import；import 只允许指向依赖插件的顶层包暴露面（`__all__`），禁止指向其内部子模块（`services` / `repositories` / `handlers` 等）。唯一豁免：管理插件 import 各插件配置 Schema 以注册管理资源。`komari_context` 是近期上下文与聊天履约证据 Redis 客户端以及共享会话身份/通知/近期互动策略的唯一所有者，顶层暴露 `KomariContextConfigSchema` / `RecentContextStore` / `MessageSchema` / `get_context_config` / `get_context_store`；`komari_memory` 顶层只暴露当前旧记忆 API 所需的 `KomariMemoryConfigSchema` / `MemoryService` / `get_memory_service` / `get_redis_manager`，其 `RedisManager` 仅借用 context 客户端；共享 `retry_async` 位于 `komari_bot.core.retry`。komari_chat 经自有 `config_interface`、chat/context 配置与上述顶层暴露面读取配置和共享资源，不再读取 memory 配置，不属于管理插件豁免。详见 `docs/adr/0006-cross-plugin-top-level-imports-decision-contracts.md`。
 
 ```
 基础服务层（被依赖，不应依赖业务插件）
@@ -182,15 +182,15 @@ SUPERUSER 消息 → komari_debug（命令处理器）
          │         群内默认只发 request ID/状态，`--public` 仅追加二次脱敏摘要
          └─ summary — 调用 group_history_summary.execute_group_summary 共享服务，
                       总结图片与完整诊断报告按顺序私聊 SUPERUSER；群内遵循相同回执/脱敏规则
-         └─ notify — on|off 切换 komari_memory.error_notify_enabled（回复失败 SUPERUSER 通知）
+         └─ notify — on|off 切换 komari_context.error_notify_enabled（回复失败 SUPERUSER 通知）
 ```
 
 ## 核心机制详解
 
 ### 1. 配置管理 (`config_manager`)
 
-- **存储源**：业务插件动态配置统一存储在 PostgreSQL 强类型单行表 `komari_<插件>_config`（16 张，迁移 0002 建表、0004 为 komari_chat 补充、0026 新增 komari_context）；每张表固定主键 `id=1`、CAS 修订号 `revision`（写操作原子自增）、写入时间 `updated_at`（存储层显式赋值）；可扩展字段（列表/字典/嵌套配置）保留 JSONB 列
-- **komari_chat 专属配置**：主动回复频控与回复送达副作用 outbox 的 10 个字段位于 `komari_chat_config`（迁移 0004 建表，从 `komari_memory_config` 单行迁入，死字段 `proactive_score_threshold` 随批删除）；TSK-192/TSK-193 起回复 Agent 预算（`agent_max_rounds` / `agent_max_tool_calls_per_round` / `agent_max_total_tool_calls`）与工具调用约束模式（`agent_tool_call_mode`）也落在此表；TSK-194/ADR-0010 起图片理解模式（`image_understanding_mode`）与 8 项下载预算（`vision_image_download_*`，迁移 0015）同样归 `komari_chat`，从 `komari_memory_config` 迁出后不保留 alias / 双读 / fallback；运行时经 `komari_chat/services/config_interface.py` 读取，该接口同时提供 `get_memory_config()` 承接聊天流程仍依赖的 memory 侧字段，komari_chat 不得 import `komari_memory.services.config_interface`
+- **存储源**：业务插件动态配置统一存储在 PostgreSQL 强类型单行表 `komari_<插件>_config`（迁移 0002 建表、0004 为 komari_chat 补充、0026 新增 komari_context、0027 完成 chat/context 字段所有权迁移）；每张表固定主键 `id=1`、CAS 修订号 `revision`（写操作原子自增）、写入时间 `updated_at`（存储层显式赋值）；可扩展字段（列表/字典/嵌套配置）保留 JSONB 列
+- **komari_chat 专属配置**：主动回复频控与回复送达副作用 outbox 的 10 个字段位于 `komari_chat_config`（迁移 0004 建表，从 `komari_memory_config` 单行迁入，死字段 `proactive_score_threshold` 随批删除）；TSK-192/TSK-193 起回复 Agent 预算（`agent_max_rounds` / `agent_max_tool_calls_per_round` / `agent_max_total_tool_calls`）与工具调用约束模式（`agent_tool_call_mode`）也落在此表；TSK-194/ADR-0010 起图片理解模式（`image_understanding_mode`）与 8 项下载预算（`vision_image_download_*`，迁移 0015）同样归 `komari_chat`；TSK-192 phase B（迁移 0027）起聊天生成槽位、常识库/上下文预算、表情反应、聊天检索开关与 `plugin_enable` 也归 `komari_chat`，查询重写使用独立的 `query_rewrite_*` 槽位。`komari_context_config` 则拥有 `redis_db`、`bot_nickname`、`error_notify_enabled`、`global_interaction_enabled` 与 `global_interaction_trigger_size`。运行时分别经 `komari_chat/services/config_interface.py` 与 `komari_context` 顶层 `get_context_config()` 读取；两处迁移后均不保留 alias / 双读 / fallback，komari_chat 不得 import `komari_memory.services.config_interface`
 - **结构真源**：各插件 `config_schema.py` 中的 SQLModel 元数据（`TypedConfigModel` 基类，见 `config/typed_config.py`）；Alembic 迁移环境只按源文件加载 schema（`load_all_typed_config_models()`），不执行插件包 `__init__`、不访问数据库
 - **旧 JSONB 表**：迁移 `0013` 已显式删除 `komari_plugin_configs`。运行时只使用强类型配置表。删除表必须使用手写迁移。
 - **Prompt 配置**：字符串 prompt 不存入配置表，统一使用独立强类型表（见 1.1 节）
@@ -528,7 +528,7 @@ Jev 请求截止覆盖连接、发送、接收与响应校验。
 表情反应与失败通知契约：
 - 表情反应在 `_attempt_reply()` 内、调用 `_generate_reply_core()` 之前以 `asyncio.create_task` fire-and-forget 派发（任务引用挂 `self._reaction_tasks` 防 GC），提示“正在生成”；`commit_delivered_reply()` 不再触发表情，送达后不撤下。
 - `_attempt_reply()` 返回 `(PendingReply | None, stored, ReplyFailureInfo | None)`；生成失败（异常、空回复、delta 缺失、预占租约丢失）转为 `ReplyFailureInfo` 而非上抛（CancelledError 除外）；频控冷却/超限/重复等正常控制流返回 `(None, False, None)` 不通知。
-- 失败分流边界是“是否贴过表情”：`report_reply_failure()` 在 `reaction_sent=True` 时以 reply 段引用原消息补发群内固定错误文本，并向 SUPERUSERS 私聊极简诊断卡（trace/群号/触发原因/阶段/异常类型+一行摘要）；Redis key `komari_chat:error_notify:{group_id}:{error_type}` SET NX EX 300 去重，Redis 异常降级照常通知；`error_notify_enabled=false` 仅静默通知，不影响群内错误文本；实现位于 `services/error_notify.py`，善后方法自身绝不抛出。
+- 失败分流边界是“是否贴过表情”：`report_reply_failure()` 在 `reaction_sent=True` 时以 reply 段引用原消息补发群内固定错误文本，并向 SUPERUSERS 私聊极简诊断卡（trace/群号/触发原因/阶段/异常类型+一行摘要）；Redis key `komari_chat:error_notify:{group_id}:{error_type}` SET NX EX 300 去重，Redis 异常降级照常通知；`komari_context.error_notify_enabled=false` 仅静默通知，不影响群内错误文本；实现位于 `services/error_notify.py`，善后方法自身绝不抛出。
 
 主动回复频控契约：
 - 非强制回复在生成前调用 Redis Lua 原子预占，同时检查冷却、最近一小时已确认名额与生成中名额；预占 ID 使用平台消息 ID，重复投递不会重复生成。
@@ -543,7 +543,7 @@ Jev 请求截止覆盖连接、发送、接收与响应校验。
 
 视觉服务与图片理解（`vision_service.py` / `image_understanding.py`，TSK-194/ADR-0010）：
 - 已移除绕过网关的独立 `AsyncOpenAI` 调用，改用 `llm_provider.generate_messages_completion()`；视觉调用作为 `read_image` 工具的子调用，通过 collector 记录同一 trace，最终请求携带任务起点快照冻结的 `thinking_mode` / `reasoning_effort`，任务内不重读
-- 图片理解模式（`image_understanding_mode`：`native` / `delegated`）与 8 项下载预算（`vision_image_download_*`）归 `komari_chat` 配置（迁移 0015 从 `komari_memory` 一次性迁入，不保留 alias / 双读 / 运行时 fallback）；模式与预算在任务起点从 chat 配置读取一次并冻结，任务执行期间配置变更只影响下一个任务
+- 图片理解模式（`image_understanding_mode`：`native` / `delegated`）与 8 项下载预算（`vision_image_download_*`）归 `komari_chat` 配置（迁移 0015 从 `komari_memory` 一次性迁入，TSK-192 phase B 后由 chat 配置拥有，不保留 alias / 双读 / 运行时 fallback）；模式与预算在任务起点从 chat 配置读取一次并冻结，任务执行期间配置变更只影响下一个任务
 - `native`：图片经安全下载与校验后作为多模态输入直接交给聊天主模型（chat 槽位），不声明 / 不调用 `read_image` 工具；聊天模型对带图请求报错或拒图时本任务明确失败，不自动降级、不切 delegated、不调用视觉服务
 - `delegated`：只向主回复 Agent 暴露稳定图片索引与 `read_image` 工具，主工具循环恒使用聊天模型与 chat 槽位；视觉子调用（`vision_service`）才使用独立视觉模型与 vision 槽位（含 `vision_thinking_mode` / `vision_reasoning_effort`）
 - TSK-195：delegated 任务起点零预下载，`ImageReadingSession`（任务级图片会话）持有稳定引用（引用消息在前、当前消息在后）、按索引成功/失败缓存与并发单飞（取消任意 waiter 不取消共享下载/视觉任务，任务完成结果仍缓存）、字节账本/并发信号量/累计总时限（跨多轮不重建；总时限为下载活动区间的并集耗时，并发重叠只计一次、空闲不消耗不重置，`download()` 与 `download_many()` 共用同一账本）、全失败安全摘要（`all_images_unavailable` + 归一化错误类型，TSK-196 消费）；只有首次 `read_image(image_index)` 才经安全下载器懒下载；原始 URL 只存在于会话内部私有映射→安全下载器边界（公开引用只含稳定 index/origin/source_label），不进主模型消息、工具结果、普通日志与 Agent Run/debug 投影；任务结束 `close()` 阻止新读取、取消并等待在途读取后再释放下载连接；视觉描述经既有 `UntrustedContext`（`source_type=vision`）回流；主 prompt 只含稳定索引/来源/范围（无 URL/base64）

@@ -301,7 +301,7 @@ def _base_wire(monkeypatch: pytest.MonkeyPatch, config: SimpleNamespace) -> Any:
     handler.memory = _FakeMemory()
     handler.query_rewrite = _FakeQueryRewrite()
     monkeypatch.setattr(message_handler_module, "get_config", lambda: config)
-    monkeypatch.setattr(message_handler_module, "get_memory_config", lambda: config)
+    monkeypatch.setattr(message_handler_module, "get_context_config", lambda: config)
     monkeypatch.setattr(message_handler_module, "user_data_plugin", _FakeUserData())
     monkeypatch.setattr(
         message_handler_module,

@@ -27,6 +27,12 @@ config_manager = config_manager_plugin.get_config_manager(
     KomariContextConfigSchema,
 )
 
+
+def get_context_config() -> KomariContextConfigSchema:
+    """Return the context resource through its single config registration."""
+    return cast("KomariContextConfigSchema", config_manager.get())
+
+
 class PluginState:
     """Owned references for the single context Redis resource."""
 
@@ -59,9 +65,7 @@ async def _initialize_context() -> None:
     if state.store is not None:
         return
 
-    config = cast(
-        "KomariContextConfigSchema", await config_manager.get_async()
-    )
+    config = cast("KomariContextConfigSchema", await config_manager.get_async())
     client: aioredis.Redis | None = None
     try:
         client = _create_redis_client(int(config.redis_db))
@@ -111,4 +115,10 @@ async def _shutdown_context_hook() -> None:
     await _shutdown_context()
 
 
-__all__ = ["MessageSchema", "RecentContextStore", "get_context_store"]
+__all__ = [
+    "KomariContextConfigSchema",
+    "MessageSchema",
+    "RecentContextStore",
+    "get_context_config",
+    "get_context_store",
+]

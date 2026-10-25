@@ -116,8 +116,7 @@ async def _column_names(params: dict[str, Any], table: str) -> set[str]:
     connection = await _connect(params)
     try:
         rows = await connection.fetch(
-            "SELECT column_name FROM information_schema.columns"
-            " WHERE table_name = $1",
+            "SELECT column_name FROM information_schema.columns WHERE table_name = $1",
             table,
         )
     finally:
@@ -400,9 +399,7 @@ def test_0013_blocks_with_policy_fingerprint_drift(
         _upgrade_0012(params, database_url)
         _authenticate_via_finalize(capsys, params, database_url)
 
-        overwrite_admission_policy(
-            params, {"mode": "whitelist", "group_ids": [42]}
-        )
+        overwrite_admission_policy(params, {"mode": "whitelist", "group_ids": [42]})
         _expect_0013_blocked(database_url, "POLICY_FINGERPRINT_DRIFT")
         assert asyncio.run(_fetch_version(params)) == "0012"
 
@@ -749,7 +746,7 @@ def test_0013_succeeds_with_held_states_and_cleans_migration_only_tables(
             # 完成当前 head 升级后，继续验证全部业务存量断言。
             result = run_bootstrap(database_url, "upgrade", "head")
             assert result.returncode == 0, result.stderr
-            assert asyncio.run(_fetch_version(params)) == "0026"
+            assert asyncio.run(_fetch_version(params)) == "0027"
         finally:
             asyncio.run(_cleanup_test_redis_keys())
 
@@ -787,9 +784,7 @@ def test_0013_succeeds_with_held_states_and_cleans_migration_only_tables(
                 )
             finally:
                 await connection.close()
-            return tombstone, [
-                str(row["commitment_type"]) for row in child_rows
-            ]
+            return tombstone, [str(row["commitment_type"]) for row in child_rows]
 
         tombstone, child_types = asyncio.run(_tombstone_snapshot())
         assert tombstone is not None
@@ -834,7 +829,6 @@ def test_0013_succeeds_with_held_states_and_cleans_migration_only_tables(
         assert int(delivered_open_children or 0) >= 1
 
 
-
 async def _fetch_single(params: dict[str, Any], column: str, sql: str) -> Any:
     del sql
     connection = await _connect(params)
@@ -848,16 +842,14 @@ def test_0013_fresh_empty_database_passes_head_without_redis() -> None:
     """空库 fresh 豁免：单次 upgrade head 不经 Redis 认证直通（纯 PG 成功路径）。
 
     与生产/prestart 同构：全新空库在同一次 upgrade 调用内走完
-    0001→0026（fresh 标记、缺省策略播种、零数据自动推进与 fresh 豁免
+    0001→0027（fresh 标记、缺省策略播种、零数据自动推进与 fresh 豁免
     全部生效），绝不要求 operator 先跑 Redis 认证。
     """
     params = asyncio.run(recreate_scratch_database("_tsk232b1c13fe"))
     database_url = scratch_url(str(params["database"]))
     try:
         result = run_bootstrap(database_url, "upgrade", "head")
-        assert result.returncode == 0, (
-            f"{result.stdout}\n{result.stderr}"
-        )
-        assert asyncio.run(_fetch_version(params)) == "0026"
+        assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+        assert asyncio.run(_fetch_version(params)) == "0027"
     finally:
         asyncio.run(drop_scratch_database(str(params["database"])))
