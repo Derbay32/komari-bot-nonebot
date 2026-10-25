@@ -147,7 +147,6 @@ def test_prompt_builder_passes_canonical_context_to_binding_lookup(
     messages = asyncio.run(
         prompt_builder.build_prompt(
             user_message="你好",
-            memories=[],
             config=_build_config(),
             current_user_id="1047195267",
             current_user_nickname="平台昵称",
@@ -160,7 +159,6 @@ def test_prompt_builder_passes_canonical_context_to_binding_lookup(
     other_messages = asyncio.run(
         prompt_builder.build_prompt(
             user_message="你好",
-            memories=[],
             config=_build_config(),
             current_user_id="1047195267",
             current_user_nickname="平台昵称",

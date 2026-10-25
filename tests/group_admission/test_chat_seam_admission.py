@@ -497,8 +497,10 @@ async def test_recall_restricted_blocks_recall(monkeypatch: pytest.MonkeyPatch) 
     assert result.content == ""
 
 
+@pytest.mark.parametrize("source_user_id", ["u1", "another-user"])
 async def test_recalled_memory_from_restricted_source_usable_in_admitted_group(
     monkeypatch: pytest.MonkeyPatch,
+    source_user_id: str,
 ) -> None:
     """已接收记忆不按来源群过滤；当前群获准即可用于另一群。"""
     from hindsight_client import RecallResponse
@@ -513,7 +515,10 @@ async def test_recalled_memory_from_restricted_source_usable_in_admitted_group(
                 {
                     "id": "memory-from-group-a",
                     "text": "A 群的旅行经历",
-                    "metadata": {"source_group_id": "group-a"},
+                    "metadata": {
+                        "source_group_id": "group-a",
+                        "source_user_id": source_user_id,
+                    },
                 }
             ]
         }

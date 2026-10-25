@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, select, update
 
 from komari_bot.plugins.user_ban.orm_models import (
     UserBanCacheState,
@@ -486,12 +486,37 @@ async def test_expired_notification_claim_ack_and_retry_are_owner_scoped() -> No
         await repository.initialize()
         await repository.delete_expired()
 
+        session = _open_session()
+        try:
+            ready_notification_ids = list(
+                (
+                    await session.execute(
+                        update(UserBanNotificationOutbox)
+                        .where(
+                            UserBanNotificationOutbox.__table__.c.user_id == user_id,
+                            UserBanNotificationOutbox.__table__.c.notification_kind
+                            == "natural_expiry",
+                        )
+                        .values(available_at=func.now())
+                        .returning(
+                            UserBanNotificationOutbox.__table__.c.notification_id
+                        )
+                    )
+                ).scalars()
+            )
+            await session.commit()
+        finally:
+            await session.close()
+        outbox_ids.extend(ready_notification_ids)
+        assert len(ready_notification_ids) == 1, (
+            "自然解封 outbox 必须恰好有一条本测试用户的通知"
+        )
+
         claimed = await repository.claim_expired_notification(
             owner_token="worker-1",
             lease_seconds=60,
         )
         assert claimed is not None
-        outbox_ids.append(claimed.notification_id)
         assert claimed.user_id == user_id
         assert claimed.attempt_count == 1
         assert claimed.records[0].reason == "到期测试"
@@ -540,7 +565,7 @@ async def test_expired_notification_claim_ack_and_retry_are_owner_scoped() -> No
                     UserBanNotificationOutbox.__table__.c.notification_id
                     == claimed.notification_id
                 )
-                .values(available_at=datetime.now(UTC) - timedelta(seconds=1))
+                .values(available_at=func.now() - timedelta(seconds=1))
             )
             await session.commit()
         finally:
