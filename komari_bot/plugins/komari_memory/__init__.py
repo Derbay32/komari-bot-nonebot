@@ -9,6 +9,7 @@ from nonebot.plugin import PluginMetadata, require
 
 from .config_schema import KomariMemoryConfigSchema
 from .services.config_interface import get_config_async
+from .services.hindsight_retain import HindsightRetainRequest
 from .services.hindsight_service import (
     HindsightMemoryService,
     HindsightRecallSession,
@@ -28,6 +29,7 @@ __plugin_meta__ = PluginMetadata(
 __all__ = [
     "HindsightMemoryService",
     "HindsightRecallSession",
+    "HindsightRetainRequest",
     "HindsightUnavailableError",
     "KomariMemoryConfigSchema",
     "get_hindsight_memory",

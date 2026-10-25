@@ -66,6 +66,7 @@ async def test_plugin_public_surface_is_hindsight_only() -> None:
         assert set(module.__all__) == {
             "HindsightMemoryService",
             "HindsightRecallSession",
+            "HindsightRetainRequest",
             "HindsightUnavailableError",
             "KomariMemoryConfigSchema",
             "get_hindsight_memory",
