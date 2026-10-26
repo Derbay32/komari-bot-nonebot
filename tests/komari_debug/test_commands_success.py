@@ -36,7 +36,6 @@ from nonebot.adapters.onebot.v11 import (
 from nonebot.adapters.onebot.v11.event import Sender
 
 from komari_bot.onebot.onebot_messages import plain_text_message
-from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
 
 if TYPE_CHECKING:
     from nonebug import App
@@ -982,13 +981,18 @@ async def test_reply_success_calls_generate_debug_reply_and_sends_report(
 
     async def _fake_generate_debug_reply(**kwargs: object) -> SimpleNamespace:
         spy.generate_called = True
-        collector = kwargs.get("collector")
+        spy.generate_kwargs = kwargs
+        # TSK-200：debug 命令自己持有 debug 前缀的请求 ID 并显式下传。
+        request_trace_id = kwargs.get("request_trace_id")
+        assert isinstance(request_trace_id, str)
+        assert request_trace_id.startswith("debug-reply-")
         return SimpleNamespace(
             reply="测试回复内容",
             reply_to_message_id=None,
             favorability_delta=5,
             favorability_reason="测试",
-            collector=collector,
+            request_id=request_trace_id,
+            image_failure_summary=None,
         )
 
     async def _fake_deliver_report(**kwargs: object) -> None:
@@ -1013,6 +1017,11 @@ async def test_reply_success_calls_generate_debug_reply_and_sends_report(
     assert spy.report_kwargs["result_type"] == "reply"
     assert spy.report_kwargs["succeeded"] is True
     assert spy.report_kwargs["public_requested"] is False
+    # 命令持有的请求 ID 与干跑结果一致，且显式传给报告渲染。
+    assert spy.report_kwargs["request_id"] == spy.generate_kwargs["request_trace_id"]
+    assert spy.report_kwargs["request_id"].startswith("debug-reply-")
+    assert "collector" not in spy.report_kwargs
+    assert "collector" not in spy.generate_kwargs
 
 
 @pytest.mark.asyncio
@@ -1020,7 +1029,7 @@ async def test_debug_report_group_receipt_never_contains_diagnostic_canaries(
     debug_commands: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    collector = LLMDiagnosticCollector(request_id="debug-safe-receipt")
+    request_id = "debug-reply-safe-receipt"
     event = _build_group_event(".debug reply secret", user_id=SU_ID)
     captured = SimpleNamespace(report_kwargs=None, receipt=None)
 
@@ -1050,20 +1059,22 @@ async def test_debug_report_group_receipt_never_contains_diagnostic_canaries(
     await debug_commands._deliver_debug_report(
         bot=cast("Any", SimpleNamespace()),
         event=event,
-        collector=collector,
+        request_id=request_id,
         result_type="reply",
         succeeded=False,
         public_requested=False,
         error="error-receipt-canary",
-        extra_info={"user_id": "user-receipt-canary"},
         final_result_info={"reply_text": "reply-receipt-canary"},
     )
 
     assert captured.report_kwargs["user_id"] == SU_ID
     assert captured.report_kwargs["public_group_id"] is None
+    assert captured.report_kwargs["request_id"] == request_id
+    assert "collector" not in captured.report_kwargs
+    assert "extra_info" not in captured.report_kwargs
     assert captured.receipt == (
         "🔒 调试请求已处理\n"
-        "请求 ID: debug-safe-receipt\n"
+        "请求 ID: debug-reply-safe-receipt\n"
         "执行状态: 失败\n"
         "完整结果: 已私聊"
     )
@@ -1206,6 +1217,10 @@ async def test_summary_success_sends_image_before_report(
 
     async def _fake_execute(**kwargs: object) -> SimpleNamespace:
         assert kwargs["user_request"] == "总结一下"
+        request_trace_id = kwargs.get("request_trace_id")
+        assert isinstance(request_trace_id, str)
+        assert request_trace_id.startswith("debug-summary-")
+        order.append("execute")
         return SimpleNamespace(
             image_base64="image-data",
             filtered_message_count=12,
@@ -1227,6 +1242,10 @@ async def test_summary_success_sends_image_before_report(
         assert kwargs["succeeded"] is True
         assert kwargs["public_requested"] is True
         assert kwargs["private_artifact_delivered"] is True
+        report_request_id = kwargs["request_id"]
+        assert isinstance(report_request_id, str)
+        assert report_request_id.startswith("debug-summary-")
+        assert "collector" not in kwargs
         order.append("report")
 
     monkeypatch.setattr(debug_commands, "SUPERUSER", _allow_superuser)
@@ -1246,7 +1265,8 @@ async def test_summary_success_sends_image_before_report(
         "--public 总结一下",
     )
 
-    assert order == ["image", "report"]
+    # 先执行总结（持有 debug-summary 请求 ID），再私聊图片，最后报告。
+    assert order == ["execute", "image", "report"]
 
 
 # ─── summary 异常流程 ─────────────────────────────────────────

@@ -73,13 +73,11 @@ from ..services.prompt_builder import build_prompt
 from ..services.query_rewrite_service import QueryRewriteService
 from ..services.reply_context import ReplyContext
 
-require("agent_run_logger")
 require("user_data")
 
 require("config_manager")
 require("komari_search")
 
-from komari_bot.plugins import agent_run_logger as agent_run_logger_plugin
 from komari_bot.plugins import config_manager as config_manager_plugin
 from komari_bot.plugins import komari_search as komari_search_plugin
 from komari_bot.plugins import user_data as user_data_plugin
@@ -92,7 +90,6 @@ llm_provider_config_manager = config_manager_plugin.get_config_manager(
 if TYPE_CHECKING:
     from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
 
-    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
     from komari_bot.plugins.komari_memory import (
         HindsightMemoryService,
         HindsightRecallSession,
@@ -133,13 +130,18 @@ class _PlainTextExtractable(Protocol):
 
 @dataclass(frozen=True)
 class DebugReplyResult:
-    """debug 回复干跑结果。"""
+    """debug 回复干跑结果。
+
+    TSK-200：Agent Run 采集器退役后，干跑结果只携带命令持有的请求 ID 与
+    图片理解失败的安全汇总（无 URL/base64/视觉正文），不再携带采集器。
+    """
 
     reply: str
     reply_to_message_id: str | None
     favorability_delta: int | None
     favorability_reason: str | None
-    collector: LLMDiagnosticCollector
+    request_id: str
+    image_failure_summary: ImageFailureSummary | None = None
 
 
 @dataclass(frozen=True)
@@ -1203,7 +1205,6 @@ class MessageHandler:
         reply_context_refetched: bool,
         request_trace_id: str,
         caller_is_superuser: bool = False,
-        collector: LLMDiagnosticCollector | None = None,
         recall_session: HindsightRecallSession | None = None,
     ) -> ReplyResult:
         """Run the read/generate core with a supplied task memory session.
@@ -1230,7 +1231,6 @@ class MessageHandler:
                     reply_context_refetched=reply_context_refetched,
                     request_trace_id=request_trace_id,
                     caller_is_superuser=caller_is_superuser,
-                    collector=collector,
                     recall_session=active_session,
                 )
                 return replace(
@@ -1238,11 +1238,10 @@ class MessageHandler:
                     hindsight_target_fingerprint=active_session.target_fingerprint,
                 )
         except Exception:
-            # TSK-196：委托核心的敏感图片 locals 已由其单点安全抛出点清空；
-            # 本包装帧同样重绑参数与 collector，保持既有 traceback 投影边界。
+            # TSK-196/TSK-200：委托核心的敏感图片 locals 已由其单点安全抛出点
+            # 清空；本包装帧同样重绑图片参数，保持既有 traceback 投影边界。
             image_urls = None
             reply_context = None
-            collector = None
             raise
 
     async def _generate_reply_with_session(
@@ -1257,7 +1256,6 @@ class MessageHandler:
         request_trace_id: str,
         recall_session: HindsightRecallSession,
         caller_is_superuser: bool = False,
-        collector: LLMDiagnosticCollector | None = None,
     ) -> ReplyResult:
         """纯读取/生成核心：查询重写、记忆召回、prompt 构建、LLM 回复生成。
 
@@ -1270,17 +1268,10 @@ class MessageHandler:
         agent_budget = AgentExecutionBudget.from_config(config)
         image_policy = ImageUnderstandingPolicy.from_config(config)
 
-        # 查询重写（带 trace）
-        if collector is not None:
-            rewrite_parent_call_id = f"rewrite-{uuid.uuid4().hex[:8]}"
-        else:
-            rewrite_parent_call_id = None
-
+        # 查询重写（trace 只用于普通运行日志）
         rewritten_query = await self.query_rewrite.rewrite_query(
             current_query=message.content,
             request_trace_id=request_trace_id,
-            parent_call_id=rewrite_parent_call_id,
-            collector=collector,
         )
 
         # TSK-225 / TSK-193：召回实际外呼前按当前群重新裁决。准入拒绝走
@@ -1343,10 +1334,7 @@ class MessageHandler:
                     vision_reasoning_effort=str(
                         getattr(vision_config, "vision_reasoning_effort", "") or ""
                     ),
-                    request_trace_id=(
-                        request_trace_id if collector is not None else None
-                    ),
-                    collector=collector,
+                    request_trace_id=request_trace_id,
                     group_id=message.group_id,
                 )
                 use_vision_tool = True
@@ -1491,8 +1479,6 @@ class MessageHandler:
                         caller_group_id=message.group_id,
                         caller_is_superuser=caller_is_superuser,
                         max_favorability_delta=user_data_plugin.get_config().max_favorability_delta_per_reply,
-                        collector=collector,
-                        parent_call_id=f"core-{uuid.uuid4().hex[:8]}",
                         agent_budget=agent_budget,
                     )
                 else:
@@ -1500,8 +1486,6 @@ class MessageHandler:
                         config=config,
                         messages=prompt_messages,
                         request_trace_id=request_trace_id,
-                        collector=collector,
-                        parent_call_id=f"core-{uuid.uuid4().hex[:8]}",
                         agent_budget=agent_budget,
                     )
             except NativeMultimodalRequestError:
@@ -1536,9 +1520,9 @@ class MessageHandler:
         # 单点安全抛出：所有预期图片失败（native 全下载失败 / native provider
         # 失败 / delegated 全部不可用）统一在此清空本帧图片敏感 locals 后抛新
         # 异常。抛前显式重绑函数参数 ``image_urls``/``reply_context``、来源与
-        # base64 列表、含 image_url 部件的 ``prompt_messages``、已 close 的
-        # ``image_session`` 与可能持 raw input_data 的 ``collector``；只重绑
-        # 本地名字，不触碰调用者传入的对象本体。最终异常 traceback 的
+        # base64 列表、含 image_url 部件的 ``prompt_messages`` 与已 close 的
+        # ``image_session``；只重绑本地名字，不触碰调用者传入的对象本体。
+        # 最终异常 traceback 的
         # ``_generate_reply_core`` frame 递归投影不含原 URL/base64/视觉描述；
         # 不依赖 Sentry sanitizer 后处理。保留 safe summary/trace id/计数。
         if _image_failure_summary is not None:
@@ -1554,7 +1538,6 @@ class MessageHandler:
             if image_session is not None:
                 await image_session.close()
                 image_session = None
-            collector = None
             raise ImageUnderstandingFailureError(_image_failure_summary)
 
         assert reply_result is not None
@@ -1694,19 +1677,6 @@ class MessageHandler:
             )
 
             # === 纯读取/生成核心 ===
-            collector = agent_run_logger_plugin.create_collector(
-                run_type="chat_reply",
-                task_kind="chat_reply",
-                trace_id=request_trace_id,
-                input_data={
-                    "message": message,
-                    "recent_messages": recent_messages,
-                    "image_urls": image_urls,
-                    "reply_context": reply_context,
-                    "reason": reason,
-                    "force_reply": force_reply,
-                },
-            )
             try:
                 reply_result = await self._generate_reply_core(
                     message=message,
@@ -1717,22 +1687,11 @@ class MessageHandler:
                     reply_context_refetched=reply_context_refetched,
                     request_trace_id=request_trace_id,
                     caller_is_superuser=caller_is_superuser,
-                    collector=collector,
                     recall_session=recall_session,
                 )
-            except asyncio.CancelledError as exc:
-                await agent_run_logger_plugin.finalize_collector(
-                    collector,
-                    status="cancelled",
-                    error=exc,
-                )
+            except asyncio.CancelledError:
                 raise
             except _FavorabilityReadError as exc:
-                await agent_run_logger_plugin.finalize_collector(
-                    collector,
-                    status="error",
-                    error=exc,
-                )
                 return (
                     None,
                     stored,
@@ -1745,11 +1704,6 @@ class MessageHandler:
                     ),
                 )
             except Exception as exc:
-                await agent_run_logger_plugin.finalize_collector(
-                    collector,
-                    status="error",
-                    error=exc,
-                )
                 return (
                     None,
                     stored,
@@ -1765,12 +1719,6 @@ class MessageHandler:
                             else None
                         ),
                     ),
-                )
-            else:
-                await agent_run_logger_plugin.finalize_collector(
-                    collector,
-                    status="success",
-                    output=reply_result,
                 )
 
             reply = reply_result.content
@@ -1900,7 +1848,7 @@ class MessageHandler:
         image_urls: list[str] | None = None,
         reply_context: ReplyContext | None = None,
         caller_is_superuser: bool = False,
-        collector: LLMDiagnosticCollector | None = None,
+        request_trace_id: str | None = None,
     ) -> DebugReplyResult:
         """debug 干跑回复生成：以命令发起者身份、当前群上下文执行纯读取/生成，
         完全跳过决策引擎、表情反应、Redis push、好感度 adjust、互动写入、冷却/频控。
@@ -1913,88 +1861,49 @@ class MessageHandler:
             _bot: Bot 实例（用于 refetch reply；可省略）
             image_urls: 命令附图的 URL 列表
             reply_context: 引用消息上下文（如有）
-            collector: 可选的诊断收集器，缺省时自行创建
+            request_trace_id: 命令持有的 debug 请求 ID；缺省时生成既有风格 ID
 
         Returns:
-            DebugReplyResult（reply, favorability_delta, favorability_reason,
-            collector）
+            DebugReplyResult（reply, reply_to_message_id, favorability_delta,
+            favorability_reason, request_id, image_failure_summary）
 
         Raises:
             RuntimeError: 底层服务未初始化
         """
-        if collector is None:
-            collector = agent_run_logger_plugin.create_collector(
-                run_type="chat_reply",
-                task_kind="chat_reply",
-                trace_id=f"debug-reply-{uuid.uuid4().hex[:12]}",
-                origin="debug",
-                input_data={
-                    "group_id": group_id,
-                    "user_id": user_id,
-                    "user_nickname": user_nickname,
-                    "content": content,
-                    "image_urls": image_urls,
-                    "reply_context": reply_context,
-                },
-                force_collect=True,
-            )
-            if collector is None:
-                msg = "Agent Run debug 收集器创建失败"
-                raise RuntimeError(msg)
-        request_trace_id = collector.request_id
+        trace_id = request_trace_id or f"debug-reply-{uuid.uuid4().hex[:12]}"
 
-        try:
-            reply_context_refetched = False
-            refetched_context: ReplyContext | None = None
-            if (
-                _bot is not None
-                and reply_context is not None
-                and self._should_refetch_reply_context(context=reply_context)
-            ):
-                refetched_context = await self._refetch_reply_context_by_message_id(
-                    bot=_bot,
-                    message_id=reply_context.message_id,
-                    group_id=group_id,
-                )
-                reply_context_refetched = True
-                if refetched_context is not None:
-                    reply_context = refetched_context
-
-            # 构造测试 MessageSchema
-            message = MessageSchema(
-                user_id=user_id,
-                user_nickname=user_nickname,
+        reply_context_refetched = False
+        refetched_context: ReplyContext | None = None
+        if (
+            _bot is not None
+            and reply_context is not None
+            and self._should_refetch_reply_context(context=reply_context)
+        ):
+            refetched_context = await self._refetch_reply_context_by_message_id(
+                bot=_bot,
+                message_id=reply_context.message_id,
                 group_id=group_id,
-                content=content,
-                timestamp=time.time(),
-                message_id=f"debug-{uuid.uuid4().hex[:8]}",
             )
+            reply_context_refetched = True
+            if refetched_context is not None:
+                reply_context = refetched_context
 
-            # === 读取已有缓冲（不 store_current，不写当前消息） ===
-            recent_messages, _stored = await self._read_buffers(
-                group_id=group_id,
-                message=message,
-                store_current=False,
-            )
-        except asyncio.CancelledError as exc:
-            await agent_run_logger_plugin.finalize_collector(
-                collector,
-                status="cancelled",
-                error=exc,
-            )
-            raise
-        except Exception as exc:
-            collector.add_error(
-                phase="debug_reply_context",
-                error_type=type(exc).__name__,
-                message=str(exc),
-            )
-            await agent_run_logger_plugin.finalize_collector(
-                collector,
-                status="error",
-                error=exc,
-            )
-            raise
+        # 构造测试 MessageSchema
+        message = MessageSchema(
+            user_id=user_id,
+            user_nickname=user_nickname,
+            group_id=group_id,
+            content=content,
+            timestamp=time.time(),
+            message_id=f"debug-{uuid.uuid4().hex[:8]}",
+        )
+
+        # === 读取已有缓冲（不 store_current，不写当前消息） ===
+        recent_messages, _stored = await self._read_buffers(
+            group_id=group_id,
+            message=message,
+            store_current=False,
+        )
 
         # === 纯读取/生成核心 ===
         try:
@@ -2005,60 +1914,37 @@ class MessageHandler:
                 reply_context=reply_context,
                 reply_context_requested=reply_context is not None,
                 reply_context_refetched=reply_context_refetched,
-                request_trace_id=request_trace_id,
+                request_trace_id=trace_id,
                 caller_is_superuser=caller_is_superuser,
-                collector=collector,
             )
-        except asyncio.CancelledError as exc:
-            await agent_run_logger_plugin.finalize_collector(
-                collector,
-                status="cancelled",
-                error=exc,
-            )
+        except asyncio.CancelledError:
             raise
         except Exception as exc:
             if isinstance(exc, FinishedException):
                 raise
-            collector.add_error(
-                phase="generate_reply_core",
-                error_type=type(exc).__name__,
-                message=str(exc),
-            )
             logger.warning(
                 "[KomariChat] debug 回复生成失败: user={} error={}\n{}",
                 user_id,
                 exc,
                 traceback.format_exc(),
             )
-            await agent_run_logger_plugin.finalize_collector(
-                collector,
-                status="error",
-                error=exc,
-            )
             if isinstance(exc, ImageUnderstandingFailureError):
-                # TSK-196 复审：完成 collector 安全 finalize 与普通安全日志后，
-                # 显式重绑本帧图片敏感 locals（image_urls/reply_context/
-                # refetched_context/本地 collector）为 None 再 re-raise；保持
-                # 异常类型/summary 语义，最终 debug 异常 traceback 的
-                # komari_chat 帧递归投影不含 raw URL/base64。普通非图片 debug
-                # 错误语义不变。
+                # TSK-196/TSK-200：普通安全日志后显式重绑本帧图片敏感 locals
+                # （image_urls/reply_context/refetched_context）为 None 再
+                # re-raise；保持异常类型/summary 语义，最终 debug 异常
+                # traceback 的 komari_chat 帧递归投影不含 raw URL/base64。
+                # 普通非图片 debug 错误语义不变。
                 image_urls = None
                 reply_context = None
                 refetched_context = None
-                collector = None
             raise
-        result = DebugReplyResult(
+        return DebugReplyResult(
             reply=reply_result.content,
             reply_to_message_id=(
                 reply_context.message_id if reply_context is not None else None
             ),
             favorability_delta=reply_result.favorability_delta,
             favorability_reason=reply_result.favorability_reason,
-            collector=collector,
+            request_id=trace_id,
+            image_failure_summary=reply_result.image_failure_summary,
         )
-        await agent_run_logger_plugin.finalize_collector(
-            collector,
-            status="success",
-            output=reply_result,
-        )
-        return result

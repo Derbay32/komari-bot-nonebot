@@ -15,7 +15,6 @@ from .reply_fulfillment_api import register_reply_fulfillment_api
 
 KNOWLEDGE_API_PREFIX = "/api/v2/komari-knowledge"
 HELP_API_PREFIX = "/api/v2/komari-help"
-AGENT_RUN_LOG_API_PREFIX = "/api/v2/agent-run-logs"
 SEARCH_API_PREFIX = "/api/v2/komari-search"
 ANNOUNCE_API_PREFIX = "/api/v2/komari-announce"
 MANAGEMENT_CONFIG_API_PREFIX = "/api/v2/komari-management-config"
@@ -42,8 +41,6 @@ class ManagementApiComponents:
     knowledge_engine_getter: Callable[[], object | None]
     register_help_api: Callable[..., None]
     help_engine_getter: Callable[[], object | None]
-    register_agent_run_log_api: Callable[..., None]
-    agent_run_log_reader_getter: Callable[[], object | None]
     register_search_api: Callable[..., None]
     register_user_ban_api: Callable[..., None]
     user_ban_service_getter: Callable[[], object]
@@ -100,12 +97,6 @@ def register_management_api_for_driver(
         api_token=token_source,
         allowed_origins=settings.allowed_origins,
         engine_getter=components.help_engine_getter,
-    )
-    components.register_agent_run_log_api(
-        server_app,
-        api_token=token_source,
-        allowed_origins=settings.allowed_origins,
-        reader_getter=components.agent_run_log_reader_getter,
     )
     components.register_search_api(
         server_app,
@@ -184,7 +175,7 @@ def register_management_api_for_driver(
     logger.info(
         "[Komari Management] 管理 API 已注册: "
         f"{KNOWLEDGE_API_PREFIX}, {HELP_API_PREFIX}, "
-        f"{AGENT_RUN_LOG_API_PREFIX}, {SEARCH_API_PREFIX}, "
+        f"{SEARCH_API_PREFIX}, "
         f"{MANAGEMENT_CONFIG_API_PREFIX}, {MANAGEMENT_PROMPT_API_PREFIX}, {ANNOUNCE_API_PREFIX}, "
         f"{USER_BAN_API_PREFIX}, "
         f"{GROUP_ADMISSION_API_PREFIX}, "

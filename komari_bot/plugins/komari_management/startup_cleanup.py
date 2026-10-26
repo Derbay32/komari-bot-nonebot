@@ -2,7 +2,8 @@
 
 旧版单 Token / ``llm_logs:read`` 权限只存在于已物理删除的遗留 JSONB 配置
 中；强类型配置表不含这些列，运行时不再做旧 KV 清理，这里只保留对仍在用
-旧权限名的凭据提示。
+已退役旧权限名的凭据提示。TSK-200 起不再建议改挂 Agent Run 日志读取权限：
+该权限随日志插件一同退役，遗留字符串保留但不授予任何能力。
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ class ManagementConfigCleanupStorageProtocol(Protocol):
     async def fetch_async(self, plugin_name: str) -> StoredConfig | None: ...
 
 
-def _contains_legacy_agent_run_permission(config_data: Mapping[str, Any]) -> bool:
+def _contains_retired_log_permission(config_data: Mapping[str, Any]) -> bool:
     raw_credentials = config_data.get("api_credentials")
     if not isinstance(raw_credentials, list):
         return False
@@ -45,10 +46,10 @@ async def cleanup_management_v1_config(
     if stored is None:
         return
 
-    if _contains_legacy_agent_run_permission(stored.config_data):
+    if _contains_retired_log_permission(stored.config_data):
         logger.warning(
-            "[Komari Management] 检测到旧权限名 llm_logs:read，"
-            "请手动改为 agent_run_logs:read"
+            "[Komari Management] 检测到已退役的旧权限名 llm_logs:read；"
+            "该权限不再授予任何能力，可按需从凭据权限列表移除"
         )
 
 

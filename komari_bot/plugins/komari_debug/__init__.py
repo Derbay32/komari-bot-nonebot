@@ -13,7 +13,6 @@ require("komari_chat")
 require("komari_context")
 require("group_history_summary")
 require("group_admission")
-require("agent_run_logger")
 
 __plugin_meta__ = PluginMetadata(
     name="komari_debug",

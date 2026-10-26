@@ -83,7 +83,6 @@ _ensure_package_shim("komari_context")
 _ensure_package_shim("komari_memory")
 _ensure_package_shim("komari_knowledge")
 _ensure_package_shim("llm_provider")
-_ensure_package_shim("agent_run_logger")
 _ensure_package_shim("komari_management")
 _ensure_package_shim("character_binding")
 _ensure_package_shim("komari_chat")
@@ -157,50 +156,6 @@ class _DummyLLMProvider:
             usage=None,
             reasoning_content=None,
         )
-
-
-class _DummyAgentRunLoggerPlugin:
-    @staticmethod
-    def create_collector(**kwargs: object) -> object | None:
-        if (
-            not kwargs.get("force_collect")
-            and kwargs.get("origin", "normal") != "debug"
-        ):
-            return None
-        from komari_bot.plugins.agent_run_logger.diagnostic import AgentRunCollector
-
-        return AgentRunCollector(
-            request_id=cast("str | None", kwargs.get("trace_id")),
-            run_type=cast("Any", kwargs.get("run_type", "chat_reply")),
-            task_kind=str(kwargs.get("task_kind", "test")),
-            origin=cast("Any", kwargs.get("origin", "normal")),
-            input_data=kwargs.get("input_data"),
-            persist=False,
-        )
-
-    @staticmethod
-    async def finalize_collector(
-        collector: object,
-        **kwargs: object,
-    ) -> bool:
-        if collector is None:
-            return False
-        mark_finished = cast("Any", collector).mark_finished
-        return bool(
-            mark_finished(
-                status=kwargs.get("status", "success"),
-                output=kwargs.get("output"),
-                error=kwargs.get("error"),
-            )
-        )
-
-    @staticmethod
-    def get_agent_run_log_reader() -> None:
-        return None
-
-    @staticmethod
-    def register_agent_run_log_api(*_args: object, **_kwargs: object) -> None:
-        return None
 
 
 class _DummyUserDataPlugin:
@@ -375,20 +330,15 @@ class _DummyChatPlugin:
 
     @staticmethod
     async def generate_debug_reply(**kwargs: object) -> object:
-        from komari_bot.plugins.agent_run_logger.diagnostic import (
-            LLMDiagnosticCollector,
-        )
-
-        collector = kwargs.get("collector")
-        if collector is None:
-            collector = LLMDiagnosticCollector(request_id="test-debug")
+        request_trace_id = kwargs.get("request_trace_id")
         return SimpleNamespace(
             reply="测试回复内容",
             reply_to_message_id=None,
             favorability_delta=5,
             favorability_reason="测试好感度变化",
             interaction_history=None,
-            collector=collector,
+            request_id=request_trace_id or "test-debug",
+            image_failure_summary=None,
         )
 
 
@@ -452,7 +402,6 @@ _REQUIRE_REGISTRY: dict[str, object] = {
     "group_admission": _DummyGroupAdmissionPlugin(),
     "nonebot_plugin_apscheduler": _DummyApschedulerPlugin(),
     "llm_provider": _DummyLLMProvider(),
-    "agent_run_logger": _DummyAgentRunLoggerPlugin(),
     "embedding_provider": _DummyEmbeddingPlugin(),
     "user_data": _DummyUserDataPlugin(),
     "user_ban": _DummyUserBanPlugin(),
@@ -585,13 +534,6 @@ _inject_package_exports(
     },
 )
 _inject_package_exports(
-    "agent_run_logger",
-    {
-        "create_collector": _DummyAgentRunLoggerPlugin.create_collector,
-        "finalize_collector": _DummyAgentRunLoggerPlugin.finalize_collector,
-    },
-)
-_inject_package_exports(
     "komari_knowledge",
     {
         "search_knowledge": _DummyKnowledgePlugin.search_knowledge,
@@ -614,15 +556,6 @@ _inject_package_exports(
         "ReplyFulfillmentOpsValidationError": (
             _DummyChatPlugin.ReplyFulfillmentOpsValidationError
         ),
-    },
-)
-_inject_package_exports(
-    "agent_run_logger",
-    {
-        "create_collector": _DummyAgentRunLoggerPlugin.create_collector,
-        "finalize_collector": _DummyAgentRunLoggerPlugin.finalize_collector,
-        "get_agent_run_log_reader": _DummyAgentRunLoggerPlugin.get_agent_run_log_reader,
-        "register_agent_run_log_api": _DummyAgentRunLoggerPlugin.register_agent_run_log_api,
     },
 )
 _inject_package_exports(

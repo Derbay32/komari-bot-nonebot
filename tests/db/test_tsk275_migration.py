@@ -23,7 +23,7 @@ from tests.db.tsk197_gate_support import (
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MIGRATIONS_DIR = PROJECT_ROOT / "migrations"
 SQLALCHEMY_URL = os.getenv("SQLALCHEMY_DATABASE_URL", "")
-HEAD = "0031"
+HEAD = "0032"
 ROULETTE_TABLES = {
     "komari_roulette_games",
     "komari_roulette_players",

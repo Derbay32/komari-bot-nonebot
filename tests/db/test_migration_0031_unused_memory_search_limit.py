@@ -171,10 +171,11 @@ async def test_0031_drops_only_dead_setting_and_preserves_surviving_chat_data() 
         check = run_bootstrap(db_url, "check")
         assert check.returncode == 0, f"{check.stdout}\n{check.stderr}"
 
+        # TSK-200：链在 0032 先拒绝降级，head 上的降级不再到达 0031。
         downgrade = run_bootstrap(db_url, "downgrade", "0030")
         assert downgrade.returncode != 0
-        combined = f"{downgrade.stdout}\n{downgrade.stderr}"
-        assert DOWNGRADE_CODE in combined
+        latest_code = "0032_TSK200_IS_IRREVERSIBLE"
+        assert latest_code in f"{downgrade.stdout}\n{downgrade.stderr}"
         connection = await asyncpg.connect(**scratch)
         try:
             assert (
@@ -187,6 +188,28 @@ async def test_0031_drops_only_dead_setting_and_preserves_surviving_chat_data() 
             await connection.close()
     finally:
         await drop_scratch_database(str(scratch["database"]))
+
+    # 0031 自身的降级拒绝仍在真实链上生效（数据库固定在 0031 时验证）。
+    guard_scratch = await recreate_scratch_database("_tsk191_0031_guard")
+    guard_url = scratch_url(str(guard_scratch["database"]))
+    try:
+        upgraded = run_bootstrap(guard_url, "upgrade", "0031")
+        assert upgraded.returncode == 0, upgraded.stderr
+
+        blocked = run_bootstrap(guard_url, "downgrade", "0030")
+        assert blocked.returncode != 0
+        assert DOWNGRADE_CODE in f"{blocked.stdout}\n{blocked.stderr}"
+
+        connection = await asyncpg.connect(**guard_scratch)
+        try:
+            assert (
+                await connection.fetchval("SELECT version_num FROM alembic_version")
+                == "0031"
+            )
+        finally:
+            await connection.close()
+    finally:
+        await drop_scratch_database(str(guard_scratch["database"]))
 
 
 @SKIP_NO_POSTGRES

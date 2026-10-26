@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import asdict
 from importlib import import_module
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -198,9 +199,6 @@ def test_delegated_raw_url_never_reaches_model_messages_or_tool_results(
 
     session, _downloader, read_images_calls, _logs = _build_real_session(monkeypatch)
 
-    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
-
-    collector = LLMDiagnosticCollector(request_id="security-boundary-1")
     result = asyncio.run(
         llm_service_module.generate_reply_with_tools(
             config=_build_config(),
@@ -208,7 +206,6 @@ def test_delegated_raw_url_never_reaches_model_messages_or_tool_results(
             tools=[llm_service_module.READ_IMAGE_TOOL],
             request_trace_id="security-boundary-1",
             image_session=session,
-            collector=collector,
         )
     )
 
@@ -228,13 +225,10 @@ def test_delegated_raw_url_never_reaches_model_messages_or_tool_results(
     # 工具结果（第二轮 user→tool 消息）以 untrusted_context source_type=vision 兜底
     rendered_all = str(provider.completion_calls)
     assert 'source_type="vision"' in rendered_all
-    # 原始 URL 绝不进入诊断收集器的工具投影
-    image_trace = next(
-        trace for trace in collector.tools if trace.tool_name == "read_image"
-    )
-    assert image_trace.parsed_arguments == {"image_index": 0}
-    assert _RAW_URL not in str(image_trace)
-    assert _DATA_URI not in str(image_trace)
+    # 原始 URL/base64 也不出现在普通运行日志
+    for record in _logs if isinstance(_logs, list) else []:
+        assert _RAW_URL not in str(record)
+        assert _DATA_URI not in str(record)
 
 
 def test_vision_description_is_wrapped_with_untrusted_vision_source(
@@ -460,9 +454,9 @@ def test_read_image_tool_failure_reaches_model_without_secrets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """全工具循环（部分失败）：视觉 seam 抛含 secret 正文异常时，主模型下一
-    轮工具结果、collector tool trace 与最终 projection 都不出现 URL/base64，
-    只出现稳定错误文本；日志不捕获 traceback。首图失败、次图成功 → 部分失败
-    允许诚实收尾（TSK-196），并携带聚合摘要。"""
+    轮工具结果与最终安全摘要都不出现 URL/base64，只出现稳定错误文本；日志
+    不捕获 traceback。首图失败、次图成功 → 部分失败允许诚实收尾（TSK-196），
+    并携带聚合摘要。"""
     provider = _RecordingProvider()
     provider.completions = [
         base_client_module.LLMCompletionResultSchema(
@@ -500,9 +494,6 @@ def test_read_image_tool_failure_reaches_model_without_secrets(
         sources=[_RAW_URL, "https://example.com/public/photo.png"],
     )
 
-    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
-
-    collector = LLMDiagnosticCollector(request_id="security-boundary-fail-1")
     result = asyncio.run(
         llm_service_module.generate_reply_with_tools(
             config=_build_config(),
@@ -510,7 +501,6 @@ def test_read_image_tool_failure_reaches_model_without_secrets(
             tools=[llm_service_module.READ_IMAGE_TOOL],
             request_trace_id="security-boundary-fail-1",
             image_session=session,
-            collector=collector,
         )
     )
 
@@ -540,30 +530,11 @@ def test_read_image_tool_failure_reaches_model_without_secrets(
     assert all(_RAW_URL not in str(content) for content in tool_messages)
     assert all(_DATA_URI not in str(content) for content in tool_messages)
 
-    # collector 内存 tool trace：首图 error、次图 success，均无 secret
-    image_traces = [
-        trace for trace in collector.tools if trace.tool_name == "read_image"
-    ]
-    assert len(image_traces) == 2
-    assert image_traces[0].status == "error"
-    assert image_traces[0].error_summary == "图片读取失败"
-    assert image_traces[0].parsed_arguments == {"image_index": 0}
-    assert image_traces[1].status == "success"
-    assert image_traces[1].parsed_arguments == {"image_index": 1}
-    for image_trace in image_traces:
-        assert _RAW_URL not in str(image_trace)
-        assert _DATA_URI not in str(image_trace)
-        assert "图片读取失败" in str(image_trace) or image_trace.status == "success"
-
-    # 最终 projection 也不含 URL/base64
-    collector.mark_finished(status="success", output={"reply": result.content})
-    record = collector.build_record()
-    record_json = json.dumps(record, ensure_ascii=False, default=str)
-    assert _RAW_URL not in record_json
-    assert _DATA_URI not in record_json
-    assert "example.com" not in record_json
-    assert "/secret/" not in record_json and "photo.png" not in record_json
-    assert "token=abc123" not in record_json
+    # 安全结果（新投影）同样不含 URL/base64
+    summary_json = json.dumps(asdict(result.image_failure_summary), default=str)
+    assert _RAW_URL not in summary_json
+    assert _DATA_URI not in summary_json
+    assert "example.com" not in summary_json
 
     # 会话日志不捕获 traceback 且不含 secret
     _assert_logs_have_no_secrets_no_traceback(log_records)
@@ -617,9 +588,6 @@ def test_delegated_repeated_read_does_not_inflate_failed_count(
         sources=[_RAW_URL, "https://example.com/public/ok.png"],
     )
 
-    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
-
-    collector = LLMDiagnosticCollector(request_id="repeated-read-1")
     result = asyncio.run(
         llm_service_module.generate_reply_with_tools(
             config=_build_config(),
@@ -627,24 +595,23 @@ def test_delegated_repeated_read_does_not_inflate_failed_count(
             tools=[llm_service_module.READ_IMAGE_TOOL],
             request_trace_id="repeated-read-1",
             image_session=session,
-            collector=collector,
         )
     )
 
     assert result.content == "这只猫在窗台上。"
-    image_traces = [
-        trace for trace in collector.tools if trace.tool_name == "read_image"
+    # 最后一次请求的上下文里，两次 index=0 工具调用都返回失败文本
+    final_tool_messages = [
+        message
+        for message in provider.completion_calls[-1]["messages"]
+        if message.get("role") == "tool"
     ]
-    assert len(image_traces) == 3, "每次 read_image 工具调用都保留 Trace"
-    assert [trace.parsed_arguments for trace in image_traces] == [
-        {"image_index": 0},
-        {"image_index": 0},
-        {"image_index": 1},
-    ]
-    error_traces = [trace for trace in image_traces if trace.status == "error"]
-    assert len(error_traces) == 2, "两次 index=0 工具调用都返回失败文本"
-    assert all(
-        trace.parsed_arguments == {"image_index": 0} for trace in error_traces
+    assert (
+        sum(
+            1
+            for content in final_tool_messages
+            if "图片读取失败" in str(content)
+        )
+        == 2
     )
     # 聚合失败计数按唯一失败索引计，不因重复读取放大
     assert result.image_failure_summary is not None

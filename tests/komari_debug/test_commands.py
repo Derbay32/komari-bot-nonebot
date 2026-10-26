@@ -465,38 +465,13 @@ def test_plugin_metadata_has_required_plugins() -> None:
 
 
 def test_report_build_chapters_success(debug_reporting: Any) -> None:
-    """验证成功报告包含所有必需章节，且回复正文在最终结果章节不截断。"""
-    from komari_bot.plugins.agent_run_logger.diagnostic import (
-        LLMCallTrace,
-        LLMDiagnosticCollector,
-        ToolExecutionTrace,
-    )
-
-    collector = LLMDiagnosticCollector(request_id="test-1")
-    call = LLMCallTrace(
-        phase="query_rewrite",
-        round_index=0,
-        model="deepseek-chat",
-        finish_reason="stop",
-        duration_ms=120.5,
-    )
-    collector.add_call(call)
-    tool = ToolExecutionTrace(
-        call_id=call.call_id,
-        tool_name="search_web",
-        parsed_arguments={"query": "test"},
-        status="success",
-        result_summary="搜索到 3 条结果",
-    )
-    collector.add_tool(tool)
-
+    """验证成功报告只有纯渲染章节，且回复正文在最终结果章节不截断。"""
     long_reply = "A" * 600
     chapters = debug_reporting._build_chapters(
-        collector,
+        "test-1",
         "reply",
         succeeded=True,
         error=None,
-        extra_info={"user_id": "42"},
         final_result_info={
             "reply_text": long_reply,
             "favorability_delta": "好感度变化: +5",
@@ -504,13 +479,7 @@ def test_report_build_chapters_success(debug_reporting: Any) -> None:
     )
 
     chapter_titles = [c[0] for c in chapters]
-    assert "请求总览" in chapter_titles
-    assert "最终结果" in chapter_titles
-    assert "LLM 调用详情" in chapter_titles
-    assert "工具摘要" in chapter_titles
-    assert "阶段 token 小计" in chapter_titles
-    assert "全链路 token 小计" in chapter_titles
-    assert "错误/降级" in chapter_titles
+    assert chapter_titles == ["请求总览", "最终结果"]
 
     # 回复正文完整保留在最终结果中，不被截断到 500
     final_result_body = chapters[1][1]
@@ -519,108 +488,24 @@ def test_report_build_chapters_success(debug_reporting: Any) -> None:
 
     # 请求总览不含回复正文
     overview_body = chapters[0][1]
+    assert "请求 ID: test-1" in overview_body
     assert long_reply not in overview_body
 
 
 def test_report_build_chapters_failure(debug_reporting: Any) -> None:
-    """验证失败报告包含错误信息章节。"""
-    from komari_bot.plugins.agent_run_logger.diagnostic import (
-        LLMCallTrace,
-        LLMDiagnosticCollector,
-    )
-
-    collector = LLMDiagnosticCollector(request_id="test-fail")
-    call = LLMCallTrace(
-        phase="generate_reply",
-        round_index=0,
-        model="deepseek-chat",
-        finish_reason="error",
-        duration_ms=50.0,
-    )
-    collector.add_call(call)
-    collector.add_error("test", "ValueError", "测试错误")
-
+    """验证失败报告只渲染状态与安全固定错误码。"""
     chapters = debug_reporting._build_chapters(
-        collector,
+        "test-fail",
         "reply",
         succeeded=False,
-        error="测试错误",
-        extra_info=None,
+        error="debug_reply_failed",
     )
 
     chapter_titles = [c[0] for c in chapters]
-    assert "最终结果" in chapter_titles
-    assert "错误/降级" in chapter_titles
-
-
-def test_token_format_unreported(debug_reporting: Any) -> None:
-    """未报告的 token 字段显示为"未报告"而非 0。"""
-    assert debug_reporting._fmt_token(None, complete=True) == "未报告"
-    assert debug_reporting._fmt_token(None, complete=False) == "未报告"
-    assert debug_reporting._fmt_token(0, complete=True) == "0"
-    assert debug_reporting._fmt_token(100, complete=True) == "100"
-
-
-def test_help_text_uses_debug_prefix(debug_commands: Any) -> None:
-    """HELP_TEXT 所有命令写完整 .debug ... 前缀。"""
-    assert ".debug favor get" in debug_commands.HELP_TEXT
-    assert ".debug favor set" in debug_commands.HELP_TEXT
-    assert ".debug bind set" in debug_commands.HELP_TEXT
-    assert ".debug bind del" in debug_commands.HELP_TEXT
-    assert ".debug bind list" in debug_commands.HELP_TEXT
-    assert ".debug reply" in debug_commands.HELP_TEXT
-    assert ".debug summary" in debug_commands.HELP_TEXT
-    assert ".debug notify" in debug_commands.HELP_TEXT
-
-
-def test_split_into_nodes_respects_max_length(debug_reporting: Any) -> None:
-    """节点拆分遵守最大长度限制。"""
-    long_text = "A" * (debug_reporting.MAX_NODE_TEXT_LENGTH + 500)
-    nodes = debug_reporting._split_into_nodes(long_text)
-    assert len(nodes) > 1
-    for node in nodes:
-        assert len(node) <= debug_reporting.MAX_NODE_TEXT_LENGTH
-
-
-def test_split_into_nodes_short_text(debug_reporting: Any) -> None:
-    """短文本拆分返回单节点。"""
-    nodes = debug_reporting._split_into_nodes("短文本")
-    assert len(nodes) == 1
-    assert nodes[0] == "短文本"
-
-
-def test_split_into_nodes_empty(debug_reporting: Any) -> None:
-    """空文本拆分返回占位节点。"""
-    nodes = debug_reporting._split_into_nodes("")
-    assert len(nodes) == 1
-    assert nodes[0] == "(无诊断信息)"
-
-
-# ─── 阶段聚合测试 ──────────────────────────────────────────────
-
-
-def test_phase_aggregation_with_missing_usage() -> None:
-    """usage 为 None 时聚合报告标注为不完整。"""
-    from komari_bot.plugins.agent_run_logger.diagnostic import (
-        LLMCallTrace,
-        LLMDiagnosticCollector,
-    )
-
-    collector = LLMDiagnosticCollector(request_id="agg-test")
-    call = LLMCallTrace(
-        phase="query_rewrite",
-        round_index=0,
-        model="deepseek-chat",
-        finish_reason="stop",
-        duration_ms=100.0,
-        usage=None,
-    )
-    collector.add_call(call)
-
-    agg = collector.aggregate_phase("query_rewrite")
-    assert agg.call_count == 1
-    assert not agg.input_tokens_complete
-    assert agg.input_tokens == 0
+    assert chapter_titles == ["请求总览", "最终结果"]
+    final_body = dict(chapters)["最终结果"]
+    assert "执行失败" in final_body
+    assert "错误码: debug_reply_failed" in final_body
 
 
 # ─── parse helpers ─────────────────────────────────────────────

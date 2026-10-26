@@ -8,9 +8,6 @@ from typing import Any
 
 import pytest
 
-from komari_bot.plugins.agent_run_logger.diagnostic import (
-    AgentRunCollector,
-)
 from komari_bot.plugins.komari_memory.services.hindsight_service import (
     HindsightUnavailableError,
 )
@@ -519,7 +516,6 @@ async def _run_tool_loop(
     *,
     provider: _Provider,
     memory: FakeHindsightMemory,
-    collector: AgentRunCollector | None = None,
     tools: list[dict[str, Any]] | None = None,
     total: int = 20,
 ) -> Any:
@@ -541,7 +537,6 @@ async def _run_tool_loop(
             recall_session=session,
             group_id="group-1",
             caller_group_id="group-1",
-            collector=collector,
             agent_budget=AgentExecutionBudget(
                 rounds=10,
                 per_round=4,
@@ -613,7 +608,6 @@ async def test_invalid_tool_arguments_remain_correctable_without_sdk_calls(
     expected_fragment: str,
 ) -> None:
     memory = FakeHindsightMemory()
-    collector = AgentRunCollector(persist=False)
     provider = _Provider(
         [
             _completion(_tool_call("recall_memory", payload)),
@@ -625,7 +619,6 @@ async def test_invalid_tool_arguments_remain_correctable_without_sdk_calls(
         monkeypatch,
         provider=provider,
         memory=memory,
-        collector=collector,
     )
 
     assert result.content == "最终回复"
@@ -636,21 +629,14 @@ async def test_invalid_tool_arguments_remain_correctable_without_sdk_calls(
     assert expected_fragment in tool_message["content"]
     assert "evil" not in tool_message["content"]
     assert "secret" not in tool_message["content"]
-    collector.mark_finished(status="success", output=result)
-    record = collector.build_record()
-    assert record["budget"]["tool_calls_used"] == 2
-    recall_traces = [t for t in collector.tools if t.tool_name == "recall_memory"]
-    assert recall_traces
-    assert all(trace.parsed_arguments == {} for trace in recall_traces)
 
 
-async def test_tool_recall_failure_stops_before_final_response_and_traces_safely(
+async def test_tool_recall_failure_stops_before_final_response(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     memory = FakeHindsightMemory(
         recall_error=HindsightUnavailableError("recall_failed")
     )
-    collector = AgentRunCollector(persist=False)
     provider = _Provider(
         [
             _completion(
@@ -665,17 +651,12 @@ async def test_tool_recall_failure_stops_before_final_response_and_traces_safely
             monkeypatch,
             provider=provider,
             memory=memory,
-            collector=collector,
         )
 
     assert captured.value.reason_code == "recall_failed"
     assert len(provider.calls) == 1
-    traces = [t for t in collector.tools if t.tool_name == "recall_memory"]
-    assert len(traces) == 1
-    assert traces[0].status == "error"
-    assert traces[0].error_summary == "recall_failed"
-    assert traces[0].parsed_arguments == {}
-    assert "敏感查询" not in str(traces[0].result)
+    # 失败异常不携带召回查询正文
+    assert "敏感查询" not in str(captured.value)
 
 
 async def test_final_response_before_recall_is_not_preempted(

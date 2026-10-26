@@ -81,6 +81,9 @@ async def test_startup_cleanup_warns_about_old_permission_without_rewriting() ->
 
     assert storage.config_data == {"api_credentials": credentials}
     assert logger.warning_messages == [
-        "[Komari Management] 检测到旧权限名 llm_logs:read，"
-        "请手动改为 agent_run_logs:read"
+        "[Komari Management] 检测到已退役的旧权限名 llm_logs:read；"
+        "该权限不再授予任何能力，可按需从凭据权限列表移除"
     ]
+    # TSK-200：退役权限名不得再被推荐；遗留 llm_logs 字符串原样保留。
+    assert "agent_run_logs" not in logger.warning_messages[0]
+    assert credentials[0]["permissions"] == ["config:read", "llm_logs:read"]

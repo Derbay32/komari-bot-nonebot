@@ -2,10 +2,10 @@
 
 背景
 ----
-ticket 10 把 komari_memory / komari_knowledge / komari_help / agent_run_logger
-四个插件的数据库连接来源从自研 asyncpg 池切换
-到 nonebot-plugin-orm 共享引擎，同时保留这四个插件的 raw SQL（向量检索 /
-HNSW / UNLOGGED / advisory lock 的判定依据不动）。
+ticket 10 把 komari_memory / komari_knowledge / komari_help 的数据库连接
+来源从自研 asyncpg 池切换到 nonebot-plugin-orm 共享引擎，同时保留这些插件
+的 raw SQL（向量检索 / HNSW / UNLOGGED / advisory lock 的判定依据不动）。
+TSK-200 起旧 Agent Run 日志插件的存储已完整退役，不再经本适配层访问数据库。
 
 实现形态
 --------

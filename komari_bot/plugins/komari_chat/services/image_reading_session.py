@@ -38,8 +38,6 @@ from .vision_service import read_images
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
-
 #: 图片来源归属：引用消息图片在前、当前消息图片在后。
 ImageOrigin = Literal["quoted", "current"]
 
@@ -147,12 +145,7 @@ class ImageReadingSessionProtocol(Protocol):
     @property
     def total_count(self) -> int: ...
 
-    async def read(
-        self,
-        index: int,
-        *,
-        parent_call_id: str | None = None,
-    ) -> ImageReadResult: ...
+    async def read(self, index: int) -> ImageReadResult: ...
 
     def all_images_unavailable(self) -> bool: ...
 
@@ -182,7 +175,6 @@ class ImageReadingSession:
         vision_thinking_mode: bool = False,
         vision_reasoning_effort: str = "",
         request_trace_id: str | None = None,
-        collector: "LLMDiagnosticCollector | None" = None,
         group_id: str | None = None,
     ) -> None:
         #: 任务归属群：图片下载 / 视觉等瞬时效果在其前按此群裁决（TSK-225）。
@@ -209,7 +201,6 @@ class ImageReadingSession:
         self._vision_thinking_mode = vision_thinking_mode
         self._vision_reasoning_effort = vision_reasoning_effort
         self._request_trace_id = request_trace_id
-        self._collector = collector
 
     @classmethod
     def build(
@@ -227,7 +218,6 @@ class ImageReadingSession:
         vision_thinking_mode: bool = False,
         vision_reasoning_effort: str = "",
         request_trace_id: str | None = None,
-        collector: "LLMDiagnosticCollector | None" = None,
         group_id: str | None = None,
     ) -> "ImageReadingSession":
         """从引用消息与当前消息的来源构造会话；索引稳定且引用在前。
@@ -272,7 +262,6 @@ class ImageReadingSession:
             vision_thinking_mode=vision_thinking_mode,
             vision_reasoning_effort=vision_reasoning_effort,
             request_trace_id=request_trace_id,
-            collector=collector,
             group_id=group_id,
         )
 
@@ -302,12 +291,7 @@ class ImageReadingSession:
         """本任务已累计下载的响应体字节数。"""
         return self._downloader.downloaded_bytes
 
-    async def read(
-        self,
-        index: int,
-        *,
-        parent_call_id: str | None = None,
-    ) -> ImageReadResult:
+    async def read(self, index: int) -> ImageReadResult:
         """读取稳定 ``image_index`` 对应图片；成功/失败均缓存。
 
         并发重复读取同一索引单飞共享同一进行中的下载与视觉请求；任务级
@@ -365,7 +349,6 @@ class ImageReadingSession:
             self._read_one(
                 reference,
                 self._sources[index],
-                parent_call_id=parent_call_id,
             )
         )
         self._inflight[index] = task
@@ -419,8 +402,6 @@ class ImageReadingSession:
         self,
         reference: ImageReference,
         source: str,
-        *,
-        parent_call_id: str | None,
     ) -> ImageReadResult:
         """单张图片的懒下载 + 视觉描述；失败按索引缓存。
 
@@ -485,11 +466,7 @@ class ImageReadingSession:
                 stream_enabled=self._vision_stream_enabled,
                 thinking_mode=self._vision_thinking_mode,
                 reasoning_effort=self._vision_reasoning_effort,
-                request_trace_id=(
-                    self._request_trace_id if self._collector is not None else None
-                ),
-                parent_call_id=parent_call_id if self._collector is not None else None,
-                collector=self._collector,
+                request_trace_id=self._request_trace_id,
                 group_id=self._group_id,
             )
         except asyncio.CancelledError:

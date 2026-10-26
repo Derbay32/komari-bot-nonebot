@@ -128,28 +128,25 @@ def test_rewrite_query_still_calls_llm_for_non_empty_input(monkeypatch: Any) -> 
     assert fake_provider.completion_calls[0]["request_phase"] == "query_rewrite"
 
 
-def test_rewrite_query_records_trace_in_collector(monkeypatch: Any) -> None:
-    """查询重写在使用 completion 接口时记录 trace 到 collector。"""
+def test_rewrite_query_forwards_request_trace_id_to_provider(
+    monkeypatch: Any,
+) -> None:
+    """TSK-200：查询重写的 trace 只进入普通运行日志请求参数。"""
     _patch_config(monkeypatch)
     fake_provider = _FakeLLMProvider(["重写后的查询"])
     monkeypatch.setattr(query_rewrite_module, "llm_provider", fake_provider)
-    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
 
-    collector = LLMDiagnosticCollector(request_id="test-qr")
     service = query_rewrite_module.QueryRewriteService()
     result = asyncio.run(
         service.rewrite_query(
             "她是谁",
             request_trace_id="trace-qr",
-            parent_call_id="parent-qr",
-            collector=collector,
         )
     )
 
     assert result == "重写后的查询"
-    assert len(collector.calls) == 1
-    assert collector.calls[0].phase == "query_rewrite"
-    assert collector.calls[0].parent_call_id == "parent-qr"
+    assert fake_provider.completion_calls[0]["request_trace_id"] == "trace-qr"
+    assert fake_provider.completion_calls[0]["request_phase"] == "query_rewrite"
 
 
 def test_rewrite_query_uses_dedicated_query_rewrite_config_fields(

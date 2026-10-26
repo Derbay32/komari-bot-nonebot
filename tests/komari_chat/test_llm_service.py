@@ -1124,8 +1124,7 @@ def test_generate_reply_with_tools_delegated_all_unavailable_terminates(
     终止工具循环，不允许 final_response 成功。
 
     单图失败（唯一索引已尝试且失败）即触发；异常只携带
-    ``ImageFailureSummary``（无 URL/base64/视觉描述/原异常正文）；最后一次
-    失败 read_image 的 ``ToolExecutionTrace`` 已写入 collector。
+    ``ImageFailureSummary``（无 URL/base64/视觉描述/原异常正文）。
     """
     fake_provider = _FakeLLMProvider("")
     fake_provider.completions = [
@@ -1172,9 +1171,6 @@ def test_generate_reply_with_tools_delegated_all_unavailable_terminates(
             )
         ]
     )
-    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
-
-    collector = LLMDiagnosticCollector(request_id="test-delegated-all-fail")
     with pytest.raises(
         image_reading_session_module.ImageUnderstandingFailureError
     ) as excinfo:
@@ -1184,7 +1180,6 @@ def test_generate_reply_with_tools_delegated_all_unavailable_terminates(
                 messages=[{"role": "user", "content": "看图"}],
                 tools=[llm_service_module.READ_IMAGE_TOOL],
                 image_session=image_session,
-                collector=collector,
             )
         )
 
@@ -1199,13 +1194,6 @@ def test_generate_reply_with_tools_delegated_all_unavailable_terminates(
     # 异常正文只携带模式摘要，不携带 URL/base64/视觉描述
     assert "https://" not in str(excinfo.value)
     assert "base64" not in str(excinfo.value)
-    # 最后一次失败 read_image 的 ToolExecutionTrace 已写入 collector
-    image_traces = [
-        trace for trace in collector.tools if trace.tool_name == "read_image"
-    ]
-    assert len(image_traces) == 1
-    assert image_traces[0].status == "error"
-    assert image_traces[0].error_summary == "图片读取失败"
     # 下一轮开始即被终止，final_response 未被执行
     assert len(fake_provider.completion_calls) == 1
 
@@ -1283,9 +1271,8 @@ def test_generate_reply_with_tools_delegated_last_round_all_unavailable_terminat
     RuntimeError。
 
     修复前 all_images_unavailable 只在轮首/final_response 检查：最后轮仅
-    read_image 时会漏终止而抛 MaxRounds。修复后每次 read_image 的
-    ToolExecutionTrace 写入 collector 后立即检查，最后一次失败 read_image 的
-    trace 保留。
+    read_image 时会漏终止而抛 MaxRounds。修复后每次 read_image 执行后立即
+    检查。
     """
     fake_provider = _FakeLLMProvider("")
     fake_provider.completions = [
@@ -1332,9 +1319,6 @@ def test_generate_reply_with_tools_delegated_last_round_all_unavailable_terminat
             ),
         ]
     )
-    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
-
-    collector = LLMDiagnosticCollector(request_id="test-delegated-last-round")
     with pytest.raises(
         image_reading_session_module.ImageUnderstandingFailureError
     ) as excinfo:
@@ -1348,7 +1332,6 @@ def test_generate_reply_with_tools_delegated_last_round_all_unavailable_terminat
                 messages=[{"role": "user", "content": "看图"}],
                 tools=[llm_service_module.READ_IMAGE_TOOL],
                 image_session=image_session,
-                collector=collector,
             )
         )
 
@@ -1366,18 +1349,8 @@ def test_generate_reply_with_tools_delegated_last_round_all_unavailable_terminat
     )
     assert "https://" not in str(excinfo.value)
     assert "base64" not in str(excinfo.value)
-    # 两轮 read_image 都执行，最后一次失败 read_image 的 Trace 已写入 collector
+    # 两轮 read_image 都执行
     assert len(fake_provider.completion_calls) == 2
-    image_traces = [
-        trace for trace in collector.tools if trace.tool_name == "read_image"
-    ]
-    assert len(image_traces) == 2
-    assert [trace.parsed_arguments for trace in image_traces] == [
-        {"image_index": 0},
-        {"image_index": 1},
-    ]
-    assert all(trace.status == "error" for trace in image_traces)
-    assert all(trace.error_summary == "图片读取失败" for trace in image_traces)
 
 
 def test_generate_reply_with_tools_final_response_before_read_image_same_round(
@@ -1444,55 +1417,10 @@ def test_generate_reply_with_tools_final_response_before_read_image_same_round(
     assert len(fake_provider.completion_calls) == 1
 
 
-def test_execute_tool_loop_records_call_traces_in_collector(monkeypatch: Any) -> None:
-    """验证 _execute_tool_loop 在传入 collector 时每轮 completion 都记录 LLMCallTrace。"""
-    fake_provider = _FakeLLMProvider("")
-    fake_provider.completions = [
-        _completion(
-            _tool_call(
-                "final_response",
-                "{}",
-                {
-                    "content": "带trace的回复",
-                    "interaction_history": {
-                        "event": "trace测试",
-                        "result": "trace回复",
-                        "emotion": "平静",
-                    },
-                },
-            )
-        )
-    ]
-    monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
-    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
-
-    collector = LLMDiagnosticCollector(request_id="test-tool-loop")
-
-    result = asyncio.run(
-        llm_service_module.generate_reply_with_tools(
-            config=_build_config(),
-            messages=[{"role": "user", "content": "你好"}],
-            tools=[llm_service_module.FINAL_RESPONSE_TOOL],
-            collector=collector,
-        )
-    )
-
-    assert result.content == "带trace的回复"
-    assert len(collector.calls) == 1
-    assert collector.calls[0].phase == "normal_reply_round_1"
-    assert collector.calls[0].round_index == 0
-    assert collector.calls[0].model == "chat-model"
-    assert len(collector.tools) >= 1
-    assert any(
-        t.tool_name == "final_response" and t.status == "success"
-        for t in collector.tools
-    )
-
-
-def test_execute_tool_loop_records_favorability_pending_in_debug(
+def test_favorability_pending_is_reported_without_side_effect(
     monkeypatch: Any,
 ) -> None:
-    """验证 debug 路径下 record_favorability_delta 只记录 pending，不调 adjust。"""
+    """record_favorability_delta 只暂存提案，结果携带好感度但不产生副作用。"""
     fake_provider = _FakeLLMProvider("")
     fake_provider.completions = [
         _completion(
@@ -1520,108 +1448,22 @@ def test_execute_tool_loop_records_favorability_pending_in_debug(
         ),
     ]
     monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
-    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
-
-    collector = LLMDiagnosticCollector(request_id="test-favor-debug")
 
     result = asyncio.run(
         llm_service_module.generate_reply_with_tools(
             config=_build_config(),
             messages=[{"role": "user", "content": "你好"}],
             tools=[llm_service_module.RECORD_FAVORABILITY_DELTA_TOOL],
-            collector=collector,
         )
     )
 
     assert result.content == "好感度pending回复"
     assert result.favorability_delta == 2
     assert result.favorability_reason == "友好互动"
-    favor_traces = [
-        t for t in collector.tools if t.tool_name == "record_favorability_delta"
-    ]
-    assert len(favor_traces) == 1
-    assert favor_traces[0].status == "success"
-    assert favor_traces[0].parsed_arguments == {"delta": 2, "reason": "友好互动"}
-    assert "pending" in str(favor_traces[0].result_summary or "")
 
 
-def test_read_image_tool_records_error_when_vision_service_fails(
-    monkeypatch: Any,
-) -> None:
-    """视觉服务返回失败结果时，工具 trace 必须记录为 error。"""
-    fake_provider = _FakeLLMProvider("")
-    fake_provider.completions = [
-        _completion(
-            _tool_call(
-                "read_image",
-                '{"image_index":0}',
-                {"image_index": 0},
-                call_id="call-image-failed",
-            )
-        ),
-        _completion(
-            _tool_call(
-                "final_response",
-                "{}",
-                {
-                    "content": "图片读取失败后的回复",
-                    "interaction_history": {
-                        "event": "读取图片",
-                        "result": "图片读取失败后继续回复",
-                        "emotion": "平静",
-                    },
-                },
-                call_id="call-final",
-            )
-        ),
-    ]
-
-    monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
-    image_session = _FakeImageSession(
-        [
-            image_reading_session_module.ImageReadResult(
-                index=0,
-                status="failure",
-                failure_message="[图片读取失败: 视觉模型故障]",
-                error_type="vision_failed",
-                stage="vision",
-            ),
-            image_reading_session_module.ImageReadResult(
-                index=1,
-                status="success",
-                description="正常图片描述",
-            ),
-        ]
-    )
-    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
-
-    collector = LLMDiagnosticCollector(request_id="test-image-tool-failed")
-    result = asyncio.run(
-        llm_service_module.generate_reply_with_tools(
-            config=_build_config(),
-            messages=[{"role": "user", "content": "看看图片"}],
-            tools=[llm_service_module.READ_IMAGE_TOOL],
-            image_session=image_session,
-            collector=collector,
-        )
-    )
-
-    # 部分失败：只尝试 index 0（失败），任务仍允许诚实收尾
-    assert result.content == "图片读取失败后的回复"
-    [image_trace] = [
-        trace for trace in collector.tools if trace.tool_name == "read_image"
-    ]
-    assert image_trace.status == "error"
-    assert image_trace.error_summary == "图片读取失败"
-    assert image_trace.result_summary is None
-    assert result.image_failure_summary is not None
-    assert result.image_failure_summary.failed_images == 1
-    assert result.image_failure_summary.error_types == ("vision_failed",)
-    assert result.image_failure_summary.stages == ("vision",)
-
-
-def test_execute_tool_loop_records_tool_errors_in_collector(monkeypatch: Any) -> None:
-    """验证工具参数校验失败时 trace 状态为 error。"""
+def test_invalid_favorability_arguments_are_correctable(monkeypatch: Any) -> None:
+    """工具参数校验失败后模型可在后续轮次纠正并完成提交。"""
     fake_provider = _FakeLLMProvider("")
     fake_provider.completions = [
         _completion(
@@ -1657,31 +1499,29 @@ def test_execute_tool_loop_records_tool_errors_in_collector(monkeypatch: Any) ->
         ),
     ]
     monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
-    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
-
-    collector = LLMDiagnosticCollector(request_id="test-tool-errors")
 
     result = asyncio.run(
         llm_service_module.generate_reply_with_tools(
             config=_build_config(),
             messages=[{"role": "user", "content": "打招呼"}],
             tools=[llm_service_module.RECORD_FAVORABILITY_DELTA_TOOL],
-            collector=collector,
         )
     )
 
     assert result.content == "纠错后回复"
-    favor_traces = [
-        t for t in collector.tools if t.tool_name == "record_favorability_delta"
+    assert result.favorability_delta == 1
+    # 非法参数回填给模型作为可纠正工具错误
+    second_round_tools = [
+        message
+        for message in fake_provider.completion_calls[1]["messages"]
+        if message.get("role") == "tool"
     ]
-    assert len(favor_traces) == 2
-    statuses = {t.status for t in favor_traces}
-    assert "error" in statuses
-    assert "success" in statuses
+    assert second_round_tools
+    assert "record_favorability_delta" in str(second_round_tools[0])
 
 
-def test_execute_tool_loop_records_unknown_tool_in_collector(monkeypatch: Any) -> None:
-    """验证未知工具调用时 trace 状态为 error。"""
+def test_unknown_tool_is_ignored_and_loop_continues(monkeypatch: Any) -> None:
+    """未知工具调用被忽略，模型收到纠错指令后仍可完成回复。"""
     fake_provider = _FakeLLMProvider("")
     fake_provider.completions = [
         _completion(
@@ -1709,28 +1549,24 @@ def test_execute_tool_loop_records_unknown_tool_in_collector(monkeypatch: Any) -
         ),
     ]
     monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
-    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
-
-    collector = LLMDiagnosticCollector(request_id="test-unknown-tool")
 
     result = asyncio.run(
         llm_service_module.generate_reply_with_tools(
             config=_build_config(),
             messages=[{"role": "user", "content": "测试未知工具"}],
             tools=[llm_service_module.SEARCH_WEB_TOOL],
-            collector=collector,
         )
     )
 
     assert result.content == "忽略未知工具后回复"
-    unknown_traces = [t for t in collector.tools if t.tool_name == "unknown_tool"]
-    assert len(unknown_traces) == 1
-    assert unknown_traces[0].status == "error"
-    assert "未知工具" in str(unknown_traces[0].error_summary or "")
+    assert len(fake_provider.completion_calls) == 2
+    retry_instruction = fake_provider.completion_calls[1]["messages"][-1]
+    assert retry_instruction["role"] == "user"
+    assert "未在工具列表中声明" in str(retry_instruction["content"])
 
 
-def test_execute_tool_loop_records_no_tool_calls_in_collector(monkeypatch: Any) -> None:
-    """验证模型未调用任何工具时在 collector 中记录错误。"""
+def test_bare_text_round_is_corrected_and_retried(monkeypatch: Any) -> None:
+    """模型未调用任何工具时追加纠错指令并重试，不发送裸文本。"""
     fake_provider = _FakeLLMProvider("")
     fake_provider.completions = [
         _completion(),
@@ -1750,28 +1586,27 @@ def test_execute_tool_loop_records_no_tool_calls_in_collector(monkeypatch: Any) 
         ),
     ]
     monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
-    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
-
-    collector = LLMDiagnosticCollector(request_id="test-no-tool-calls")
 
     result = asyncio.run(
         llm_service_module.generate_reply_with_tools(
             config=_build_config(),
             messages=[{"role": "user", "content": "随便说点"}],
             tools=[llm_service_module.SEARCH_WEB_TOOL],
-            collector=collector,
         )
     )
 
     assert result.content == "未调用工具后纠错回复"
-    assert len(collector.calls) == 2
-    no_tool_traces = [t for t in collector.tools if t.tool_name == "<no_tool_calls>"]
-    assert len(no_tool_traces) == 1
-    assert no_tool_traces[0].status == "error"
+    assert len(fake_provider.completion_calls) == 2
+    correction = fake_provider.completion_calls[1]["messages"][-1]
+    assert correction["role"] == "user"
+    assert "工具调用" in str(correction["content"])
+    assert "final_response" in str(correction["content"])
 
 
-def test_execute_tool_loop_records_max_rounds_in_collector(monkeypatch: Any) -> None:
-    """验证达到配置的最大轮数时 collector 记录错误（TSK-192 预算配置驱动）。"""
+def test_max_rounds_raises_after_consuming_configured_rounds(
+    monkeypatch: Any,
+) -> None:
+    """达到配置的最大轮数后抛 MaxRounds，不伪造成功回复。"""
     fake_provider = _FakeLLMProvider("")
     fake_provider.completions = [
         _completion(),
@@ -1779,9 +1614,6 @@ def test_execute_tool_loop_records_max_rounds_in_collector(monkeypatch: Any) -> 
         _completion(),
     ]
     monkeypatch.setattr(llm_service_module, "llm_provider", fake_provider)
-    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
-
-    collector = LLMDiagnosticCollector(request_id="test-max-rounds")
 
     with pytest.raises(RuntimeError, match="最大轮数"):
         asyncio.run(
@@ -1789,13 +1621,10 @@ def test_execute_tool_loop_records_max_rounds_in_collector(monkeypatch: Any) -> 
                 config=_build_config(agent_max_rounds=2, agent_max_total_tool_calls=8),
                 messages=[{"role": "user", "content": "查一下"}],
                 tools=[llm_service_module.SEARCH_WEB_TOOL],
-                collector=collector,
             )
         )
 
-    assert len(collector.calls) >= 2
-    assert len(collector.errors) >= 1
-    assert collector.errors[0]["type"] == "MaxRoundsExceeded"
+    assert len(fake_provider.completion_calls) == 2
 
 
 def test_generate_reply_with_tools_rejects_unlisted_tool_definition(

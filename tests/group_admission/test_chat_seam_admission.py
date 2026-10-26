@@ -79,7 +79,6 @@ def _sess(
         vision_temperature=0.3,
         vision_max_tokens=1024,
         request_trace_id="t",
-        collector=None,
     )
 
 
@@ -638,16 +637,16 @@ async def test_debug_public_restricted_blocks_group_public_output(
     s = ScriptedAdjudicate("restricted")
     install_scripted_adjudicate(monkeypatch, s)
     mod = _fresh_chat_module(monkeypatch)
-    collector = SimpleNamespace(request_id="debug-1", buffer=[])
     result = await mod.generate_debug_reply(
         group_id=str(GROUP_ID),
         user_id="5",
         user_nickname="n",
         content="x",
-        collector=collector,
+        request_trace_id="debug-1",
     )
     assert s.calls != [], "chat.debug_public 群公开输出前未调用 adjudicate"
     assert result.reply == "", "受限准入下 debug 群公开输出应被安静丢弃"
+    assert result.request_id == "debug-1"
 
 
 def _fresh_chat_module(monkeypatch: pytest.MonkeyPatch) -> Any:

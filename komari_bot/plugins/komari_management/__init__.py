@@ -8,9 +8,6 @@ from nonebot import get_driver, logger
 from nonebot.plugin import PluginMetadata, require
 
 from komari_bot.config.prompt_storage import close_prompt_storage_if_created
-from komari_bot.plugins.agent_run_logger.config_schema import (
-    AgentRunLoggerConfigSchema,
-)
 from komari_bot.plugins.embedding_provider.config_schema import (
     DynamicConfigSchema as EmbeddingProviderConfigSchema,
 )
@@ -93,9 +90,6 @@ def _load_management_components() -> ManagementApiComponents:
     require("komari_help")
     from komari_bot.plugins import komari_help as help_plugin
 
-    require("agent_run_logger")
-    from komari_bot.plugins import agent_run_logger as agent_run_logger_plugin
-
     require("komari_search")
     from komari_bot.plugins import komari_search as search_plugin
 
@@ -122,8 +116,6 @@ def _load_management_components() -> ManagementApiComponents:
         knowledge_engine_getter=knowledge_plugin.get_engine,
         register_help_api=help_plugin.register_help_api,
         help_engine_getter=help_plugin.get_engine,
-        register_agent_run_log_api=agent_run_logger_plugin.register_agent_run_log_api,
-        agent_run_log_reader_getter=agent_run_logger_plugin.get_agent_run_log_reader,
         register_search_api=search_plugin.register_search_api,
         register_user_ban_api=user_ban_plugin.register_user_ban_api,
         user_ban_service_getter=user_ban_plugin.get_service,
@@ -178,14 +170,6 @@ def _load_management_components() -> ManagementApiComponents:
                 manager_getter=lambda: config_manager_plugin.get_config_manager(
                     "komari_help",
                     HelpConfigSchema,
-                ),
-            ),
-            ManagedConfigResource(
-                resource_id="agent_run_logger",
-                display_name="Agent Run Logger",
-                manager_getter=lambda: config_manager_plugin.get_config_manager(
-                    "agent_run_logger",
-                    AgentRunLoggerConfigSchema,
                 ),
             ),
             ManagedConfigResource(

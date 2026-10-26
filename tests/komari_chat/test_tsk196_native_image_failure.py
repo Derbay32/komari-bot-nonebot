@@ -15,10 +15,9 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from importlib import import_module
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import pytest
 
@@ -38,8 +37,6 @@ message_handler_module = import_module(
     "komari_bot.plugins.komari_chat.handlers.message_handler"
 )
 
-if TYPE_CHECKING:
-    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
 
 ImageUnderstandingFailureError = (
     image_reading_session_module.ImageUnderstandingFailureError
@@ -616,14 +613,14 @@ def test_native_no_images_plain_llm_error_propagates_unwrapped(
     assert download_batches == []
 
 
-# ── Agent Run：native 多模态失败脱敏 + 失败调用进入采集 ────────────────
+# ── native 多模态失败脱敏 ─────────────────────────────────────────────
 
 
-def test_agent_run_native_multimodal_failure_redacts_exception_message(
+def test_native_multimodal_failure_redacts_exception_message(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """native 多模态请求失败：失败 LLM trace 进入 Agent Run，且异常正文
-    内嵌的 URL/base64 被脱敏；final_error 只有安全模式摘要。"""
+    """native 多模态请求失败：最终异常只含安全模式摘要，异常正文内嵌的
+    URL/base64 不进入异常链或异常文本。"""
     config = _chat_config_stub(image_understanding_mode="native")
     handler, _generate_kwargs, _download_batches, _build_kwargs = _wire_native_core(
         monkeypatch,
@@ -643,11 +640,6 @@ def test_agent_run_native_multimodal_failure_redacts_exception_message(
     # ``_execute_tool_loop`` 的 record_failed_call + 安全包装路径。
     monkeypatch.setattr(llm_service_module, "_call_llm_completion", _fail_completion)
 
-    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
-
-    collector: LLMDiagnosticCollector = LLMDiagnosticCollector(
-        request_id="trace-native-redact-1"
-    )
     with pytest.raises(ImageUnderstandingFailureError) as excinfo:
         asyncio.run(
             handler._generate_reply_core(
@@ -658,28 +650,19 @@ def test_agent_run_native_multimodal_failure_redacts_exception_message(
                 reply_context_requested=False,
                 reply_context_refetched=False,
                 request_trace_id="trace-native-redact-1",
-                collector=collector,
             )
         )
 
     assert excinfo.value.summary.mode == "native"
-    # 失败调用仍进入 Agent Run：至少一条 LLM trace 且状态 error
-    assert collector.calls, "失败调用必须进入 Agent Run"
-    assert all(call.status == "error" for call in collector.calls)
-    collector.mark_finished(status="error", error=excinfo.value)
-    record = collector.build_record()
-    record_json = json.dumps(record, ensure_ascii=False, default=str)
-    assert _RAW_URL not in record_json
-    assert _DATA_URI not in record_json
-    assert "example.com" not in record_json
-    assert "secret/path" not in record_json
-    assert "token=abc123" not in record_json
-    # LLM trace 错误消息被归一化为安全文本
-    failed_call = collector.calls[0]
-    assert failed_call.error is not None
-    assert "RuntimeError" in failed_call.error["message"]
-    assert _RAW_URL not in failed_call.error["message"]
-    assert _DATA_URI not in failed_call.error["message"]
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__context__ is None
+    assert _collect_exception_chain(excinfo.value) == [excinfo.value]
+    rendered = str(excinfo.value)
+    assert _RAW_URL not in rendered
+    assert _DATA_URI not in rendered
+    assert "example.com" not in rendered
+    assert "secret/path" not in rendered
+    assert "token=abc123" not in rendered
 
 
 def test_execute_tool_loop_native_marker_has_no_exception_chain(
@@ -690,8 +673,7 @@ def test_execute_tool_loop_native_marker_has_no_exception_chain(
 
     ``raise X from None`` 若仍在 ``except Exception as exc`` 内，marker 的
     ``__context__`` 仍会引用原 provider 异常（只是抑制显示）；重构后 except 内
-    只完成安全 ``record_failed_call`` 并置位局部状态，离开 except（无 active
-    exception）再 raise marker。collector 仍保留安全失败 trace。
+    只置位局部状态，离开 except（无 active exception）再 raise marker。
     """
     config = _chat_config_stub(image_understanding_mode="native")
 
@@ -702,11 +684,6 @@ def test_execute_tool_loop_native_marker_has_no_exception_chain(
 
     monkeypatch.setattr(llm_service_module, "_call_llm_completion", _fail_completion)
 
-    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
-
-    collector: LLMDiagnosticCollector = LLMDiagnosticCollector(
-        request_id="trace-native-marker-1"
-    )
     with pytest.raises(llm_service_module.NativeMultimodalRequestError) as excinfo:
         asyncio.run(
             llm_service_module.generate_reply_with_tools(
@@ -726,7 +703,6 @@ def test_execute_tool_loop_native_marker_has_no_exception_chain(
                     }
                 ],
                 tools=[llm_service_module.FINAL_RESPONSE_TOOL],
-                collector=collector,
             )
         )
 
@@ -736,21 +712,13 @@ def test_execute_tool_loop_native_marker_has_no_exception_chain(
     assert _collect_exception_chain(excinfo.value) == [excinfo.value]
     assert _RAW_URL not in str(excinfo.value)
     assert _DATA_URI not in str(excinfo.value)
-    # collector 仍保留安全失败 trace（错误消息已归一化）
-    assert collector.calls, "失败调用必须进入 Agent Run"
-    assert all(call.status == "error" for call in collector.calls)
-    failed_call = collector.calls[0]
-    assert failed_call.error is not None
-    assert "RuntimeError" in failed_call.error["message"]
-    assert _RAW_URL not in failed_call.error["message"]
-    assert _DATA_URI not in failed_call.error["message"]
 
 
 def test_execute_tool_loop_non_image_provider_error_stays_unwrapped(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """TSK-196 复审：非图片请求的主 provider 异常仍在 except 中原样 raise，
-    不包装为 marker，也不进入图片失败摘要；collector 保留原样失败 trace。"""
+    不包装为 marker，也不进入图片失败摘要。"""
     config = _chat_config_stub(image_understanding_mode="native")
 
     async def _fail_completion(**kwargs: object) -> None:
@@ -759,18 +727,12 @@ def test_execute_tool_loop_non_image_provider_error_stays_unwrapped(
 
     monkeypatch.setattr(llm_service_module, "_call_llm_completion", _fail_completion)
 
-    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
-
-    collector: LLMDiagnosticCollector = LLMDiagnosticCollector(
-        request_id="trace-native-noplain-1"
-    )
     with pytest.raises(RuntimeError, match="普通文本生成失败") as excinfo:
         asyncio.run(
             llm_service_module.generate_reply_with_tools(
                 config=config,
                 messages=[{"role": "user", "content": "你好"}],
                 tools=[llm_service_module.FINAL_RESPONSE_TOOL],
-                collector=collector,
             )
         )
 
@@ -784,11 +746,6 @@ def test_execute_tool_loop_non_image_provider_error_stays_unwrapped(
     )
     assert excinfo.value.__cause__ is None
     assert excinfo.value.__context__ is None
-    # 非图片请求失败 trace 保留原始 str(exc)（无脱敏需求）
-    assert collector.calls
-    failed_call = collector.calls[0]
-    assert failed_call.error is not None
-    assert "普通文本生成失败" in failed_call.error["message"]
 
 
 def test_native_provider_failure_exception_chain_is_fully_broken(
@@ -799,7 +756,7 @@ def test_native_provider_failure_exception_chain_is_fully_broken(
 
     递归遍历最终异常的 ``__cause__``/``__context__``，不得找到任何非 None 链
     （即链上只有最终异常自身），因此也找不到原 provider RuntimeError 与内嵌
-    URL/base64；collector 仍保留安全失败 trace。
+    URL/base64。
     """
     config = _chat_config_stub(image_understanding_mode="native")
     handler, _generate_kwargs, _download_batches, _build_kwargs = _wire_native_core(
@@ -818,11 +775,6 @@ def test_native_provider_failure_exception_chain_is_fully_broken(
 
     monkeypatch.setattr(llm_service_module, "_call_llm_completion", _fail_completion)
 
-    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
-
-    collector: LLMDiagnosticCollector = LLMDiagnosticCollector(
-        request_id="trace-native-chain-1"
-    )
     with pytest.raises(ImageUnderstandingFailureError) as excinfo:
         asyncio.run(
             handler._generate_reply_core(
@@ -833,7 +785,6 @@ def test_native_provider_failure_exception_chain_is_fully_broken(
                 reply_context_requested=False,
                 reply_context_refetched=False,
                 request_trace_id="trace-native-chain-1",
-                collector=collector,
             )
         )
 
@@ -847,11 +798,3 @@ def test_native_provider_failure_exception_chain_is_fully_broken(
     for member in chain:
         assert _RAW_URL not in str(member)
         assert _DATA_URI not in str(member)
-    # collector 仍保留安全失败 trace
-    assert collector.calls, "失败调用必须进入 Agent Run"
-    assert all(call.status == "error" for call in collector.calls)
-    failed_call = collector.calls[0]
-    assert failed_call.error is not None
-    assert "RuntimeError" in failed_call.error["message"]
-    assert _RAW_URL not in failed_call.error["message"]
-    assert _DATA_URI not in failed_call.error["message"]

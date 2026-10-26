@@ -7,9 +7,6 @@ from komari_bot.core.retry import retry_async
 
 from .config_interface import get_config
 
-if __import__("typing", fromlist=["TYPE_CHECKING"]).TYPE_CHECKING:
-    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
-
 # 依赖 llm_provider 插件
 require("llm_provider")
 
@@ -49,10 +46,8 @@ class QueryRewriteService:
         request_api: str = "chat_completions",
         stream_enabled: bool = False,
         request_trace_id: str | None = None,
-        parent_call_id: str | None = None,
-        collector: "LLMDiagnosticCollector | None" = None,
     ) -> str:
-        """调用 LLM 生成重写后的查询（使用 completion 接口以获取 trace）。"""
+        """调用 LLM 生成重写后的查询。"""
         request_data = {
             "prompt": rewrite_prompt,
             "model": model,
@@ -69,22 +64,6 @@ class QueryRewriteService:
             request_trace_id=request_trace_id or "",
         )
 
-        if collector is not None:
-            from komari_bot.plugins.agent_run_logger.diagnostic import (
-                record_completion_call,
-            )
-
-            record_completion_call(
-                collector,
-                parent_call_id=parent_call_id,
-                phase="query_rewrite",
-                round_index=0,
-                method="generate_completion",
-                model=model,
-                request=request_data,
-                completion=result,
-            )
-
         return result.content
 
     async def rewrite_query(
@@ -92,16 +71,12 @@ class QueryRewriteService:
         current_query: str,
         *,
         request_trace_id: str | None = None,
-        parent_call_id: str | None = None,
-        collector: "LLMDiagnosticCollector | None" = None,
     ) -> str:
         """重写查询为语义完整的独立语句。
 
         Args:
             current_query: 当前用户输入
-            request_trace_id: 请求追踪 ID
-            parent_call_id: 父调用 ID
-            collector: 可选的诊断收集器
+            request_trace_id: 普通运行日志的请求追踪 ID
 
         Returns:
             重写后的查询，失败时返回原始查询
@@ -127,8 +102,6 @@ class QueryRewriteService:
                 request_api=config.query_rewrite_request_api,
                 stream_enabled=config.query_rewrite_stream_enabled,
                 request_trace_id=request_trace_id,
-                parent_call_id=parent_call_id,
-                collector=collector,
             )
         except Exception as e:
             # 降级：返回原始查询
@@ -136,12 +109,6 @@ class QueryRewriteService:
                 f"[QueryRewrite] 重写失败，使用原始查询: {e}",
                 exc_info=True,
             )
-            if collector is not None:
-                collector.add_error(
-                    phase="query_rewrite",
-                    error_type=type(e).__name__,
-                    message=str(e),
-                )
             return current_query
 
         # 清理结果
