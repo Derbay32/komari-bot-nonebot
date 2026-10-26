@@ -275,11 +275,10 @@ class AgentHost:
         )
         self._controls[control_id] = future
         try:
-            await self._send(encode_control(control_id, request))
-            value = await asyncio.wait_for(
-                asyncio.shield(future),
-                timeout=self.control_timeout if wait_seconds is None else wait_seconds,
-            )
+            timeout = self.control_timeout if wait_seconds is None else wait_seconds
+            async with asyncio.timeout(timeout):
+                await self._send(encode_control(control_id, request))
+                value = await asyncio.shield(future)
             return AgentControlResult(value=value)
         except TimeoutError as exc:
             if not future.done():
