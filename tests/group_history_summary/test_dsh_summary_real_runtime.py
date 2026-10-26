@@ -639,14 +639,28 @@ async def test_real_dsh_cancellation_during_internal_history_page(
 
 
 class _LeaseManager:
-    def __init__(self) -> None:
+    def __init__(self, host: Any, cancel_completed: asyncio.Event) -> None:
+        self.host = host
+        self.cancel_completed = cancel_completed
         self.release_calls = 0
-        self.release_states: list[str] = []
+        self.release_checks: list[dict[str, bool]] = []
         self.renew_calls = 0
 
     async def release(self, *, key: str, owner_token: str) -> bool:
         del key, owner_token
         self.release_calls += 1
+        observed_host = cast("Any", self.host)
+        checks = {
+            "cancellation_completed": self.cancel_completed.is_set(),
+            "no_live_requests": not observed_host._requests,
+            "no_live_callbacks": not observed_host._all_callback_tasks,
+            "host_ready": self.host.state.value == "ready",
+        }
+        self.release_checks.append(checks)
+        assert checks["cancellation_completed"], "lease released before DSH cancellation drained"
+        assert checks["no_live_requests"], "live request remained at lease release"
+        assert checks["no_live_callbacks"], "live callback remained at lease release"
+        assert checks["host_ready"], "host was not ready at lease release"
         return True
 
     async def renew(self, *, key: str, owner_token: str, ttl_seconds: int) -> bool:
@@ -675,13 +689,9 @@ async def test_real_dsh_lease_loss_cancels_running_task_and_releases_after_drain
         gate_started.set()
         await asyncio.Future()
 
-    manager = _LeaseManager()
-    lease = GroupSummaryLease(
-        manager=cast("Any", manager),
-        key="real-lease-loss",
-        owner_token="owner",
-        ttl_seconds=60,
-    )
+    cancel_completed = asyncio.Event()
+    manager: _LeaseManager
+    lease: GroupSummaryLease
     provider = _OneRowProvider()
     render_calls: list[dict[str, Any]] = []
 
@@ -694,6 +704,23 @@ async def test_real_dsh_lease_loss_cancels_running_task_and_releases_after_drain
         summary_prompt="总结角色。",
         context_window=16384,
     ) as (host, server):
+        real_execute = host.execute
+
+        async def observed_execute(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return await real_execute(*args, **kwargs)
+            except asyncio.CancelledError:
+                cancel_completed.set()
+                raise
+
+        host.execute = observed_execute  # type: ignore[method-assign]
+        manager = _LeaseManager(host, cancel_completed)
+        lease = GroupSummaryLease(
+            manager=cast("Any", manager),
+            key="real-lease-loss",
+            owner_token="owner",
+            ttl_seconds=60,
+        )
         first_service = DshSummaryService(
             host_getter=lambda: host,
             history_provider_factory=lambda *_args: provider,
@@ -717,6 +744,14 @@ async def test_real_dsh_lease_loss_cancels_running_task_and_releases_after_drain
             await task
 
         assert manager.release_calls == 1
+        assert manager.release_checks == [
+            {
+                "cancellation_completed": True,
+                "no_live_requests": True,
+                "no_live_callbacks": True,
+                "host_ready": True,
+            }
+        ]
         assert host.state.value == "ready"
 
         server.enqueue(

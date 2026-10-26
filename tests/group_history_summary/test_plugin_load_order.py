@@ -17,11 +17,27 @@ install_nonebot_forwardref_compatibility()
 import nonebot
 
 nonebot.init(_env_file=None, driver="~fastapi", log_level="ERROR")
-nonebot.load_plugins("komari_bot/plugins")
 
-loaded = {plugin.name for plugin in nonebot.get_loaded_plugins()}
-assert "character_binding" in loaded, loaded
-assert "group_history_summary" in loaded, loaded
+from nonebot.plugin import _managers, get_loaded_plugins, get_plugin
+from nonebot.plugin.manager import PluginManager
+
+# Register the real local plugin search path without importing any plugin.
+manager = PluginManager(search_path=["komari_bot/plugins"])
+_managers.append(manager)
+
+assert "group_history_summary" in manager.searched_plugins
+assert "character_binding" in manager.searched_plugins
+assert get_plugin("character_binding") is None
+assert get_plugin("group_history_summary") is None
+assert not {plugin.name for plugin in get_loaded_plugins()}
+
+# Load summary first; its own require("character_binding") must resolve through
+# the actual NoneBot manager and load the real dependency.
+plugin = manager.load_plugin("group_history_summary")
+assert plugin is not None
+assert get_plugin("group_history_summary") is not None
+assert get_plugin("character_binding") is not None
+assert {p.name for p in get_loaded_plugins()} >= {"group_history_summary", "character_binding"}
 
 from komari_bot.plugins.group_history_summary import history_tools
 
