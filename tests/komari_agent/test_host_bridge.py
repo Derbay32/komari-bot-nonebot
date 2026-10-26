@@ -335,6 +335,7 @@ async def test_close_fails_running_task_and_closes_process(tmp_path: Path) -> No
         with pytest.raises(AgentHostUnavailableError):
             await task
         assert host.readiness.state is ReadinessState.UNAVAILABLE
+        assert host.process_id is None
         with pytest.raises(AgentHostUnavailableError):
             await host.execute(_task("task-2"), _callbacks([]))
 

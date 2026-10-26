@@ -134,7 +134,7 @@ class AgentHost:
     def process_id(self) -> int | None:
         """Child PID while it is running (test and operational diagnostics)."""
         process = self._process
-        return None if process is None else process.pid
+        return None if process is None or process.returncode is not None else process.pid
 
     async def start(self) -> None:
         """Spawn the child and await its one readiness announcement."""
@@ -267,6 +267,7 @@ class AgentHost:
             await self._stop_reader_and_stderr()
             self._fail_pending("host_closed")
             await self._finish_callback_tasks()
+            self._process = None
             self._state = HostState.CLOSED
             self._readiness = HostReadiness(state=ReadinessState.UNAVAILABLE, bindings=_UNAVAILABLE_BINDINGS)
 
