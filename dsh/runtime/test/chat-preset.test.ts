@@ -45,6 +45,7 @@ async function runChat(
       installAnchor: DSH_PACKAGE,
       baseConfig: DSH_BASE_CONFIG,
       dshHome: join(root, 'home'),
+      attachmentRoot: join(root, 'attachments'),
       sendFrame: chatSendFrame(runtimeRef, simulator, {
         ...options,
         onCallback: (name) => {

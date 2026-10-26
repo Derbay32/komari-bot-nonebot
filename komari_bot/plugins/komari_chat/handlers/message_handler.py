@@ -44,9 +44,9 @@ from ..reply_fulfillment_domain import build_reply_fulfillment_id
 from ..services.admission_gate import effect_business_admitted
 from ..services.chat_result import ReplyResult
 from ..services.config_interface import get_config
-from ..services.dsh_chat_service import DshChatService
+from ..services.dsh_chat_service import DshChatService, ImageTransportTaskError
 from ..services.image_downloader import extract_image_sources
-from ..services.image_reading_session import (
+from ..services.image_failure import (
     ImageFailureSummary,
     ImageUnderstandingFailureError,
 )
@@ -1218,16 +1218,23 @@ class MessageHandler:
         if dsh_chat is None:
             dsh_chat = DshChatService()
             self.dsh_chat = dsh_chat
-        return await dsh_chat.generate(
-            message=message,
-            recent_messages=recent_messages,
-            reply_context=reply_context,
-            recall_session=recall_session,
-            request_trace_id=request_trace_id,
-            config=get_config(),
-            caller_is_superuser=caller_is_superuser,
-            image_urls=image_urls,
-        )
+        try:
+            return await dsh_chat.generate(
+                message=message,
+                recent_messages=recent_messages,
+                reply_context=reply_context,
+                recall_session=recall_session,
+                request_trace_id=request_trace_id,
+                config=get_config(),
+                caller_is_superuser=caller_is_superuser,
+                image_urls=image_urls,
+            )
+        except (ImageUnderstandingFailureError, ImageTransportTaskError):
+            # The service has already closed task-owned bytes. Rebind this
+            # frame's URL-bearing locals before the safe exception unwinds.
+            image_urls = None
+            reply_context = None
+            raise
 
     async def _attempt_reply(
         self,
@@ -1596,12 +1603,11 @@ class MessageHandler:
                 exc,
                 traceback.format_exc(),
             )
-            if isinstance(exc, ImageUnderstandingFailureError):
-                # TSK-196/TSK-200：普通安全日志后显式重绑本帧图片敏感 locals
-                # （image_urls/reply_context/refetched_context）为 None 再
-                # re-raise；保持异常类型/summary 语义，最终 debug 异常
-                # traceback 的 komari_chat 帧递归投影不含 raw URL/base64。
-                # 普通非图片 debug 错误语义不变。
+            if isinstance(
+                exc, (ImageUnderstandingFailureError, ImageTransportTaskError)
+            ):
+                # The service has already closed task-owned bytes. Rebind this
+                # frame's URL-bearing locals before the safe exception unwinds.
                 image_urls = None
                 reply_context = None
                 refetched_context = None

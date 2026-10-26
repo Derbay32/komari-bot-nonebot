@@ -41,6 +41,7 @@ test('concurrent tasks receive only their own frozen capability snapshot', async
       installAnchor: DSH_PACKAGE,
       baseConfig: DSH_BASE_CONFIG,
       dshHome: join(root, 'home'),
+      attachmentRoot: join(root, 'attachments'),
       sendFrame: chatSendFrame(runtimeRef, simulator),
     })
     const budget = { max_rounds: 4, max_tool_calls_per_round: 3, max_total_tool_calls: 8 }

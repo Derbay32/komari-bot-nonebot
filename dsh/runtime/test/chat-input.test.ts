@@ -116,3 +116,58 @@ test('capabilities are decoded as a closed control section but never rendered', 
   const text = renderChatTaskInput(decoded)
   assert.ok(!text.includes('capabilities'))
 })
+
+test('closed image descriptors validate order, ceilings, and never enter the text partition', () => {
+  const data = minimalChatTaskData({ text: 'image task' })
+  data.images = [
+    {
+      index: 0,
+      origin: 'quoted',
+      media_type: 'image/png',
+      byte_count: 3,
+      sha256: 'a'.repeat(64),
+    },
+    {
+      index: 2,
+      origin: 'current',
+      media_type: 'image/jpeg',
+      byte_count: 4,
+      sha256: 'b'.repeat(64),
+    },
+  ]
+  const decoded = decodeChatTaskData(data)
+  assert.equal(decoded.images.length, 2)
+  assert.deepEqual(decoded.images.map((image) => image.index), [0, 2])
+  const text = renderChatTaskInput(decoded)
+  assert.ok(!text.includes('<images>'))
+  assert.ok(!text.includes('a'.repeat(64)))
+  assert.ok(!text.includes('"media_type"'))
+
+  const invalid = (images: unknown[]) => {
+    const candidate = minimalChatTaskData()
+    ;(candidate as Record<string, unknown>).images = images
+    assert.throws(() => decodeChatTaskData(candidate), /invalid_chat_image_descriptor/)
+  }
+  const base = {
+    index: 0,
+    origin: 'quoted',
+    media_type: 'image/png',
+    byte_count: 3,
+    sha256: 'a'.repeat(64),
+  }
+  invalid([base, { ...base }])
+  invalid([
+    { ...base, index: 1, origin: 'current' },
+    { ...base, index: 2, origin: 'quoted' },
+  ])
+  invalid([{ ...base, origin: 'current' }, { ...base, index: 1, origin: 'quoted' }])
+  invalid(Array.from({ length: 9 }, (_, index) => ({ ...base, index })))
+  invalid([{ ...base, byte_count: 16 * 1024 * 1024 + 1 }])
+  invalid([{ ...base, sha256: 'A'.repeat(64) }])
+  invalid([{ ...base, index: true }])
+  invalid([
+    { ...base, index: 0, byte_count: 16 * 1024 * 1024 },
+    { ...base, index: 1, byte_count: 16 * 1024 * 1024 },
+    { ...base, index: 2, byte_count: 1 },
+  ])
+})

@@ -22,9 +22,7 @@ from komari_bot.plugins.llm_provider.base_client import build_assistant_message
 from .admission_gate import effect_business_admitted
 from .agent_budget import AgentBudgetLedger, AgentExecutionBudget
 from .chat_result import ReplyResult as _ReplyResult
-from .image_reading_session import (
-    ImageUnderstandingFailureError,
-)
+from .image_failure import ImageUnderstandingFailureError
 
 if TYPE_CHECKING:
     from collections.abc import Sequence

@@ -42,6 +42,7 @@ test('reading a completed but not-yet-disposed task snapshot keeps its successfu
       installAnchor: DSH_PACKAGE,
       baseConfig: DSH_BASE_CONFIG,
       dshHome: join(root, 'home'),
+      attachmentRoot: join(root, 'attachments'),
       extraPatches: probePatch(),
       sendFrame: chatSendFrame(runtimeRef, simulator),
     })

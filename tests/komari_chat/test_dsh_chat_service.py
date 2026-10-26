@@ -67,6 +67,14 @@ def _config() -> SimpleNamespace:
         agent_max_rounds=5,
         agent_max_tool_calls_per_round=3,
         agent_max_total_tool_calls=8,
+        vision_image_download_max_count=8,
+        vision_image_download_max_bytes=16 * 1024 * 1024,
+        vision_image_download_total_max_bytes=32 * 1024 * 1024,
+        vision_image_download_max_pixels=100_000_000,
+        vision_image_download_concurrency=2,
+        vision_image_download_connect_timeout_seconds=5.0,
+        vision_image_download_read_timeout_seconds=30.0,
+        vision_image_download_total_timeout_seconds=45.0,
     )
 
 
@@ -226,6 +234,7 @@ def test_generates_only_through_host_after_exactly_one_recall_and_verifies_resul
         "uid_knowledge",
         "facts",
         "capabilities",
+        "images",
     }
     assert request.task_data["current"]["content"] == "当前消息"
     assert request.task_data["capabilities"] == {
@@ -236,6 +245,7 @@ def test_generates_only_through_host_after_exactly_one_recall_and_verifies_resul
     assert "image_sources" not in str(request.task_data)
     assert set(host.callbacks[0]) == {
         "admission",
+        "chat.read_image_chunk",
         "chat.submit_final_response",
         "chat.submit_favorability",
         "chat.recall_memory",
@@ -384,50 +394,6 @@ def test_uid_enrichment_remains_independent_when_vector_knowledge_is_disabled() 
 
     assert uid_calls == ["u-1", "u-0"]
     assert host.requests[0].task_data["knowledge"] == []
-
-
-@pytest.mark.parametrize(
-    "context",
-    [
-        ReplyContext(
-            source_side="user",
-            message_id="quoted-1",
-            user_id="u-2",
-            user_nickname="用户2",
-            text="看这个",
-            image_sources=("https://example.invalid/secret-image.png",),
-            image_count=1,
-            has_visible_image=True,
-        ),
-    ],
-)
-def test_image_seams_fail_closed_without_retaining_urls(context: ReplyContext) -> None:
-    host = _FakeHost({"content": "never"})
-    service, memory, session = _service(host)
-
-    with pytest.raises(service_module.ImageTransportUnavailableError) as exc_info:
-        asyncio.run(_generate(service, session, context))
-
-    assert exc_info.value.code == "image_transport_unavailable"
-    assert "example.invalid" not in str(exc_info.value)
-    # TSK-203 never skips the exactly-once automatic recall for an image-only
-    # trigger, but stops at the unmigrated image seam before DSH generation.
-    assert len(memory.recall_calls) == 1
-    assert "看这个" in memory.recall_calls[0]
-    assert host.requests == []
-
-
-def test_current_image_also_fails_closed_after_the_single_recall() -> None:
-    host = _FakeHost({"content": "never"})
-    service, memory, session = _service(host)
-
-    with pytest.raises(service_module.ImageTransportUnavailableError):
-        asyncio.run(
-            _generate(service, session, image_urls=["https://example.invalid/a.png"])
-        )
-    assert len(memory.recall_calls) == 1
-    assert "当前消息" in memory.recall_calls[0]
-    assert host.requests == []
 
 
 def test_host_task_error_is_mapped_to_a_safe_fixed_code() -> None:

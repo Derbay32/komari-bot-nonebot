@@ -299,6 +299,7 @@ export function minimalChatTaskData(overrides: {
     knowledge: [],
     uid_knowledge: [],
     capabilities: overrides.capabilities ?? { knowledge: true, search: true, fetch: true },
+    images: [],
     facts: {
       bot_nickname: 'Fixture',
       current_favorability: {

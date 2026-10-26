@@ -18,6 +18,7 @@ from nonebot import logger
 from komari_bot.agent import (
     AgentHost,
     AgentTaskBudget,
+    AgentTaskError,
     AgentTaskRequest,
     TaskKind,
 )
@@ -31,7 +32,20 @@ from .chat_candidate import (
 from .chat_query_tools import ChatQueryTools
 from .chat_recall_query import RecallQueryBudgetError, build_automatic_recall_query
 from .chat_result import ReplyResult
-from .chat_task_data import ChatQueryCapabilities, build_chat_task_data
+from .chat_task_data import ChatQueryCapabilities, ChatTaskData, build_chat_task_data
+from .image_downloader import ImageDownloadPolicy
+from .image_failure import (
+    IMAGE_INPUT_FAILED_CODE,
+    IMAGE_MODEL_FAILED_CODE,
+    INVALID_IMAGE_INPUT_CODE,
+    ImageFailureSummary,
+    ImageUnderstandingFailureError,
+)
+from .native_image import (
+    ImageChunkAdmissionError,
+    NativeImageContractError,
+    NativeImageInput,
+)
 
 if TYPE_CHECKING:
     from komari_bot.agent import AgentCallbackHandler, AgentCallbackRequest, JsonValue
@@ -92,13 +106,10 @@ class ChatFavorabilityReadError(DshChatError):
     code = "favorability_read_failed"
 
 
-class ImageTransportUnavailableError(DshChatError):
-    """A text-only DSH chat task reached an image seam owned by TSK-205."""
+class ImageTransportTaskError(DshChatError):
+    """A malformed image descriptor or chunk contract failed the task."""
 
-    code = "image_transport_unavailable"
-
-    def __init__(self) -> None:
-        super().__init__(self.code)
+    code = INVALID_IMAGE_INPUT_CODE
 
 
 class ChatSubmissionAdmissionError(DshChatError):
@@ -153,6 +164,7 @@ class FrozenChatTaskConfig:
     knowledge_limit: int
     max_favorability_delta: int
     capabilities: ChatQueryCapabilities
+    image_policy: ImageDownloadPolicy
 
 
 class DshChatService:
@@ -219,125 +231,217 @@ class DshChatService:
         if not effect_business_admitted(group_id=message.group_id):
             return ReplyResult(content="")
 
-        # TSK-203 does not skip automatic recall for an image-only trigger. The
-        # unmigrated image seam fails closed immediately after that single
-        # read-only recall and before any DSH generation or knowledge lookup.
+        # Automatic recall is never skipped for an image-only trigger. Native
+        # image preparation replaces the old TSK-203 fail-closed seam here.
         recall_response = await recall_session.recall(recall_query)
-        if image_urls or (
-            reply_context is not None and reply_context.image_sources
-        ):
-            raise ImageTransportUnavailableError
 
-        favorability = await self._load_favorability(message.user_id)
-        knowledge_results, uid_knowledge_results = await self._load_knowledge(
-            message=message,
-            recent_messages=recent_messages,
-            reply_context=reply_context,
-            config=frozen,
-        )
-        group_bindings = self._load_group_bindings(message.group_id)
-        task_data = build_chat_task_data(
-            current=message,
-            recent=recent_messages,
-            quote=reply_context,
-            memory_results=list(getattr(recall_response, "results", None) or []),
-            knowledge_results=knowledge_results,
-            uid_knowledge_results=uid_knowledge_results,
-            favorability=favorability,
-            bot_nickname=frozen.bot_nickname,
-            max_favorability_delta=frozen.max_favorability_delta,
-            group_bindings=group_bindings,
-            capabilities=frozen.capabilities,
-        )
-
-        candidate = ChatCandidate(max_favorability_delta=frozen.max_favorability_delta)
-
-        trusted_trace_id = request_trace_id
-
-        async def query_search_web(
-            query: str,
-            *,
-            request_trace_id: str | None = None,
-        ) -> str:
-            del request_trace_id
-            return await self._search_web(
-                query,
-                request_trace_id=trusted_trace_id,
-            )
-
-        async def query_fetch_page(
-            urls: list[str],
-            *,
-            request_trace_id: str | None = None,
-        ) -> str:
-            del request_trace_id
-            return await self._fetch_page(
-                urls,
-                request_trace_id=trusted_trace_id,
-            )
-
-        query_tools = ChatQueryTools(
+        quoted_sources = list(reply_context.image_sources) if reply_context else []
+        current_sources = list(image_urls or [])
+        image_input = NativeImageInput(
+            quoted_sources=quoted_sources,
+            current_sources=current_sources,
+            policy=frozen.image_policy,
+            admission_guard=lambda: effect_business_admitted(
+                group_id=message.group_id
+            ),
             group_id=message.group_id,
             request_trace_id=request_trace_id,
-            knowledge_limit=frozen.knowledge_limit,
-            capabilities=frozen.capabilities,
-            recall_session=recall_session,
-            admission=lambda: effect_business_admitted(group_id=message.group_id),
-            knowledge_search=self._knowledge_search,
-            search_web=query_search_web,
-            fetch_page=query_fetch_page,
         )
-
-        async def admission(_request: AgentCallbackRequest) -> JsonValue:
+        failure_summary: ImageFailureSummary | None = None
+        transport_error_code: str | None = None
+        task_data: ChatTaskData | None = None
+        try:
             try:
-                allow = effect_business_admitted(group_id=message.group_id)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                allow = False
-            return {"allow": bool(allow)}
+                descriptors = await image_input.prepare()
+            except ImageChunkAdmissionError:
+                return ReplyResult(content="")
+            except NativeImageContractError:
+                await image_input.aclose()
+                raise ImageTransportTaskError(INVALID_IMAGE_INPUT_CODE) from None
+            if image_input.all_downloads_failed:
+                failure_summary = image_input.failure_summary()
+                descriptors = ()
+            else:
+                favorability = await self._load_favorability(message.user_id)
+                knowledge_results, uid_knowledge_results = await self._load_knowledge(
+                    message=message,
+                    recent_messages=recent_messages,
+                    reply_context=reply_context,
+                    config=frozen,
+                )
+                group_bindings = self._load_group_bindings(message.group_id)
+                task_data = build_chat_task_data(
+                    current=message,
+                    recent=recent_messages,
+                    quote=reply_context,
+                    memory_results=list(
+                        getattr(recall_response, "results", None) or []
+                    ),
+                    knowledge_results=knowledge_results,
+                    uid_knowledge_results=uid_knowledge_results,
+                    favorability=favorability,
+                    bot_nickname=frozen.bot_nickname,
+                    max_favorability_delta=frozen.max_favorability_delta,
+                    group_bindings=group_bindings,
+                    images=descriptors,
+                    capabilities=frozen.capabilities,
+                )
 
-        async def submit_final_response(
-            request: AgentCallbackRequest,
-        ) -> JsonValue:
-            if not effect_business_admitted(group_id=message.group_id):
-                raise ChatSubmissionAdmissionError
-            return _receipt_payload(candidate.submit_final_response(request.data))
+                candidate = ChatCandidate(
+                    max_favorability_delta=frozen.max_favorability_delta
+                )
 
-        async def submit_favorability(request: AgentCallbackRequest) -> JsonValue:
-            if not effect_business_admitted(group_id=message.group_id):
-                raise ChatSubmissionAdmissionError
-            return _receipt_payload(candidate.submit_favorability(request.data))
+                trusted_trace_id = request_trace_id
 
-        host = self._host_getter()
-        task = AgentTaskRequest(
-            task_id=request_trace_id,
-            kind=TaskKind.CHAT,
-            task_data=cast("dict[str, JsonValue]", task_data.to_dict()),
-            budget=frozen.budget.to_agent_budget(),
-        )
-        callbacks: dict[str, AgentCallbackHandler] = {
-            "admission": admission,
-            "chat.submit_final_response": submit_final_response,
-            "chat.submit_favorability": submit_favorability,
-        }
-        callbacks.update(query_tools.callbacks())
-        result = await host.execute(task, callbacks)
-        content, delta, reason = candidate.verify_host_result(result.result)
-        logger.info(
-            "[KomariChat] DSH chat generated: trace_id={} recent={} memory={} knowledge={} uid_knowledge={} content_chars={}",
-            request_trace_id,
-            len(task_data.recent),
-            len(task_data.memory),
-            len(task_data.knowledge),
-            len(task_data.uid_knowledge),
-            len(content),
-        )
-        return ReplyResult(
-            content=content,
-            favorability_delta=delta,
-            favorability_reason=reason,
-        )
+                async def query_search_web(
+                    query: str,
+                    *,
+                    request_trace_id: str | None = None,
+                ) -> str:
+                    del request_trace_id
+                    return await self._search_web(
+                        query,
+                        request_trace_id=trusted_trace_id,
+                    )
+
+                async def query_fetch_page(
+                    urls: list[str],
+                    *,
+                    request_trace_id: str | None = None,
+                ) -> str:
+                    del request_trace_id
+                    return await self._fetch_page(
+                        urls,
+                        request_trace_id=trusted_trace_id,
+                    )
+
+                query_tools = ChatQueryTools(
+                    group_id=message.group_id,
+                    request_trace_id=request_trace_id,
+                    knowledge_limit=frozen.knowledge_limit,
+                    capabilities=frozen.capabilities,
+                    recall_session=recall_session,
+                    admission=lambda: effect_business_admitted(group_id=message.group_id),
+                    knowledge_search=self._knowledge_search,
+                    search_web=query_search_web,
+                    fetch_page=query_fetch_page,
+                )
+
+                async def admission(_request: AgentCallbackRequest) -> JsonValue:
+                    try:
+                        allow = effect_business_admitted(group_id=message.group_id)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        allow = False
+                    return {"allow": bool(allow)}
+
+                async def submit_final_response(
+                    request: AgentCallbackRequest,
+                ) -> JsonValue:
+                    if not effect_business_admitted(group_id=message.group_id):
+                        raise ChatSubmissionAdmissionError
+                    return _receipt_payload(
+                        candidate.submit_final_response(request.data)
+                    )
+
+                async def submit_favorability(
+                    request: AgentCallbackRequest,
+                ) -> JsonValue:
+                    if not effect_business_admitted(group_id=message.group_id):
+                        raise ChatSubmissionAdmissionError
+                    return _receipt_payload(
+                        candidate.submit_favorability(request.data)
+                    )
+
+                async def read_image_chunk(
+                    request: AgentCallbackRequest,
+                ) -> JsonValue:
+                    return cast(
+                        "JsonValue",
+                        await cast("NativeImageInput", image_input).read_chunk(
+                            request.data
+                        ),
+                    )
+
+                host = self._host_getter()
+                task = AgentTaskRequest(
+                    task_id=request_trace_id,
+                    kind=TaskKind.CHAT,
+                    task_data=cast(
+                        "dict[str, JsonValue]", task_data.to_dict()
+                    ),
+                    budget=frozen.budget.to_agent_budget(),
+                )
+                callbacks: dict[str, AgentCallbackHandler] = {
+                    "admission": admission,
+                    "chat.read_image_chunk": read_image_chunk,
+                    "chat.submit_final_response": submit_final_response,
+                    "chat.submit_favorability": submit_favorability,
+                }
+                callbacks.update(query_tools.callbacks())
+                try:
+                    result = await host.execute(task, callbacks)
+                except AgentTaskError as exc:
+                    if exc.code == IMAGE_MODEL_FAILED_CODE:
+                        failure_summary = image_input.failure_summary(
+                            model_failed=True
+                        )
+                    elif exc.code == IMAGE_INPUT_FAILED_CODE:
+                        failure_summary = image_input.failure_summary(
+                            processing_failed=True
+                        )
+                    elif exc.code == INVALID_IMAGE_INPUT_CODE:
+                        transport_error_code = INVALID_IMAGE_INPUT_CODE
+                    elif exc.code == "admission_denied":
+                        return ReplyResult(content="")
+                    else:
+                        raise
+                else:
+                    content, delta, reason = candidate.verify_host_result(
+                        result.result
+                    )
+                    logger.info(
+                        "[KomariChat] DSH chat generated: trace_id={} recent={} memory={} knowledge={} uid_knowledge={} images={} content_chars={}",
+                        request_trace_id,
+                        len(task_data.recent),
+                        len(task_data.memory),
+                        len(task_data.knowledge),
+                        len(task_data.uid_knowledge),
+                        len(descriptors),
+                        len(content),
+                    )
+                    partial_summary = (
+                        image_input.failure_summary()
+                        if image_input.download_failures > 0
+                        else None
+                    )
+                    return ReplyResult(
+                        content=content,
+                        favorability_delta=delta,
+                        favorability_reason=reason,
+                        image_failure_summary=partial_summary,
+                    )
+        finally:
+            await image_input.aclose()
+            # The safe summary and fixed code above are the only facts allowed
+            # to survive. Rebind every URL-bearing local in this frame before a
+            # failure can unwind through it.
+            image_input = None  # type: ignore[assignment]
+            image_urls = None
+            reply_context = None
+            quoted_sources = []
+            current_sources = []
+            descriptors = ()
+            recall_query = ""
+            task_data = None
+            task = None
+
+        if failure_summary is not None:
+            raise ImageUnderstandingFailureError(failure_summary) from None
+        if transport_error_code is not None:
+            raise ImageTransportTaskError(transport_error_code) from None
+        raise DshChatError("image_transport_incomplete") from None
 
     async def _load_favorability(self, user_id: str) -> object:
         try:
@@ -416,6 +520,7 @@ def _freeze_chat_task_config(
         bot_nickname = chat_config.bot_nickname
         knowledge_enabled = bool(chat_config.knowledge_enabled)
         knowledge_limit = chat_config.knowledge_limit
+        image_policy = ImageDownloadPolicy.from_config(config)
     except AttributeError:
         raise ChatTaskBudgetError from None
     if (
@@ -443,6 +548,7 @@ def _freeze_chat_task_config(
             search=_safe_availability(search_available),
             fetch=_safe_availability(fetch_available),
         ),
+        image_policy=image_policy,
     )
 
 
@@ -581,6 +687,6 @@ __all__ = [
     "DshChatError",
     "DshChatService",
     "FrozenChatTaskConfig",
-    "ImageTransportUnavailableError",
+    "ImageTransportTaskError",
     "RecallQueryBudgetError",
 ]

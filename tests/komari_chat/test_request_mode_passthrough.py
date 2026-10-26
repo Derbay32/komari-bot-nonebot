@@ -19,6 +19,9 @@ query_rewrite_module = import_module(
 image_reading_session_module = import_module(
     "komari_bot.plugins.komari_chat.services.image_reading_session"
 )
+failure_module = import_module(
+    "komari_bot.plugins.komari_chat.services.image_failure"
+)
 image_downloader_module = import_module(
     "komari_bot.plugins.komari_chat.services.image_downloader"
 )
@@ -81,7 +84,7 @@ class _FakeImageSession:
         )
 
     def failure_summary(self) -> Any:
-        return image_reading_session_module.ImageFailureSummary(
+        return failure_module.ImageFailureSummary(
             all_images_unavailable=self.all_images_unavailable(),
             total_images=len(self.results),
         )

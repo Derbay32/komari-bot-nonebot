@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .image_reading_session import ImageFailureSummary
+    from .image_failure import ImageFailureSummary
 
 
 @dataclass(frozen=True)
@@ -15,8 +15,8 @@ class ReplyResult:
 
     ``hindsight_target_fingerprint`` is annotated by the generation wrapper from
     the active task memory session; it is never accepted from model arguments.
-    ``image_failure_summary`` remains the safe aggregate used by the pre-DSH
-    notification boundary until TSK-205 owns image transport.
+    ``image_failure_summary`` is the safe aggregate used by the notification
+    boundary for native image failures.
     """
 
     content: str

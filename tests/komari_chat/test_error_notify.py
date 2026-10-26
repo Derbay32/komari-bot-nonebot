@@ -24,7 +24,10 @@ from tests.komari_chat.hindsight_recall_support import (
 image_reading_session_module = import_module(
     "komari_bot.plugins.komari_chat.services.image_reading_session"
 )
-ImageFailureSummary = image_reading_session_module.ImageFailureSummary
+from komari_bot.plugins.komari_chat.services.image_failure import (
+    ImageFailureSummary,
+)
+
 message_handler_module = import_module(
     "komari_bot.plugins.komari_chat.handlers.message_handler"
 )

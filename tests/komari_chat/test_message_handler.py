@@ -16,7 +16,11 @@ from nonebot.adapters.onebot.v11.event import Reply, Sender
 
 from komari_bot.context.redis_store import MessageSchema
 from komari_bot.plugins.komari_chat.services.dsh_chat_service import (
-    ImageTransportUnavailableError,
+    ImageTransportTaskError,
+)
+from komari_bot.plugins.komari_chat.services.image_failure import (
+    ImageFailureSummary,
+    ImageUnderstandingFailureError,
 )
 from komari_bot.plugins.komari_chat.services.reply_context import ReplyContext
 
@@ -1054,7 +1058,7 @@ def test_generate_debug_reply_projects_partial_image_summary_without_effects(
     """Successful debug keeps only the safe summary and performs no effect."""
     redis = _FakeRedisForDebug()
     memory = FakeHindsightMemory()
-    summary = image_reading_session_module.ImageFailureSummary(
+    summary = ImageFailureSummary(
         mode="native",
         all_images_unavailable=False,
         total_images=2,
@@ -1152,10 +1156,20 @@ def test_generate_debug_reply_uses_explicit_request_trace_id(
     assert service.calls[0]["request_trace_id"] == "debug-reply-supplied"
     assert result.reply == "带trace的回复"
 
-def test_generate_debug_reply_image_seam_fails_closed_without_effects(
+class _DebugImageService:
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+        self.calls: list[dict[str, object]] = []
+
+    async def generate(self, **kwargs: object) -> object:
+        self.calls.append(dict(kwargs))
+        raise self.error
+
+
+def _debug_handler_with_service(
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """TSK-203 debug uses the same DSH seam and never falls back for images."""
+    service: _DebugImageService,
+) -> Any:
     redis = _FakeRedisForDebug()
     memory = FakeHindsightMemory()
     handler = message_handler_module.MessageHandler.__new__(
@@ -1163,6 +1177,26 @@ def test_generate_debug_reply_image_seam_fails_closed_without_effects(
     )
     handler.redis = redis
     handler.hindsight_memory = memory
+    handler._reaction_tasks = set()
+    handler.dsh_chat = service
+    _patch_both_configs(monkeypatch, lambda: _chat_memory_stub())
+    return handler, redis, memory
+
+
+def test_generate_debug_reply_transport_failure_has_no_business_effects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Debug surfaces a safe transport failure without falling back or writing."""
+    redis = _FakeRedisForDebug()
+    memory = FakeHindsightMemory()
+    service = _DebugImageService(ImageTransportTaskError("invalid_image_input"))
+    handler = message_handler_module.MessageHandler.__new__(
+        message_handler_module.MessageHandler
+    )
+    handler.redis = redis
+    handler.hindsight_memory = memory
+    handler._reaction_tasks = set()
+    handler.dsh_chat = service
     _patch_both_configs(monkeypatch, lambda: _chat_memory_stub())
 
     reply_ctx = ReplyContext(
@@ -1176,7 +1210,7 @@ def test_generate_debug_reply_image_seam_fails_closed_without_effects(
         has_visible_image=True,
     )
 
-    with pytest.raises(ImageTransportUnavailableError) as exc_info:
+    with pytest.raises(ImageTransportTaskError) as exc_info:
         asyncio.run(
             handler.generate_debug_reply(
                 group_id="debug-group-3",
@@ -1188,24 +1222,31 @@ def test_generate_debug_reply_image_seam_fails_closed_without_effects(
             )
         )
 
-    assert exc_info.value.code == "image_transport_unavailable"
+    assert exc_info.value.code == "invalid_image_input"
     assert "example.com" not in str(exc_info.value)
-    assert len(memory.recall_calls) == 1
+    assert memory.open_calls == 1
     assert redis.pushed_messages == []
     assert redis.pushed_global_interactions == []
+    assert service.calls and service.calls[0]["image_urls"] == ["https://example.com/img.png"]
+
 
 def test_generate_debug_reply_image_failure_never_notifies_or_returns_summary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The unmigrated image seam fails closed before any notification/result."""
-    redis = _FakeRedisForDebug()
-    memory = FakeHindsightMemory()
-    handler = message_handler_module.MessageHandler.__new__(
-        message_handler_module.MessageHandler
+    """Debug image failures never construct a notifier or return a partial result."""
+    error = ImageUnderstandingFailureError(
+        ImageFailureSummary(
+            mode="native",
+            all_images_unavailable=True,
+            total_images=2,
+            attempted_images=2,
+            failed_images=2,
+            error_types=("image_unavailable",),
+            stages=("download",),
+        )
     )
-    handler.redis = redis
-    handler.hindsight_memory = memory
-    _patch_both_configs(monkeypatch, lambda: _chat_memory_stub())
+    service = _DebugImageService(error)
+    handler, redis, _memory = _debug_handler_with_service(monkeypatch, service)
 
     class _RecordingBot:
         def __init__(self) -> None:
@@ -1232,7 +1273,7 @@ def test_generate_debug_reply_image_failure_never_notifies_or_returns_summary(
 
     monkeypatch.setattr(handler, "_notify_image_failure_summary", _forbidden_notify)
 
-    with pytest.raises(ImageTransportUnavailableError):
+    with pytest.raises(ImageUnderstandingFailureError):
         asyncio.run(
             handler.generate_debug_reply(
                 group_id="debug-group-img-fail",
@@ -1246,7 +1287,7 @@ def test_generate_debug_reply_image_failure_never_notifies_or_returns_summary(
         )
 
     assert bot.calls == []
-    assert len(memory.recall_calls) == 1
+    assert service.calls
     assert redis.pushed_messages == []
 
 def test_normal_attempt_reply_defers_side_effects_until_delivery(

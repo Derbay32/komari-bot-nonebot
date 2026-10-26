@@ -351,6 +351,7 @@ def write_profile(
     context_window: int = 8192,
     max_tokens: int = 128,
     compaction: bool = False,
+    input_modalities: tuple[str, ...] | None = None,
 ) -> Path:
     """Write a private test profile whose patch is the only mutable layer."""
     profile = data_dir / "dsh"
@@ -373,6 +374,10 @@ def write_profile(
         "          - id: fixture-model",
         f"            contextWindow: {context_window}",
         f"            maxTokens: {max_tokens}",
+    ]
+    if input_modalities is not None:
+        lines.append(f"            input: [{', '.join(input_modalities)}]")
+    lines.extend([
         "        retryPolicy:",
         "          mode: normal",
         f"          maxRetries: {retry_max_retries}",
@@ -381,7 +386,7 @@ def write_profile(
         "            initialDelayMs: 1",
         "            maxDelayMs: 5",
         "            jitterRatio: 0",
-    ]
+    ])
     if compaction:
         lines.extend([
             "- id: compaction-basic",
@@ -435,6 +440,7 @@ def chat_task_data(text: str = "hello") -> dict[str, Any]:
             "search": True,
             "fetch": True,
         },
+        "images": [],
         "facts": {
             "bot_nickname": "Fixture",
             "current_favorability": {
@@ -476,6 +482,7 @@ async def running_dsh(
     summary_prompt: str = "You summarize fixtures.",
     context_window: int = 8192,
     max_tokens: int = 128,
+    input_modalities: tuple[str, ...] | None = None,
 ) -> AsyncIterator[tuple[AgentHost, ScriptedModelServer]]:
     """Start the controlled endpoint and a real DSH host, then close both."""
     server = ScriptedModelServer(responder=responder)
@@ -492,6 +499,7 @@ async def running_dsh(
         summary_prompt=summary_prompt,
         context_window=context_window,
         max_tokens=max_tokens,
+        input_modalities=input_modalities,
     )
     host = host_for(data_dir, entry_script=entry_script)
     try:

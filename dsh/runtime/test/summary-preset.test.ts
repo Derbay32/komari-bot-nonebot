@@ -58,6 +58,7 @@ async function runSummary(
       installAnchor: DSH_PACKAGE,
       baseConfig: DSH_BASE_CONFIG,
       dshHome: join(root, 'home'),
+      attachmentRoot: join(root, 'attachments'),
       sendFrame: summarySendFrame(runtimeRef, simulator, {
         ...options,
         onCallback: (name) => {

@@ -51,7 +51,10 @@ const SAFE_TASK_MESSAGES: Readonly<Record<string, string>> = {
   invalid_binding: 'The selected binding is not valid for the configured route.',
   provider_unavailable: 'The configured provider route is unavailable.',
   retry_policy_invalid: 'The provider retry policy does not match the fixed runtime policy.',
-  admission_denied: 'Task admission was denied before provider I/O.',
+  admission_denied: 'Task admission was denied before an image effect.',
+  invalid_image_input: 'The task image transport data is invalid.',
+  image_input_failed: 'A verified task image could not be prepared for the model.',
+  image_model_failed: 'The model request for the task image input failed.',
   incomplete_result: 'The task ended without a validated business result.',
   cancelled: 'The task was cancelled.',
   agent_error: 'The agent requested by the task failed.',
@@ -136,6 +139,7 @@ function parseCli(argv: readonly string[]): {
   installAnchor: string
   baseConfig: string
   dshHome: string
+  attachmentRoot: string
 } {
   const parsed = parseArgs({
     args: [...argv],
@@ -144,6 +148,7 @@ function parseCli(argv: readonly string[]): {
       'install-anchor': { type: 'string' },
       'base-config': { type: 'string' },
       'dsh-home': { type: 'string' },
+      'attachment-root': { type: 'string' },
     },
     strict: true,
     allowPositionals: false,
@@ -153,6 +158,7 @@ function parseCli(argv: readonly string[]): {
     installAnchor: resolveArgPath(parsed.values['install-anchor'], 'install_anchor'),
     baseConfig: resolveArgPath(parsed.values['base-config'], 'base_config'),
     dshHome: resolveArgPath(parsed.values['dsh-home'], 'dsh_home'),
+    attachmentRoot: resolveArgPath(parsed.values['attachment-root'], 'attachment_root'),
   }
 }
 
@@ -211,6 +217,7 @@ export async function runAgentProcess(argv: readonly string[], options: RunOptio
       installAnchor: cli.installAnchor,
       baseConfig: cli.baseConfig,
       dshHome: cli.dshHome,
+      attachmentRoot: cli.attachmentRoot,
       sendFrame: send,
       ...(options.extraPatches === undefined ? {} : { extraPatches: options.extraPatches }),
     })

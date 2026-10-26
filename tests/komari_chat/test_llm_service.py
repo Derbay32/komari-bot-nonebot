@@ -16,6 +16,9 @@ retry_module = import_module("komari_bot.core.retry")
 image_reading_session_module = import_module(
     "komari_bot.plugins.komari_chat.services.image_reading_session"
 )
+failure_module = import_module(
+    "komari_bot.plugins.komari_chat.services.image_failure"
+)
 
 
 class _FakeImageSession:
@@ -73,7 +76,7 @@ class _FakeImageSession:
             for index in self._attempted
             if self.results[index].status == "failure"
         ]
-        return image_reading_session_module.ImageFailureSummary(
+        return failure_module.ImageFailureSummary(
             mode=self.mode,
             all_images_unavailable=self.all_images_unavailable(),
             total_images=self.total_count,
@@ -1172,7 +1175,7 @@ def test_generate_reply_with_tools_delegated_all_unavailable_terminates(
         ]
     )
     with pytest.raises(
-        image_reading_session_module.ImageUnderstandingFailureError
+        failure_module.ImageUnderstandingFailureError
     ) as excinfo:
         asyncio.run(
             llm_service_module.generate_reply_with_tools(
@@ -1248,7 +1251,7 @@ def test_generate_reply_with_tools_delegated_all_unavailable_same_round_final(
     )
 
     with pytest.raises(
-        image_reading_session_module.ImageUnderstandingFailureError
+        failure_module.ImageUnderstandingFailureError
     ) as excinfo:
         asyncio.run(
             llm_service_module.generate_reply_with_tools(
@@ -1320,7 +1323,7 @@ def test_generate_reply_with_tools_delegated_last_round_all_unavailable_terminat
         ]
     )
     with pytest.raises(
-        image_reading_session_module.ImageUnderstandingFailureError
+        failure_module.ImageUnderstandingFailureError
     ) as excinfo:
         asyncio.run(
             llm_service_module.generate_reply_with_tools(
@@ -1345,7 +1348,7 @@ def test_generate_reply_with_tools_delegated_last_round_all_unavailable_terminat
     assert summary.stages == ("download", "vision")
     # 是专用安全异常，绝非 MaxRounds RuntimeError
     assert isinstance(
-        excinfo.value, image_reading_session_module.ImageUnderstandingFailureError
+        excinfo.value, failure_module.ImageUnderstandingFailureError
     )
     assert "https://" not in str(excinfo.value)
     assert "base64" not in str(excinfo.value)

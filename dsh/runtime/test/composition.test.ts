@@ -28,6 +28,7 @@ test('the private composition mounts only the allowlisted runtime services', asy
     installAnchor: DSH_PACKAGE,
     baseConfig: DSH_BASE_CONFIG,
     dshHome: join(root, 'home'),
+    attachmentRoot: join(root, 'attachments'),
     sendFrame: async () => undefined,
   })
   try {

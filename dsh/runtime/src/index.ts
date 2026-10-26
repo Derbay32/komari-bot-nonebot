@@ -5,4 +5,7 @@ export { bootstrapProfile, CallbackDispatcher, HostBootError, PROFILE_BUNDLE, st
 export { DshManagementService, ManagementError, AGENT_SETTINGS_NS, LLM_SETTINGS_NS } from './management.js'
 export type { ManagementErrorCode } from './management.js'
 export { TaskMutationConflict } from './gate.js'
+export { AttachmentPreparationError, TaskAttachmentSession, TaskAttachmentStore } from './attachments.js'
+export { decodeChatTaskData, InvalidChatImageDescriptor, renderChatTaskInput, MAX_CHAT_IMAGES, MAX_CHAT_IMAGE_BYTES, MAX_CHAT_IMAGE_TOTAL_BYTES } from './chat-input.js'
+export type { ChatImageDescriptor, ChatImageMediaType } from './chat-input.js'
 export type { HostRuntime, StartHostOptions } from './host.js'
