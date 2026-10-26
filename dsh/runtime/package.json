@@ -19,8 +19,8 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json && tsc -p tsconfig.test.json",
-    "check": "tsc -p tsconfig.json --noEmit",
-    "test": "node --test dist-test/"
+    "check": "tsc -p tsconfig.build.json && tsc -p tsconfig.test.json --noEmit",
+    "test": "node --test dist-test/*.test.js"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "~4.0.5",
