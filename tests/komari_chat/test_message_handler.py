@@ -6,9 +6,6 @@ import ast
 import asyncio
 import inspect
 import json
-import sys
-import types
-from contextlib import asynccontextmanager
 from importlib import import_module
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,9 +14,8 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 from nonebot.adapters.onebot.v11 import Message, MessageSegment
 from nonebot.adapters.onebot.v11.event import Reply, Sender
 
-import komari_bot.plugins as plugins_package
+from komari_bot.context.redis_store import MessageSchema
 from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
-from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -29,7 +25,9 @@ import pytest
 message_handler_module = import_module(
     "komari_bot.plugins.komari_chat.handlers.message_handler"
 )
-llm_service_module = import_module("komari_bot.plugins.komari_chat.services.llm_service")
+llm_service_module = import_module(
+    "komari_bot.plugins.komari_chat.services.llm_service"
+)
 image_reading_session_module = import_module(
     "komari_bot.plugins.komari_chat.services.image_reading_session"
 )
@@ -44,13 +42,28 @@ def _patch_both_configs(
     monkeypatch: "pytest.MonkeyPatch",
     stub: "Callable[[], object]",
 ) -> None:
-    """KOMARIBOT-7：迁出字段走 get_config、memory 字段走 get_memory_config。
+    """TSK-192 phase B: chat and context config seams share a duck-typed stub.
 
-    两个名字都 patch 为同一鸭子类型桩：被测路径只会从各自名字读取
-    其字段，桩内同时持有迁出字段与 memory 字段时两处都能命中。
+    The tested path reads chat fields through ``get_config`` and shared
+    conversation policy through ``get_context_config``.
     """
     monkeypatch.setattr(message_handler_module, "get_config", stub)
-    monkeypatch.setattr(message_handler_module, "get_memory_config", stub)
+    monkeypatch.setattr(message_handler_module, "get_context_config", stub)
+
+
+from tests.komari_chat.hindsight_recall_support import (
+    FakeHindsightMemory,
+    FakeRecallSession,
+    fake_recall_session,
+    recall_response,
+)
+
+
+def _attempt_recall_session(handler: object) -> FakeRecallSession:
+    memory = getattr(handler, "hindsight_memory", None)
+    if isinstance(memory, FakeHindsightMemory):
+        return fake_recall_session(memory)
+    return fake_recall_session(FakeHindsightMemory())
 
 
 class _FakeEvent:
@@ -99,11 +112,7 @@ def _patch_config(
 
 
 def _chat_memory_stub(**overrides: object) -> SimpleNamespace:
-    """合并 memory 字段与 TSK-192 预算字段的配置替身。
-
-    普通/debug 入口任务开始读取同一执行预算快照：stub 同时承载
-    ``get_config`` 与 ``get_memory_config`` 两个名字的字段。
-    """
+    """Combined chat/context config stub for handler-level tests."""
     values: dict[str, object] = {
         "proactive_enabled": False,
         "context_messages_limit": 10,
@@ -180,7 +189,9 @@ class _FakeRedis:
         user_id: str,
         limit: int = 10,
     ) -> list[dict[str, object]]:
-        self.global_interaction_buffer_calls.append({"user_id": user_id, "limit": limit})
+        self.global_interaction_buffer_calls.append(
+            {"user_id": user_id, "limit": limit}
+        )
         return [{"event": "旧互动", "result": "旧回应", "emotion": "平静"}]
 
     async def push_global_interaction(
@@ -193,66 +204,6 @@ class _FakeRedis:
         self.pushed_global_interactions.append(
             {"user_id": user_id, "record": record, "trigger_size": trigger_size}
         )
-
-
-class _FakeMemory:
-    def __init__(self) -> None:
-        self.pg_pool = object()
-        self.interaction_history: dict[str, object] | None = None
-        self.upsert_interaction_history_calls: list[dict[str, object]] = []
-        self.search_interaction_event_calls: list[dict[str, object]] = []
-        self.get_user_profile_calls: list[dict[str, object]] = []
-
-    async def search_conversations(self, **_kwargs: object) -> list[dict[str, object]]:
-        return []
-
-    async def search_interaction_events(
-        self,
-        **kwargs: object,
-    ) -> list[dict[str, object]]:
-        self.search_interaction_event_calls.append(dict(kwargs))
-        return [{"event_summary": "长期互动事件"}]
-
-    async def get_user_profile(
-        self,
-        *,
-        user_id: str,
-        group_id: str,
-    ) -> dict[str, object]:
-        self.get_user_profile_calls.append({"user_id": user_id, "group_id": group_id})
-        return {
-            "display_name": "阿虚",
-            "traits": {"性格": {"value": "经常开玩笑", "category": "general"}},
-        }
-
-    async def get_interaction_history(
-        self,
-        *,
-        user_id: str,
-        group_id: str,
-    ) -> dict[str, object] | None:
-        del user_id, group_id
-        return self.interaction_history
-
-    async def upsert_interaction_history(
-        self,
-        *,
-        user_id: str,
-        group_id: str,
-        interaction: dict[str, object],
-    ) -> None:
-        self.upsert_interaction_history_calls.append(
-            {"user_id": user_id, "group_id": group_id, "interaction": interaction}
-        )
-
-
-@asynccontextmanager
-async def _fake_memory_lock(*_args: object, **kwargs: object):
-    _fake_memory_lock_calls.append(kwargs)
-    yield
-
-
-_fake_memory_lock_calls: list[dict[str, object]] = []
 
 
 class _FakeQueryRewrite:
@@ -275,12 +226,6 @@ class _FakeQueryRewrite:
         self.parent_call_id = parent_call_id
         self.collector = collector
         return "重写后的查询"
-
-
-class _FakeEmbeddingProvider:
-    async def embed(self, text: str) -> list[float]:
-        assert text == "重写后的查询"
-        return [0.1, 0.2]
 
 
 class _FakeBot:
@@ -399,10 +344,9 @@ def test_read_buffers_uses_context_limit_instead_of_summary_limit(
         message_id="current",
     )
 
-    recent, _interactions, stored = asyncio.run(
+    recent, stored = asyncio.run(
         handler._read_buffers(
             group_id="g1",
-            user_id="u2",
             message=current,
             store_current=False,
         )
@@ -417,6 +361,55 @@ def test_read_buffers_uses_context_limit_instead_of_summary_limit(
         "m19",
     ]
     assert stored is False
+
+
+def test_read_buffers_excludes_chat_trigger_from_its_own_prompt_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Chat trigger is stored after reading, so it never appears in its own context."""
+    history = [
+        MessageSchema(
+            user_id="u1",
+            user_nickname="用户",
+            group_id="g1",
+            content="更早的消息",
+            timestamp=1.0,
+            message_id="m1",
+        )
+    ]
+    redis = _FakeRedis(history)
+    handler = message_handler_module.MessageHandler.__new__(
+        message_handler_module.MessageHandler
+    )
+    handler.redis = redis
+    _patch_both_configs(
+        monkeypatch,
+        lambda: SimpleNamespace(
+            context_messages_limit=10,
+            context_max_utf8_bytes=24_000,
+            context_max_estimated_tokens=6_000,
+        ),
+    )
+    current = MessageSchema(
+        user_id="u2",
+        user_nickname="当前用户",
+        group_id="g1",
+        content="当前触发消息",
+        timestamp=2.0,
+        message_id="current",
+    )
+
+    recent, stored = asyncio.run(
+        handler._read_buffers(
+            group_id="g1",
+            message=current,
+            store_current=True,
+        )
+    )
+
+    assert stored is True
+    assert [message.message_id for message in recent] == ["m1"]
+    assert [message.message_id for message in redis.pushed_messages] == ["current"]
 
 
 def test_attempt_reply_only_rewrites_current_message(
@@ -440,12 +433,15 @@ def test_attempt_reply_only_rewrites_current_message(
     )
 
     redis = _FakeRedis([previous_message])
-    memory = _FakeMemory()
+    recall_result = recall_response(
+        {"id": "memory-1", "text": "长期记忆", "type": "world"}
+    )
+    memory = FakeHindsightMemory(response=recall_result)
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
     )
     handler.redis = redis
-    handler.memory = memory
+    handler.hindsight_memory = memory
     handler.query_rewrite = _FakeQueryRewrite()
     build_prompt_kwargs: dict[str, object] = {}
     generate_with_tools_kwargs: dict[str, object] = {}
@@ -458,13 +454,9 @@ def test_attempt_reply_only_rewrites_current_message(
         generate_with_tools_kwargs.update(_kwargs)
         return llm_service_module.ReplyResult(
             content="收到啦",
-            interaction_history={
-                "event": "发送当前待回复消息",
-                "result": "回复收到啦",
-                "emotion": "平静",
-            },
             favorability_delta=1,
             favorability_reason="正常互动",
+            hindsight_target_fingerprint="a" * 64,
         )
 
     _patch_both_configs(
@@ -498,13 +490,6 @@ def test_attempt_reply_only_rewrites_current_message(
             is_fetch_available=lambda **_kwargs: False,
         ),
     )
-    embedding_package_name = "komari_bot.plugins.embedding_provider"
-    embedding_fake = types.ModuleType(embedding_package_name)
-    embedding_fake.embed = _FakeEmbeddingProvider().embed  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, embedding_package_name, embedding_fake)
-    monkeypatch.setattr(
-        plugins_package, "embedding_provider", embedding_fake, raising=False
-    )
 
     result = asyncio.run(
         handler._attempt_reply(
@@ -518,6 +503,7 @@ def test_attempt_reply_only_rewrites_current_message(
             reply_context_refetched=False,
             force_reply=True,
             reason="platform_summon",
+            recall_session=_attempt_recall_session(handler),
             store_current=True,
         )
     )
@@ -527,32 +513,16 @@ def test_attempt_reply_only_rewrites_current_message(
     assert pending_reply.reply == "收到啦"
     assert pending_reply.reply_to_message_id == current_message.message_id
     assert handler.query_rewrite.current_query == "当前待回复消息"
-    assert redis.global_interaction_buffer_calls == [{"user_id": "user-1", "limit": 10}]
-    assert memory.get_user_profile_calls == [{"user_id": "user-1", "group_id": "group-1"}]
-    assert memory.search_interaction_event_calls == [
-        {
-            "user_id": "user-1",
-            "query": "重写后的查询",
-            "limit": 3,
-            "query_embedding": [0.1, 0.2],
-        }
-    ]
-    assert build_prompt_kwargs["current_user_profile"] == {
-        "display_name": "阿虚",
-        "traits": {"性格": {"value": "经常开玩笑", "category": "general"}},
-    }
-    assert build_prompt_kwargs["interaction_records"] == [
-        {"event": "旧互动", "result": "旧回应", "emotion": "平静"}
-    ]
-    assert build_prompt_kwargs["interaction_memories"] == [{"event_summary": "长期互动事件"}]
-    assert llm_service_module.READ_PROFILE_TOOL in generate_with_tools_kwargs["tools"]
-    assert llm_service_module.RECORD_FAVORABILITY_DELTA_TOOL in generate_with_tools_kwargs["tools"]
-    assert generate_with_tools_kwargs["memory_service"] is memory
-    assert generate_with_tools_kwargs["group_id"] == "group-1"
-    assert generate_with_tools_kwargs["allowed_profile_user_ids"] == frozenset(
-        {"user-1", "user-2"}
+    assert redis.global_interaction_buffer_calls == []
+    assert memory.recall_calls == ["重写后的查询"]
+    assert build_prompt_kwargs["recall_response"] is recall_result
+    assert llm_service_module.RECALL_MEMORY_TOOL in generate_with_tools_kwargs["tools"]
+    assert (
+        llm_service_module.RECORD_FAVORABILITY_DELTA_TOOL
+        in generate_with_tools_kwargs["tools"]
     )
-    assert generate_with_tools_kwargs["caller_user_id"] == "user-1"
+    assert generate_with_tools_kwargs["recall_session"] is memory.sessions[0]
+    assert generate_with_tools_kwargs["group_id"] == "group-1"
     assert generate_with_tools_kwargs["caller_group_id"] == "group-1"
     assert generate_with_tools_kwargs["caller_is_superuser"] is False
     assert generate_with_tools_kwargs["tools"] is not None
@@ -636,12 +606,12 @@ def _wire_reaction_sent_case(
 ) -> tuple[Any, MessageSchema]:
     """reaction_sent 字段双分支公共布线（KOMARIBOT-11）。"""
     redis = _FakeRedisForDebug()
-    memory = _FakeMemoryForDebug()
+    memory = FakeHindsightMemory()
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
     )
     handler.redis = redis
-    handler.memory = memory
+    handler.hindsight_memory = memory
     handler._reaction_tasks = set()
     handler.query_rewrite = _FakeQueryRewrite()
 
@@ -651,9 +621,9 @@ def _wire_reaction_sent_case(
     async def _fake_generate(**_kwargs: object) -> object:
         return llm_service_module.ReplyResult(
             content="生成成功",
-            interaction_history={"event": "测试", "result": "生成成功", "emotion": "平静"},
             favorability_delta=1,
             favorability_reason="测试",
+            hindsight_target_fingerprint="a" * 64,
         )
 
     _patch_both_configs(
@@ -687,13 +657,6 @@ def _wire_reaction_sent_case(
     )
     monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
 
-    embedding_package_name = "komari_bot.plugins.embedding_provider"
-    embedding_fake = types.ModuleType(embedding_package_name)
-    embedding_fake.embed = _FakeEmbeddingProvider().embed  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, embedding_package_name, embedding_fake)
-    monkeypatch.setattr(
-        plugins_package, "embedding_provider", embedding_fake, raising=False
-    )
     monkeypatch.setattr(
         message_handler_module, "user_data_plugin", _FakeUserDataForDebug()
     )
@@ -725,6 +688,7 @@ def _run_reaction_sent_attempt(handler: Any, message: MessageSchema) -> Any:
             reply_context_refetched=False,
             force_reply=True,
             reason="platform_summon",
+            recall_session=_attempt_recall_session(handler),
             store_current=True,
             on_reply_triggered=_dummy_reaction,
         )
@@ -734,10 +698,8 @@ def _run_reaction_sent_attempt(handler: Any, message: MessageSchema) -> Any:
 def test_pending_reply_reaction_sent_true_when_reaction_dispatched(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """ KOMARIBOT-11：表情真实派发时 PendingReply.reaction_sent=True。"""
-    handler, message = _wire_reaction_sent_case(
-        monkeypatch, face_reaction_enabled=True
-    )
+    """KOMARIBOT-11：表情真实派发时 PendingReply.reaction_sent=True。"""
+    handler, message = _wire_reaction_sent_case(monkeypatch, face_reaction_enabled=True)
     pending_reply, stored, failure = _run_reaction_sent_attempt(handler, message)
     assert failure is None
     assert stored is True
@@ -748,7 +710,7 @@ def test_pending_reply_reaction_sent_true_when_reaction_dispatched(
 def test_pending_reply_reaction_sent_false_when_reaction_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """ KOMARIBOT-11：face_reaction_enabled=False 边界下 reaction_sent=False。"""
+    """KOMARIBOT-11：face_reaction_enabled=False 边界下 reaction_sent=False。"""
     handler, message = _wire_reaction_sent_case(
         monkeypatch, face_reaction_enabled=False
     )
@@ -964,7 +926,9 @@ class _FakeRedisForDebug:
     async def get_global_interaction_buffer(
         self, user_id: str, limit: int = 10
     ) -> list[dict[str, object]]:
-        self.global_interaction_buffer_calls.append({"user_id": user_id, "limit": limit})
+        self.global_interaction_buffer_calls.append(
+            {"user_id": user_id, "limit": limit}
+        )
         return []
 
     async def push_global_interaction(
@@ -1075,27 +1039,6 @@ class _FakeProactiveReservation:
         return lease
 
 
-class _FakeMemoryForDebug:
-    def __init__(self) -> None:
-        self.search_conversation_calls: list[dict[str, object]] = []
-        self.get_user_profile_calls: list[dict[str, object]] = []
-
-    async def search_conversations(self, **_kwargs: object) -> list[dict[str, object]]:
-        self.search_conversation_calls.append(dict(_kwargs))
-        return []
-
-    async def search_interaction_events(
-        self, **_kwargs: object
-    ) -> list[dict[str, object]]:
-        return []
-
-    async def get_user_profile(
-        self, *, user_id: str, group_id: str
-    ) -> dict[str, object] | None:
-        self.get_user_profile_calls.append({"user_id": user_id, "group_id": group_id})
-        return {"display_name": "test_user", "traits": {}}
-
-
 class _FakeUserDataForDebug:
     """记录 adjust 调用，验证 debug 路径不调 adjust。"""
 
@@ -1117,7 +1060,9 @@ class _FakeUserDataForDebug:
             updated_at="2026-01-01T00:00:00+00:00",
         )
 
-    async def adjust_user_favorability(self, user_id: str, delta: int) -> SimpleNamespace:
+    async def adjust_user_favorability(
+        self, user_id: str, delta: int
+    ) -> SimpleNamespace:
         self.adjust_calls.append({"user_id": user_id, "delta": delta})
         return SimpleNamespace(
             user_id=user_id, before=0, delta=delta, after=delta, stage_index=1
@@ -1129,13 +1074,13 @@ def test_generate_debug_reply_skips_all_side_effects(
 ) -> None:
     """验证 debug reply 路径不触发 Redis push、好感度 adjust、互动写入、冷却/频控。"""
     redis = _FakeRedisForDebug()
-    memory = _FakeMemoryForDebug()
+    memory = FakeHindsightMemory()
     fake_user_data = _FakeUserDataForDebug()
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
     )
     handler.redis = redis
-    handler.memory = memory
+    handler.hindsight_memory = memory
     handler.query_rewrite = _FakeQueryRewrite()
     monkeypatch.setattr(message_handler_module, "user_data_plugin", fake_user_data)
     monkeypatch.setattr(
@@ -1168,22 +1113,16 @@ def test_generate_debug_reply_skips_all_side_effects(
     async def _fake_generate(**_kwargs: object) -> object:
         return llm_service_module.ReplyResult(
             content="debug测试回复",
-            interaction_history={"event": "测试", "result": "测试回复", "emotion": "平静"},
             favorability_delta=1,
             favorability_reason="debug测试",
+            hindsight_target_fingerprint="a" * 64,
         )
 
     monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
-    monkeypatch.setattr(message_handler_module, "generate_reply_with_tools", _fake_generate)
-    monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
-
-    embedding_package_name = "komari_bot.plugins.embedding_provider"
-    embedding_fake = types.ModuleType(embedding_package_name)
-    embedding_fake.embed = _FakeEmbeddingProvider().embed  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, embedding_package_name, embedding_fake)
     monkeypatch.setattr(
-        plugins_package, "embedding_provider", embedding_fake, raising=False
+        message_handler_module, "generate_reply_with_tools", _fake_generate
     )
+    monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
 
     result = asyncio.run(
         handler.generate_debug_reply(
@@ -1200,11 +1139,7 @@ def test_generate_debug_reply_skips_all_side_effects(
     assert result.reply == "debug测试回复"
     assert result.favorability_delta == 1
     assert result.favorability_reason == "debug测试"
-    assert result.interaction_history == {
-        "event": "测试",
-        "result": "测试回复",
-        "emotion": "平静",
-    }
+    assert not hasattr(result, "interaction_history")
     assert result.collector is not None
     assert result.collector.request_id.startswith("debug-reply-")
     assert result.reply_to_message_id is None
@@ -1215,6 +1150,7 @@ def test_generate_debug_reply_skips_all_side_effects(
     # debug 路径不触达预占 module（冷却/频控零副作用）：本测试未布线
     # proactive_reservation，任何预占触达都会以 AttributeError 红灯
     assert fake_user_data.adjust_calls == []  # 没有调好感度 adjust
+    assert memory.recall_calls == ["重写后的查询"]  # debug 允许召回读取
 
 
 def test_generate_debug_reply_collector_has_query_rewrite_trace(
@@ -1222,14 +1158,16 @@ def test_generate_debug_reply_collector_has_query_rewrite_trace(
 ) -> None:
     """验证 debug reply 的 collector 包含查询重写和生成阶段的 trace。"""
     redis = _FakeRedisForDebug()
-    memory = _FakeMemoryForDebug()
+    memory = FakeHindsightMemory()
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
     )
     handler.redis = redis
-    handler.memory = memory
+    handler.hindsight_memory = memory
     handler.query_rewrite = _FakeQueryRewrite()
-    monkeypatch.setattr(message_handler_module, "user_data_plugin", _FakeUserDataForDebug())
+    monkeypatch.setattr(
+        message_handler_module, "user_data_plugin", _FakeUserDataForDebug()
+    )
     monkeypatch.setattr(
         message_handler_module,
         "komari_search_plugin",
@@ -1261,24 +1199,22 @@ def test_generate_debug_reply_collector_has_query_rewrite_trace(
         nonlocal collector_from_generate, trace_id_from_generate
         collector_from_generate = kwargs.get("collector")
         trace_id_from_generate = cast("str | None", kwargs.get("request_trace_id"))
-        assert "max_tool_rounds" not in kwargs, "debug 入口不得传递入口专属轮次封顶（TSK-192）"
+        assert "max_tool_rounds" not in kwargs, (
+            "debug 入口不得传递入口专属轮次封顶（TSK-192）"
+        )
         return llm_service_module.ReplyResult(
             content="带trace的回复",
-            interaction_history={"event": "trace", "result": "trace回复", "emotion": "平静"},
             favorability_delta=2,
             favorability_reason="trace测试",
+            hindsight_target_fingerprint="a" * 64,
         )
 
     monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
-    monkeypatch.setattr(message_handler_module, "generate_reply_with_tools", _fake_generate_with_tools)
-    monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate_with_tools)
-
-    embedding_package_name = "komari_bot.plugins.embedding_provider"
-    embedding_fake = types.ModuleType(embedding_package_name)
-    embedding_fake.embed = _FakeEmbeddingProvider().embed  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, embedding_package_name, embedding_fake)
     monkeypatch.setattr(
-        plugins_package, "embedding_provider", embedding_fake, raising=False
+        message_handler_module, "generate_reply_with_tools", _fake_generate_with_tools
+    )
+    monkeypatch.setattr(
+        message_handler_module, "generate_reply", _fake_generate_with_tools
     )
 
     supplied_collector = LLMDiagnosticCollector(request_id="debug-reply-supplied")
@@ -1304,14 +1240,16 @@ def test_generate_debug_reply_with_images_and_reply_context(
 ) -> None:
     """验证 debug reply 附带引用消息和图片时仍正确工作且无副作用。"""
     redis = _FakeRedisForDebug()
-    memory = _FakeMemoryForDebug()
+    memory = FakeHindsightMemory()
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
     )
     handler.redis = redis
-    handler.memory = memory
+    handler.hindsight_memory = memory
     handler.query_rewrite = _FakeQueryRewrite()
-    monkeypatch.setattr(message_handler_module, "user_data_plugin", _FakeUserDataForDebug())
+    monkeypatch.setattr(
+        message_handler_module, "user_data_plugin", _FakeUserDataForDebug()
+    )
     monkeypatch.setattr(
         message_handler_module,
         "komari_search_plugin",
@@ -1342,13 +1280,15 @@ def test_generate_debug_reply_with_images_and_reply_context(
     async def _fake_generate(**_kwargs: object) -> object:
         return llm_service_module.ReplyResult(
             content="附图debug回复",
-            interaction_history={"event": "附图测试", "result": "附图回复", "emotion": "平静"},
             favorability_delta=0,
             favorability_reason="无变化",
+            hindsight_target_fingerprint="a" * 64,
         )
 
     monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
-    monkeypatch.setattr(message_handler_module, "generate_reply_with_tools", _fake_generate)
+    monkeypatch.setattr(
+        message_handler_module, "generate_reply_with_tools", _fake_generate
+    )
     monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
     download_batches: list[list[str]] = []
 
@@ -1363,14 +1303,6 @@ def test_generate_debug_reply_with_images_and_reply_context(
         message_handler_module,
         "download_images_as_base64_aligned",
         _download_images,
-    )
-
-    embedding_package_name = "komari_bot.plugins.embedding_provider"
-    embedding_fake = types.ModuleType(embedding_package_name)
-    embedding_fake.embed = _FakeEmbeddingProvider().embed  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, embedding_package_name, embedding_fake)
-    monkeypatch.setattr(
-        plugins_package, "embedding_provider", embedding_fake, raising=False
     )
 
     from komari_bot.plugins.komari_chat.services.reply_context import ReplyContext
@@ -1420,14 +1352,16 @@ def test_generate_debug_reply_with_image_failure_summary_never_notifies(
     时，只把安全结果保留在 collector/output，绝不调用通知边界或发送任何
     群/私聊消息（不依赖“代码没走 process_message”的注释来保证）。"""
     redis = _FakeRedisForDebug()
-    memory = _FakeMemoryForDebug()
+    memory = FakeHindsightMemory()
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
     )
     handler.redis = redis
-    handler.memory = memory
+    handler.hindsight_memory = memory
     handler.query_rewrite = _FakeQueryRewrite()
-    monkeypatch.setattr(message_handler_module, "user_data_plugin", _FakeUserDataForDebug())
+    monkeypatch.setattr(
+        message_handler_module, "user_data_plugin", _FakeUserDataForDebug()
+    )
     monkeypatch.setattr(
         message_handler_module,
         "komari_search_plugin",
@@ -1465,14 +1399,16 @@ def test_generate_debug_reply_with_image_failure_summary_never_notifies(
     async def _fake_generate(**_kwargs: object) -> object:
         return llm_service_module.ReplyResult(
             content="debug附图回复",
-            interaction_history={"event": "附图", "result": "回复", "emotion": "平静"},
             favorability_delta=0,
             favorability_reason="无变化",
             image_failure_summary=summary,
+            hindsight_target_fingerprint="a" * 64,
         )
 
     monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
-    monkeypatch.setattr(message_handler_module, "generate_reply_with_tools", _fake_generate)
+    monkeypatch.setattr(
+        message_handler_module, "generate_reply_with_tools", _fake_generate
+    )
     monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
 
     async def _download_images(
@@ -1486,14 +1422,6 @@ def test_generate_debug_reply_with_image_failure_summary_never_notifies(
         message_handler_module,
         "download_images_as_base64_aligned",
         _download_images,
-    )
-
-    embedding_package_name = "komari_bot.plugins.embedding_provider"
-    embedding_fake = types.ModuleType(embedding_package_name)
-    embedding_fake.embed = _FakeEmbeddingProvider().embed  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, embedding_package_name, embedding_fake)
-    monkeypatch.setattr(
-        plugins_package, "embedding_provider", embedding_fake, raising=False
     )
 
     class _RecordingBot:
@@ -1558,13 +1486,13 @@ def test_normal_attempt_reply_defers_side_effects_until_delivery(
         message_id="msg-normal-1",
     )
     redis = _FakeRedisForDebug()
-    memory = _FakeMemoryForDebug()
+    memory = FakeHindsightMemory()
     fake_user_data = _FakeUserDataForDebug()
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
     )
     handler.redis = redis
-    handler.memory = memory
+    handler.hindsight_memory = memory
     handler.query_rewrite = _FakeQueryRewrite()
     monkeypatch.setattr(message_handler_module, "user_data_plugin", fake_user_data)
     monkeypatch.setattr(
@@ -1596,22 +1524,16 @@ def test_normal_attempt_reply_defers_side_effects_until_delivery(
     async def _fake_generate(**_kwargs: object) -> object:
         return llm_service_module.ReplyResult(
             content="正常回复",
-            interaction_history={"event": "正常消息", "result": "正常回复", "emotion": "平静"},
             favorability_delta=1,
             favorability_reason="正常互动",
+            hindsight_target_fingerprint="a" * 64,
         )
 
     monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
-    monkeypatch.setattr(message_handler_module, "generate_reply_with_tools", _fake_generate)
-    monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
-
-    embedding_package_name = "komari_bot.plugins.embedding_provider"
-    embedding_fake = types.ModuleType(embedding_package_name)
-    embedding_fake.embed = _FakeEmbeddingProvider().embed  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, embedding_package_name, embedding_fake)
     monkeypatch.setattr(
-        plugins_package, "embedding_provider", embedding_fake, raising=False
+        message_handler_module, "generate_reply_with_tools", _fake_generate
     )
+    monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
 
     result = asyncio.run(
         handler._attempt_reply(
@@ -1625,6 +1547,7 @@ def test_normal_attempt_reply_defers_side_effects_until_delivery(
             reply_context_refetched=False,
             force_reply=True,
             reason="platform_summon",
+            recall_session=_attempt_recall_session(handler),
             store_current=True,
         )
     )
@@ -1660,15 +1583,15 @@ def test_proactive_attempt_returns_pending_reply_carrying_handoff(
     handler.redis = redis
     handler.proactive_reservation = reservation_svc
 
-    async def _fake_read_buffers(**_kwargs: object) -> tuple[list, list, bool]:
-        return [], [], True
+    async def _fake_read_buffers(**_kwargs: object) -> tuple[list, bool]:
+        return [], True
 
     async def _fake_generate_core(**_kwargs: object) -> object:
         return llm_service_module.ReplyResult(
             content="主动回复",
-            interaction_history=None,
             favorability_delta=0,
             favorability_reason="主动关心",
+            hindsight_target_fingerprint="a" * 64,
         )
 
     monkeypatch.setattr(handler, "_read_buffers", _fake_read_buffers)
@@ -1704,6 +1627,7 @@ def test_proactive_attempt_returns_pending_reply_carrying_handoff(
             reply_context_refetched=False,
             force_reply=False,
             reason="score",
+            recall_session=_attempt_recall_session(handler),
             store_current=True,
         )
     )
@@ -1739,8 +1663,8 @@ def test_proactive_generation_failure_returns_failure_and_lease_exit_releases(
     handler.redis = redis
     handler.proactive_reservation = reservation_svc
 
-    async def _fake_read_buffers(**_kwargs: object) -> tuple[list, list, bool]:
-        return [], [], True
+    async def _fake_read_buffers(**_kwargs: object) -> tuple[list, bool]:
+        return [], True
 
     async def _fail_generate_core(**_kwargs: object) -> object:
         msg = "好感度读取失败"
@@ -1778,6 +1702,7 @@ def test_proactive_generation_failure_returns_failure_and_lease_exit_releases(
             reply_context_refetched=False,
             force_reply=False,
             reason="score",
+            recall_session=_attempt_recall_session(handler),
             store_current=True,
         )
     )
@@ -1806,8 +1731,8 @@ def test_normal_attempt_reply_gracefully_handles_favorability_read_failure(
         message_handler_module.MessageHandler
     )
 
-    async def _fake_read_buffers(**_kwargs: object) -> tuple[list, list, bool]:
-        return [], [], True
+    async def _fake_read_buffers(**_kwargs: object) -> tuple[list, bool]:
+        return [], True
 
     async def _fake_generate_core(**_kwargs: object) -> object:
         msg = "好感度服务不可用"
@@ -1840,6 +1765,7 @@ def test_normal_attempt_reply_gracefully_handles_favorability_read_failure(
             reply_context_refetched=False,
             force_reply=True,
             reason="platform_summon",
+            recall_session=_attempt_recall_session(handler),
             store_current=True,
         )
     )
@@ -1862,20 +1788,16 @@ def test_generate_debug_reply_refetches_quoted_image_without_url(
     )
     captured: dict[str, object] = {}
 
-    async def _fake_read_buffers(**_kwargs: object) -> tuple[list, list, bool]:
-        return [], [], False
+    async def _fake_read_buffers(**_kwargs: object) -> tuple[list, bool]:
+        return [], False
 
     async def _fake_generate_core(**kwargs: object) -> object:
         captured.update(kwargs)
         return llm_service_module.ReplyResult(
             content="已读取引用图片",
-            interaction_history={
-                "event": "引用图片",
-                "result": "读取完成",
-                "emotion": "平静",
-            },
             favorability_delta=0,
             favorability_reason="无变化",
+            hindsight_target_fingerprint="a" * 64,
         )
 
     monkeypatch.setattr(handler, "_read_buffers", _fake_read_buffers)
@@ -1922,9 +1844,7 @@ def test_generate_debug_reply_refetches_quoted_image_without_url(
 
     refetched_context = cast("ReplyContext", captured["reply_context"])
     assert bot.calls == [456]
-    assert refetched_context.image_sources == (
-        "https://example.com/refetched.png",
-    )
+    assert refetched_context.image_sources == ("https://example.com/refetched.png",)
     assert captured["reply_context_refetched"] is True
     assert result.reply_to_message_id == "456"
 
@@ -1939,12 +1859,12 @@ def test_reaction_scheduled_before_generate_core(
     reaction_called = False
 
     redis = _FakeRedisForDebug()
-    memory = _FakeMemoryForDebug()
+    memory = FakeHindsightMemory()
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
     )
     handler.redis = redis
-    handler.memory = memory
+    handler.hindsight_memory = memory
     handler._reaction_tasks = set()
     handler.query_rewrite = _FakeQueryRewrite()
 
@@ -1980,9 +1900,9 @@ def test_reaction_scheduled_before_generate_core(
     async def _fake_generate(**_kwargs: object) -> object:
         return llm_service_module.ReplyResult(
             content="带表情的回复",
-            interaction_history={"event": "表情测试", "result": "表情回复", "emotion": "平静"},
             favorability_delta=1,
             favorability_reason="表情互动",
+            hindsight_target_fingerprint="a" * 64,
         )
 
     async def _fake_reaction() -> None:
@@ -1990,18 +1910,14 @@ def test_reaction_scheduled_before_generate_core(
         reaction_called = True
 
     monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
-    monkeypatch.setattr(message_handler_module, "generate_reply_with_tools", _fake_generate)
+    monkeypatch.setattr(
+        message_handler_module, "generate_reply_with_tools", _fake_generate
+    )
     monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
 
-    embedding_package_name = "komari_bot.plugins.embedding_provider"
-    embedding_fake = types.ModuleType(embedding_package_name)
-    embedding_fake.embed = _FakeEmbeddingProvider().embed  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, embedding_package_name, embedding_fake)
     monkeypatch.setattr(
-        plugins_package, "embedding_provider", embedding_fake, raising=False
+        message_handler_module, "user_data_plugin", _FakeUserDataForDebug()
     )
-
-    monkeypatch.setattr(message_handler_module, "user_data_plugin", _FakeUserDataForDebug())
 
     current_message = MessageSchema(
         user_id="user-reaction",
@@ -2024,6 +1940,7 @@ def test_reaction_scheduled_before_generate_core(
             reply_context_refetched=False,
             force_reply=True,
             reason="platform_summon",
+            recall_session=_attempt_recall_session(handler),
             store_current=True,
             on_reply_triggered=_fake_reaction,
         )
@@ -2042,12 +1959,12 @@ def test_reaction_not_scheduled_when_disabled(
     """face_reaction_enabled=false 时不派发表情，但仍正常生成回复。"""
     reaction_called = False
     redis = _FakeRedisForDebug()
-    memory = _FakeMemoryForDebug()
+    memory = FakeHindsightMemory()
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
     )
     handler.redis = redis
-    handler.memory = memory
+    handler.hindsight_memory = memory
     handler.query_rewrite = _FakeQueryRewrite()
 
     _patch_both_configs(
@@ -2082,9 +1999,9 @@ def test_reaction_not_scheduled_when_disabled(
     async def _fake_generate(**_kwargs: object) -> object:
         return llm_service_module.ReplyResult(
             content="无表情回复",
-            interaction_history={"event": "无表情", "result": "无表情回复", "emotion": "平静"},
             favorability_delta=1,
             favorability_reason="测试",
+            hindsight_target_fingerprint="a" * 64,
         )
 
     async def _fake_reaction() -> None:
@@ -2092,17 +2009,14 @@ def test_reaction_not_scheduled_when_disabled(
         reaction_called = True
 
     monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
-    monkeypatch.setattr(message_handler_module, "generate_reply_with_tools", _fake_generate)
+    monkeypatch.setattr(
+        message_handler_module, "generate_reply_with_tools", _fake_generate
+    )
     monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
 
-    embedding_package_name = "komari_bot.plugins.embedding_provider"
-    embedding_fake = types.ModuleType(embedding_package_name)
-    embedding_fake.embed = _FakeEmbeddingProvider().embed  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, embedding_package_name, embedding_fake)
     monkeypatch.setattr(
-        plugins_package, "embedding_provider", embedding_fake, raising=False
+        message_handler_module, "user_data_plugin", _FakeUserDataForDebug()
     )
-    monkeypatch.setattr(message_handler_module, "user_data_plugin", _FakeUserDataForDebug())
 
     current_message = MessageSchema(
         user_id="user-no-reaction",
@@ -2125,6 +2039,7 @@ def test_reaction_not_scheduled_when_disabled(
             reply_context_refetched=False,
             force_reply=True,
             reason="platform_summon",
+            recall_session=_attempt_recall_session(handler),
             store_current=True,
             on_reply_triggered=_fake_reaction,
         )
@@ -2141,12 +2056,12 @@ def test_reaction_sent_then_empty_reply_returns_failure_with_reaction_sent_true(
 ) -> None:
     """贴表情后LLM返回空回复→ failure.reaction_sent=True（需发群内错误文本）。"""
     redis = _FakeRedisForDebug()
-    memory = _FakeMemoryForDebug()
+    memory = FakeHindsightMemory()
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
     )
     handler.redis = redis
-    handler.memory = memory
+    handler.hindsight_memory = memory
     handler._reaction_tasks = set()
     handler.query_rewrite = _FakeQueryRewrite()
 
@@ -2182,23 +2097,20 @@ def test_reaction_sent_then_empty_reply_returns_failure_with_reaction_sent_true(
     async def _fake_generate(**_kwargs: object) -> object:
         return llm_service_module.ReplyResult(
             content="",  # 空回复
-            interaction_history={"event": "空回复测试", "result": "", "emotion": "平静"},
             favorability_delta=1,
             favorability_reason="测试",
+            hindsight_target_fingerprint="a" * 64,
         )
 
     monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
-    monkeypatch.setattr(message_handler_module, "generate_reply_with_tools", _fake_generate)
+    monkeypatch.setattr(
+        message_handler_module, "generate_reply_with_tools", _fake_generate
+    )
     monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
 
-    embedding_package_name = "komari_bot.plugins.embedding_provider"
-    embedding_fake = types.ModuleType(embedding_package_name)
-    embedding_fake.embed = _FakeEmbeddingProvider().embed  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, embedding_package_name, embedding_fake)
     monkeypatch.setattr(
-        plugins_package, "embedding_provider", embedding_fake, raising=False
+        message_handler_module, "user_data_plugin", _FakeUserDataForDebug()
     )
-    monkeypatch.setattr(message_handler_module, "user_data_plugin", _FakeUserDataForDebug())
 
     current_message = MessageSchema(
         user_id="user-empty",
@@ -2224,6 +2136,7 @@ def test_reaction_sent_then_empty_reply_returns_failure_with_reaction_sent_true(
             reply_context_refetched=False,
             force_reply=True,
             reason="platform_summon",
+            recall_session=_attempt_recall_session(handler),
             store_current=True,
             on_reply_triggered=_dummy_reaction_empty,
         )
@@ -2239,12 +2152,12 @@ def test_reaction_sent_then_delta_missing_returns_failure_with_reaction_sent_tru
 ) -> None:
     """贴表情后好感度delta缺失→ failure.reaction_sent=True。"""
     redis = _FakeRedisForDebug()
-    memory = _FakeMemoryForDebug()
+    memory = FakeHindsightMemory()
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
     )
     handler.redis = redis
-    handler.memory = memory
+    handler.hindsight_memory = memory
     handler._reaction_tasks = set()
     handler.query_rewrite = _FakeQueryRewrite()
 
@@ -2280,23 +2193,20 @@ def test_reaction_sent_then_delta_missing_returns_failure_with_reaction_sent_tru
     async def _fake_generate(**_kwargs: object) -> object:
         return llm_service_module.ReplyResult(
             content="有回复但无delta",
-            interaction_history={"event": "delta测试", "result": "有回复无delta", "emotion": "平静"},
             favorability_delta=None,  # 缺失
             favorability_reason=None,
+            hindsight_target_fingerprint="a" * 64,
         )
 
     monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
-    monkeypatch.setattr(message_handler_module, "generate_reply_with_tools", _fake_generate)
+    monkeypatch.setattr(
+        message_handler_module, "generate_reply_with_tools", _fake_generate
+    )
     monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
 
-    embedding_package_name = "komari_bot.plugins.embedding_provider"
-    embedding_fake = types.ModuleType(embedding_package_name)
-    embedding_fake.embed = _FakeEmbeddingProvider().embed  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, embedding_package_name, embedding_fake)
     monkeypatch.setattr(
-        plugins_package, "embedding_provider", embedding_fake, raising=False
+        message_handler_module, "user_data_plugin", _FakeUserDataForDebug()
     )
-    monkeypatch.setattr(message_handler_module, "user_data_plugin", _FakeUserDataForDebug())
 
     current_message = MessageSchema(
         user_id="user-delta",
@@ -2322,6 +2232,7 @@ def test_reaction_sent_then_delta_missing_returns_failure_with_reaction_sent_tru
             reply_context_refetched=False,
             force_reply=True,
             reason="platform_summon",
+            recall_session=_attempt_recall_session(handler),
             store_current=True,
             on_reply_triggered=_dummy_reaction_delta,
         )
@@ -2342,7 +2253,7 @@ def test_reserve_failure_returns_failure_with_reaction_sent_false(
         message_handler_module.MessageHandler
     )
     handler.redis = redis
-    handler.memory = _FakeMemoryForDebug()
+    handler.hindsight_memory = FakeHindsightMemory()
     handler.proactive_reservation = reservation_svc
 
     _patch_both_configs(
@@ -2393,6 +2304,7 @@ def test_reserve_failure_returns_failure_with_reaction_sent_false(
             reply_context_refetched=False,
             force_reply=False,
             reason="score",
+            recall_session=_attempt_recall_session(handler),
             store_current=True,
             on_reply_triggered=_fake_reaction,
         )
@@ -2478,6 +2390,7 @@ def test_proactive_denied_reason_records_branch_telemetry_and_returns_no_reply(
             reply_context_refetched=False,
             force_reply=False,
             reason="score",
+            recall_session=_attempt_recall_session(handler),
             store_current=True,
         )
     )
@@ -2496,7 +2409,7 @@ def test_proactive_handoff_lost_returns_generate_failure_with_reaction_sent_true
     生成完成、移交时租约已丢失：表情已派发，failure.reaction_sent=True。
     """
     redis = _FakeRedisForDebug()
-    memory = _FakeMemoryForDebug()
+    memory = FakeHindsightMemory()
     reservation_svc = _FakeProactiveReservation(
         handoff_error=ReservationLostError(
             group_id="group-lost",
@@ -2507,19 +2420,19 @@ def test_proactive_handoff_lost_returns_generate_failure_with_reaction_sent_true
         message_handler_module.MessageHandler
     )
     handler.redis = redis
-    handler.memory = memory
+    handler.hindsight_memory = memory
     handler._reaction_tasks = set()
     handler.proactive_reservation = reservation_svc
 
-    async def _fake_read_buffers(**_kwargs: object) -> tuple[list, list, bool]:
-        return [], [], True
+    async def _fake_read_buffers(**_kwargs: object) -> tuple[list, bool]:
+        return [], True
 
     async def _fake_generate_core(**_kwargs: object) -> object:
         return llm_service_module.ReplyResult(
             content="生成成功但租约已丢",
-            interaction_history={"event": "测试", "result": "生成成功", "emotion": "平静"},
             favorability_delta=1,
             favorability_reason="测试",
+            hindsight_target_fingerprint="a" * 64,
         )
 
     monkeypatch.setattr(handler, "_read_buffers", _fake_read_buffers)
@@ -2565,6 +2478,7 @@ def test_proactive_handoff_lost_returns_generate_failure_with_reaction_sent_true
             reply_context_refetched=False,
             force_reply=False,
             reason="score",
+            recall_session=_attempt_recall_session(handler),
             store_current=True,
             on_reply_triggered=_fake_reaction,
         )
@@ -2589,14 +2503,16 @@ def test_pending_reply_does_not_retain_reaction_callback(
 ) -> None:
     """表情回调只在生成前派发，不进入冻结的待履约回复。"""
     redis = _FakeRedisForDebug()
-    memory = _FakeMemoryForDebug()
+    memory = FakeHindsightMemory()
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
     )
     handler.redis = redis
-    handler.memory = memory
+    handler.hindsight_memory = memory
     handler.query_rewrite = _FakeQueryRewrite()
-    monkeypatch.setattr(message_handler_module, "user_data_plugin", _FakeUserDataForDebug())
+    monkeypatch.setattr(
+        message_handler_module, "user_data_plugin", _FakeUserDataForDebug()
+    )
     monkeypatch.setattr(
         message_handler_module,
         "komari_search_plugin",
@@ -2628,22 +2544,16 @@ def test_pending_reply_does_not_retain_reaction_callback(
     async def _fake_generate(**_kwargs: object) -> object:
         return llm_service_module.ReplyResult(
             content="送达测试",
-            interaction_history={"event": "送达", "result": "送达回复", "emotion": "平静"},
             favorability_delta=1,
             favorability_reason="测试",
+            hindsight_target_fingerprint="a" * 64,
         )
 
     monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
-    monkeypatch.setattr(message_handler_module, "generate_reply_with_tools", _fake_generate)
-    monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
-
-    embedding_package_name = "komari_bot.plugins.embedding_provider"
-    embedding_fake = types.ModuleType(embedding_package_name)
-    embedding_fake.embed = _FakeEmbeddingProvider().embed  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, embedding_package_name, embedding_fake)
     monkeypatch.setattr(
-        plugins_package, "embedding_provider", embedding_fake, raising=False
+        message_handler_module, "generate_reply_with_tools", _fake_generate
     )
+    monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
 
     current_message = MessageSchema(
         user_id="user-commit",
@@ -2666,6 +2576,7 @@ def test_pending_reply_does_not_retain_reaction_callback(
             reply_context_refetched=False,
             force_reply=True,
             reason="platform_summon",
+            recall_session=_attempt_recall_session(handler),
             store_current=True,
         )
     )
@@ -2678,6 +2589,7 @@ def test_pending_reply_does_not_retain_reaction_callback(
     # KOMARIBOT-11：无表情回调时 reaction_sent 为真实派发结果 False
     assert pending_reply.reaction_sent is False
 
+
 def test_read_buffers_failure_returns_failure_with_reaction_sent_false(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2687,7 +2599,7 @@ def test_read_buffers_failure_returns_failure_with_reaction_sent_false(
         message_handler_module.MessageHandler
     )
     handler.redis = redis
-    handler.memory = _FakeMemoryForDebug()
+    handler.hindsight_memory = FakeHindsightMemory()
 
     _patch_both_configs(
         monkeypatch,
@@ -2701,7 +2613,7 @@ def test_read_buffers_failure_returns_failure_with_reaction_sent_false(
         ),
     )
 
-    async def _failing_read_buffers(**_kwargs: object) -> tuple[list, list, bool]:
+    async def _failing_read_buffers(**_kwargs: object) -> tuple[list, bool]:
         msg = "Redis 读缓冲失败"
         raise RuntimeError(msg)
 
@@ -2728,6 +2640,7 @@ def test_read_buffers_failure_returns_failure_with_reaction_sent_false(
             reply_context_refetched=False,
             force_reply=True,
             reason="platform_summon",
+            recall_session=_attempt_recall_session(handler),
             store_current=True,
         )
     )
@@ -2735,3 +2648,24 @@ def test_read_buffers_failure_returns_failure_with_reaction_sent_false(
     assert failure is not None
     assert failure.stage == "read_buffers"
     assert failure.reaction_sent is False
+
+
+def test_pending_reply_freezes_bot_nickname_from_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TSK-192 phase B: PendingReply freezes identity from context ownership."""
+    handler, message = _wire_reaction_sent_case(
+        monkeypatch,
+        face_reaction_enabled=False,
+    )
+    monkeypatch.setattr(
+        message_handler_module,
+        "get_context_config",
+        lambda: SimpleNamespace(bot_nickname="冻结昵称"),
+    )
+
+    pending_reply, _stored, failure = _run_reaction_sent_attempt(handler, message)
+
+    assert failure is None
+    assert pending_reply is not None
+    assert pending_reply.bot_nickname == "冻结昵称"

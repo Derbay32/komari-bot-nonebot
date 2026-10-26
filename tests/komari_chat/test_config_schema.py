@@ -76,7 +76,9 @@ def test_config_schema_declares_immediate_default_apply_mode() -> None:
     assert KomariChatConfigSchema.model_config.get("json_schema_extra") == {
         "default_apply_mode": "immediate"
     }
-    for field in KomariChatConfigSchema.model_fields.values():
+    for field_name, field in KomariChatConfigSchema.model_fields.items():
+        if field_name == "plugin_enable":
+            continue
         extra = field.json_schema_extra
         if isinstance(extra, dict) and "apply_mode" in extra:
             assert extra["apply_mode"] == "immediate"
@@ -104,7 +106,9 @@ def test_agent_budget_fields_expose_expected_defaults() -> None:
     """AC1：三项预算默认值为 10 / 4 / 20。"""
     config = KomariChatConfigSchema()
 
-    assert set(EXPECTED_AGENT_BUDGET_DEFAULTS) <= set(KomariChatConfigSchema.model_fields)
+    assert set(EXPECTED_AGENT_BUDGET_DEFAULTS) <= set(
+        KomariChatConfigSchema.model_fields
+    )
     for field_name, expected_default in EXPECTED_AGENT_BUDGET_DEFAULTS.items():
         assert getattr(config, field_name) == expected_default, field_name
 
@@ -276,9 +280,7 @@ def test_image_understanding_mode_is_typed_enum_with_default_delegated() -> None
         EXPECTED_IMAGE_UNDERSTANDING_MODE_CHOICES
     )
     assert (
-        KomariChatConfigSchema.model_fields[
-            "image_understanding_mode"
-        ].default
+        KomariChatConfigSchema.model_fields["image_understanding_mode"].default
         == EXPECTED_IMAGE_UNDERSTANDING_MODE_DEFAULT
     )
 
@@ -436,3 +438,94 @@ def test_komari_chat_does_not_import_komari_memory_config_interface() -> None:
                 )
 
     assert offenders == []
+
+
+# ── TSK-192 phase B：chat/context configuration ownership ───────────────
+
+TSK192_CHAT_OWNED_FIELDS = {
+    "llm_model_chat": "gemini-3-flash-preview",
+    "llm_temperature_chat": 1.0,
+    "llm_max_tokens_chat": 4000,
+    "llm_request_api_chat": "chat_completions",
+    "llm_stream_enabled_chat": False,
+    "llm_thinking_mode_chat": False,
+    "llm_reasoning_effort_chat": "",
+    "assistant_prefill_enabled": False,
+    "dsv4_roleplay_instruct_mode": "auto",
+    "knowledge_enabled": True,
+    "knowledge_limit": 3,
+    "context_messages_limit": 10,
+    "context_max_utf8_bytes": 24_000,
+    "context_max_estimated_tokens": 6_000,
+    "face_reaction_enabled": False,
+    "face_reaction_id": "76",
+}
+
+TSK192_QUERY_REWRITE_FIELDS = {
+    "query_rewrite_model": "deepseek-v4-flash",
+    "query_rewrite_request_api": "chat_completions",
+    "query_rewrite_stream_enabled": False,
+    "query_rewrite_thinking_mode": False,
+    "query_rewrite_reasoning_effort": "",
+}
+
+
+def test_phase_b_fields_have_one_chat_owner_with_original_defaults() -> None:
+    config = KomariChatConfigSchema()
+
+    assert config.plugin_enable is False
+    for field_name, expected in TSK192_CHAT_OWNED_FIELDS.items():
+        assert field_name in KomariChatConfigSchema.model_fields, field_name
+        assert getattr(config, field_name) == expected, field_name
+    for field_name, expected in TSK192_QUERY_REWRITE_FIELDS.items():
+        assert field_name in KomariChatConfigSchema.model_fields, field_name
+        assert getattr(config, field_name) == expected, field_name
+
+
+def test_retired_memory_search_limit_is_absent_from_live_chat_schema() -> None:
+    """0031 retires the dead chat setting from schema and serialization."""
+    config = KomariChatConfigSchema()
+
+    assert "memory_search_limit" not in KomariChatConfigSchema.model_fields
+    assert "memory_search_limit" not in config.model_dump()
+    assert not hasattr(config, "memory_search_limit")
+
+
+def test_phase_b_fields_preserve_validation_and_apply_metadata() -> None:
+    plugin_field = KomariChatConfigSchema.model_fields["plugin_enable"]
+    assert plugin_field.json_schema_extra == {"apply_mode": "restart"}
+
+    bounds = {
+        "llm_temperature_chat": (-0.1, 2.1),
+        "llm_max_tokens_chat": (19, 8193),
+        "knowledge_limit": (0, 11),
+        "context_messages_limit": (4, 51),
+        "context_max_utf8_bytes": (1023, 131_073),
+        "context_max_estimated_tokens": (255, 32_001),
+    }
+    for field_name, (lower, upper) in bounds.items():
+        with pytest.raises(ValidationError):
+            KomariChatConfigSchema(**{field_name: lower})
+        with pytest.raises(ValidationError):
+            KomariChatConfigSchema(**{field_name: upper})
+
+    normalized = KomariChatConfigSchema(dsv4_roleplay_instruct_mode=" INNER_OS ")
+    assert normalized.dsv4_roleplay_instruct_mode == "inner_os"
+    invalid = KomariChatConfigSchema(dsv4_roleplay_instruct_mode="unknown")
+    assert invalid.dsv4_roleplay_instruct_mode == "auto"
+
+
+def test_query_rewrite_fields_use_summary_validation_not_temperature_copy() -> None:
+    config = KomariChatConfigSchema(query_rewrite_request_api="responses")
+    assert config.query_rewrite_request_api == "responses"
+    with pytest.raises(ValidationError):
+        KomariChatConfigSchema(query_rewrite_request_api="websocket")
+    assert not hasattr(config, "query_rewrite_temperature")
+    assert not hasattr(config, "query_rewrite_max_tokens")
+
+
+def test_chat_config_interface_has_no_memory_config_dependency() -> None:
+    interface_path = KOMARI_CHAT_PLUGIN_DIR / "services" / "config_interface.py"
+    source = interface_path.read_text(encoding="utf-8")
+    assert "get_memory_config" not in source
+    assert "KomariMemoryConfigSchema" not in source

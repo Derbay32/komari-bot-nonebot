@@ -19,6 +19,7 @@ TSK-87：本模块已接线生产正常路径：聊天入口送达持久化后�
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any, Protocol
@@ -27,11 +28,16 @@ import asyncpg
 from nonebot import logger
 from redis.exceptions import RedisError
 
-from komari_bot.plugins.komari_memory import MessageSchema
+from komari_bot.context.redis_store import MessageSchema
+from komari_bot.plugins.komari_memory import (
+    HindsightRetainRequest,
+    HindsightUnavailableError,
+)
 
 from ..reply_fulfillment_domain import (
     _COMMITMENT_PAYLOAD_TYPES,
     COMMITMENT_ORDER,
+    HindsightMemoryPayload,
     ReplyFulfillmentConflictError,
 )
 from .admission_gate import (
@@ -140,17 +146,26 @@ class _CommitmentExecutorRepository(Protocol):
     ) -> dict[str, Any] | None: ...
 
 
-def _build_payload(commitment_type: str, raw: object) -> Any:
+def _build_payload(
+    commitment_type: str,
+    raw: object,
+) -> tuple[Any, HindsightRetainRequest | None]:
     """把持久载荷构造成冻结领域值对象（invalid_payload 的分类点）。
 
     在调用下游之前完成解析；解析失败属于载荷/JSON 字段校验错误，
     与下游调用抛出的 ``TypeError``（protocol_violation）严格区分。
+    Hindsight 记忆载荷在同一处经官方 ``HindsightRetainRequest.from_json``
+    严格重建，损坏的持久请求在触达 SDK 之前即成为永久 ``invalid_payload``。
     """
     payload_type = _COMMITMENT_PAYLOAD_TYPES.get(commitment_type)
     if payload_type is None or not isinstance(raw, dict):
         msg = "承诺载荷必须是冻结值对象可解析的 JSON 对象"
         raise TypeError(msg)
-    return payload_type(**raw)
+    payload = payload_type(**raw)
+    retain_request: HindsightRetainRequest | None = None
+    if isinstance(payload, HindsightMemoryPayload):
+        retain_request = HindsightRetainRequest.from_json(json.loads(payload.request))
+    return payload, retain_request
 
 
 def _classify_error(error: BaseException) -> tuple[bool, str]:
@@ -163,6 +178,11 @@ def _classify_error(error: BaseException) -> tuple[bool, str]:
     isinstance 类型映射。判定不读异常正文、不读异常类名，也无需
     在模块导入期 require 任何下游插件（error_code 鸭子类型读取）。
     """
+    if isinstance(error, HindsightUnavailableError):
+        # 只使用调用方已经归一化的固定原因码，绝不读取异常正文。
+        if error.reason_code == "document_conflict":
+            return True, "idempotency_conflict"
+        return False, str(error.reason_code)
     error_code = getattr(error, "error_code", None)
     if isinstance(error_code, str):
         permanent = error_code in {"idempotency_conflict", "protocol_violation"}
@@ -197,12 +217,15 @@ class ReplyCommitmentWorkflow:
         proactive_reservation: Any,
         user_data: Any,
         config_getter: Callable[[], Any],
+        *,
+        hindsight_memory: Any | None = None,
     ) -> None:
         self.repository = repository
         self.redis = redis
         self.proactive_reservation = proactive_reservation
         self.user_data = user_data
         self.config_getter = config_getter
+        self.hindsight_memory = hindsight_memory
         self._owner_token = f"commit-{uuid.uuid4().hex}"
         # 父归属缺失的安全持有告警去重（单 worker 部署，进程内即可）。
         self._held_warnings: set[str] = set()
@@ -382,6 +405,11 @@ class ReplyCommitmentWorkflow:
             # 父租约已不属于自己（丢失或被回收），立即中止本轮。
             return False
         parent = await self.repository.load_parent_attribution(fulfillment_id)
+        parent_group_id = (
+            str(parent.get("group_id"))
+            if parent is not None and parent.get("group_id") is not None
+            else None
+        )
         for row in sorted(
             rows,
             key=lambda item: COMMITMENT_ORDER.get(
@@ -397,6 +425,7 @@ class ReplyCommitmentWorkflow:
                 row,
                 lease_lost,
                 claimed,
+                parent_group_id,
             ):
                 return False
         if lease_lost.is_set():
@@ -439,6 +468,7 @@ class ReplyCommitmentWorkflow:
         row: dict[str, Any],
         lease_lost: asyncio.Event,
         claimed: dict[str, Any] | None,
+        parent_group_id: str | None,
     ) -> bool:
         """兑现单个当前到期承诺；返回 False 表示租约已丢失需中止。
 
@@ -450,7 +480,7 @@ class ReplyCommitmentWorkflow:
         """
         commitment_type = str(row["commitment_type"])
         try:
-            payload = _build_payload(commitment_type, row["payload"])
+            payload, retain_request = _build_payload(commitment_type, row["payload"])
         except (TypeError, ValueError):
             if lease_lost.is_set():
                 return await self._mark_failed(
@@ -471,6 +501,19 @@ class ReplyCommitmentWorkflow:
                 commitment_type,
                 payload,
                 claimed,
+                retain_request,
+                parent_group_id,
+            )
+        except HindsightUnavailableError as error:
+            if error.reason_code == "submission_not_admitted":
+                # 最终同步 guard 在 preflight await 之后拒绝：安全持有该
+                # 义务，不写完成标记、不消费失败预算，等待下一次裁决。
+                return False
+            return await self._mark_row_failure(
+                fulfillment_id,
+                commitment_type,
+                error,
+                lease_lost,
             )
         except asyncio.CancelledError:
             raise
@@ -589,12 +632,16 @@ class ReplyCommitmentWorkflow:
         commitment_type: str,
         payload: Any,
         claimed: dict[str, Any] | None,
+        retain_request: HindsightRetainRequest | None,
+        parent_group_id: str | None,
     ) -> None:
         """串行调用对应下游承诺能力；外部副作用依赖既有幂等 ID 恢复。
 
         未解决履约的 Redis 防重证据持久保留（不传 TTL），由终态清理
         在保护期结束后显式删除，避免旧固定 TTL 失效后人工续跑重复
-        副作用。
+        副作用。Hindsight 记忆只把准备阶段冻结的请求提交给共享调用侧；
+        目标指纹不符、配置变化或凭据轮换都由该调用侧按冻结目标裁决，
+        绝不从当前配置重建正文或改投其他地址/记忆库。
         """
         if commitment_type == "proactive_reply_confirmation":
             await self.proactive_reservation.confirm(
@@ -630,24 +677,42 @@ class ReplyCommitmentWorkflow:
             # 尽力吸收进判定自有近期上下文；它不是新的持久业务承诺。
             await self._observe_confirmed_delivery(payload, claimed)
             return
-        if commitment_type == "interaction_history":
-            interaction_record: dict[str, object] = {
-                "version": 1,
-                **dict(payload.record),
-                "display_name": payload.display_name,
-                "timestamp": payload.reply_timestamp,
-                "message_id": payload.trigger_message_id,
-            }
-            await self.redis.push_global_interaction_once(
-                user_id=payload.user_id,
-                record=interaction_record,
-                trigger_size=int(payload.trigger_size),
-                operation_id=fulfillment_id,
-                dedupe_ttl_seconds=None,
-            )
+        if commitment_type == "hindsight_memory":
+            if retain_request is None:
+                msg = "Hindsight 记忆承诺缺少冻结请求"
+                raise TypeError(msg)
+            await self._retain_memory(retain_request, parent_group_id)
             return
         msg = f"不支持的承诺类型: {commitment_type!r}"
         raise TypeError(msg)
+
+    async def _retain_memory(
+        self,
+        request: HindsightRetainRequest,
+        parent_group_id: str | None,
+    ) -> None:
+        """Submit exactly one frozen retain through the accepted shared caller.
+
+        The caller opens a task session pinned to the frozen target
+        fingerprint, so a rotated credential is allowed while a changed
+        endpoint or bank is refused before any SDK I/O. The synchronous
+        ``FACT_FINALIZATION`` guard is supplied for both the preflight and the
+        final submission gate; a denial after the awaited preflight surfaces
+        as ``submission_not_admitted`` and is held by the executor without
+        consuming a retry attempt.
+        """
+        service = self.hindsight_memory
+        if service is None:
+            raise HindsightUnavailableError("configuration_unavailable")
+        async with service.open_session(
+            expected_target_fingerprint=request.target_fingerprint
+        ) as session:
+            await session.retain(
+                request,
+                submission_guard=lambda: (
+                    reply_fulfillment_finalization_granted(group_id=parent_group_id)
+                ),
+            )
 
     async def _observe_confirmed_delivery(
         self,

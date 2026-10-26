@@ -21,17 +21,14 @@ SimpleNamespace 绕过 Pydantic 构造线上不可能状态。
 from __future__ import annotations
 
 import asyncio
-import sys
-import types
 from importlib import import_module
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-import komari_bot.plugins as plugins_package
+from komari_bot.context.redis_store import MessageSchema
 from komari_bot.plugins.agent_run_logger.diagnostic import AgentRunCollector
-from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
 from komari_bot.plugins.llm_provider.base_client import (
     LLMCompletionResultSchema,
     LLMProviderContinuationSchema,
@@ -39,7 +36,7 @@ from komari_bot.plugins.llm_provider.base_client import (
     LLMToolCallSchema,
 )
 
-retry_module = import_module("komari_bot.plugins.komari_memory.core.retry")
+retry_module = import_module("komari_bot.core.retry")
 agent_budget_module = import_module(
     "komari_bot.plugins.komari_chat.services.agent_budget"
 )
@@ -54,6 +51,10 @@ prompt_builder_module = import_module(
 )
 
 from tests.config.prompt_field_contract import prompt_marker_values
+from tests.komari_chat.hindsight_recall_support import (
+    FakeHindsightMemory,
+    fake_recall_session,
+)
 
 # ── 基础替身 ────────────────────────────────────────────────────────────
 
@@ -171,22 +172,6 @@ class _FakeRedis:
         return []
 
 
-class _FakeMemory:
-    async def search_conversations(self, **_kwargs: object) -> list[dict[str, object]]:
-        return []
-
-    async def search_interaction_events(
-        self, **_kwargs: object
-    ) -> list[dict[str, object]]:
-        return []
-
-    async def get_user_profile(
-        self, *, user_id: str, group_id: str
-    ) -> dict[str, object]:
-        del user_id, group_id
-        return {"display_name": "测试用户", "traits": {}}
-
-
 class _FakeQueryRewrite:
     async def rewrite_query(
         self,
@@ -194,12 +179,6 @@ class _FakeQueryRewrite:
         **_kwargs: object,
     ) -> str:
         return current_query
-
-
-class _FakeEmbeddingProvider:
-    async def embed(self, text: str) -> list[float]:
-        del text
-        return [0.1, 0.2]
 
 
 class _FakeUserData:
@@ -260,7 +239,7 @@ def _build_config(**overrides: Any) -> SimpleNamespace:
 
 
 def _build_chat_config_stub(**overrides: Any) -> SimpleNamespace:
-    """handler 级测试使用的合并配置替身（get_config 与 get_memory_config 共用）。"""
+    """handler 级测试使用的合并配置替身（get_config 与 get_context_config 共用）。"""
     values: dict[str, Any] = {
         "proactive_enabled": False,
         "context_messages_limit": 10,
@@ -274,7 +253,7 @@ def _build_chat_config_stub(**overrides: Any) -> SimpleNamespace:
         "global_interaction_trigger_size": 20,
         "face_reaction_enabled": False,
         "face_reaction_id": "76",
-        # TSK-194：图片理解模式（合并替身承载 get_config/get_memory_config）
+        # TSK-194：图片理解模式（合并替身承载 get_config/get_context_config）
         "image_understanding_mode": "delegated",
         "error_notify_enabled": False,
         "knowledge_enabled": False,
@@ -290,9 +269,7 @@ def _build_chat_config_stub(**overrides: Any) -> SimpleNamespace:
     # no-fallback，fixture 必须显式提供，避免隐式回退默认值）。
     values.setdefault("vision_image_download_max_count", 4)
     values.setdefault("vision_image_download_max_bytes", 8 * 1024 * 1024)
-    values.setdefault(
-        "vision_image_download_total_max_bytes", 20 * 1024 * 1024
-    )
+    values.setdefault("vision_image_download_total_max_bytes", 20 * 1024 * 1024)
     values.setdefault("vision_image_download_max_pixels", 40_000_000)
     values.setdefault("vision_image_download_concurrency", 2)
     values.setdefault("vision_image_download_connect_timeout_seconds", 5.0)
@@ -314,12 +291,12 @@ def _wire_handler(
         message_handler_module.MessageHandler
     )
     handler.redis = _FakeRedis()
-    handler.memory = _FakeMemory()
+    handler.hindsight_memory = FakeHindsightMemory()
     handler.query_rewrite = _FakeQueryRewrite()
     handler._reaction_tasks = set()
 
     monkeypatch.setattr(message_handler_module, "get_config", lambda: config)
-    monkeypatch.setattr(message_handler_module, "get_memory_config", lambda: config)
+    monkeypatch.setattr(message_handler_module, "get_context_config", lambda: config)
     monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
     monkeypatch.setattr(
         message_handler_module,
@@ -337,13 +314,6 @@ def _wire_handler(
         SimpleNamespace(search_web=search.search_web, fetch_page=search.fetch_page),
     )
 
-    embedding_package_name = "komari_bot.plugins.embedding_provider"
-    embedding_fake = types.ModuleType(embedding_package_name)
-    embedding_fake.embed = _FakeEmbeddingProvider().embed  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, embedding_package_name, embedding_fake)
-    monkeypatch.setattr(
-        plugins_package, "embedding_provider", embedding_fake, raising=False
-    )
     monkeypatch.setattr(retry_module.asyncio, "sleep", _no_sleep)
     return handler, search
 
@@ -403,6 +373,7 @@ def test_normal_entry_uses_configured_budget(monkeypatch: pytest.MonkeyPatch) ->
             reply_context_refetched=False,
             force_reply=True,
             reason="platform_summon",
+            recall_session=fake_recall_session(handler.hindsight_memory),
             store_current=True,
         )
     )
@@ -571,6 +542,7 @@ def test_normal_entry_freezes_budget_snapshot_across_rounds(
             reply_context_refetched=False,
             force_reply=True,
             reason="platform_summon",
+            recall_session=fake_recall_session(handler.hindsight_memory),
             store_current=True,
         )
     )
@@ -1030,7 +1002,9 @@ def test_public_entries_have_no_max_tool_rounds_parameter() -> None:
 # ── TSK-193：工具调用约束模式与裸文本硬协议 ────────────────────────────
 
 
-def _marker_template(*, instruction: str = "MARKER-工具调用指令-必须调用final_response") -> Any:
+def _marker_template(
+    *, instruction: str = "MARKER-工具调用指令-必须调用final_response"
+) -> Any:
     """经公开 Prompt loader seam 注入的完整 marker Prompt 快照。"""
     template = dict(prompt_marker_values("komari_chat"))
     template["tool_call_instruction"] = instruction
@@ -1102,7 +1076,6 @@ def test_prompt_guided_simple_entry_omits_tool_choice_and_injects_marker(
     messages = asyncio.run(
         prompt_builder_module.build_prompt(
             user_message="你好",
-            memories=[],
             config=config,
         )
     )
@@ -1115,8 +1088,12 @@ def test_prompt_guided_simple_entry_omits_tool_choice_and_injects_marker(
 
     call = provider.completion_calls[0]
     assert "tool_choice" not in call, "prompt_guided 不得发送 tool_choice 参数"
-    rendered = "\n".join(str(message.get("content", "")) for message in call["messages"])
-    assert marker in rendered, "请求 messages 必须包含数据库 tool_call_instruction marker"
+    rendered = "\n".join(
+        str(message.get("content", "")) for message in call["messages"]
+    )
+    assert marker in rendered, (
+        "请求 messages 必须包含数据库 tool_call_instruction marker"
+    )
 
 
 def _template_loader(template: dict[str, str]) -> Any:
@@ -1185,6 +1162,7 @@ def test_prompt_guided_normal_and_debug_entries_match_simple_entry(
                 reply_context_refetched=False,
                 force_reply=True,
                 reason="platform_summon",
+                recall_session=fake_recall_session(handler.hindsight_memory),
                 store_current=True,
             )
         )
@@ -1194,7 +1172,9 @@ def test_prompt_guided_normal_and_debug_entries_match_simple_entry(
 
     call = provider.completion_calls[0]
     assert "tool_choice" not in call, f"{entry} 入口 prompt_guided 不得发送 tool_choice"
-    rendered = "\n".join(str(message.get("content", "")) for message in call["messages"])
+    rendered = "\n".join(
+        str(message.get("content", "")) for message in call["messages"]
+    )
     assert marker in rendered, f"{entry} 入口请求 messages 必须包含 marker"
 
 
@@ -1330,6 +1310,7 @@ def test_handler_reports_incompatible_provider_rejection_as_reply_failure(
             reply_context_refetched=False,
             force_reply=True,
             reason="platform_summon",
+            recall_session=fake_recall_session(handler.hindsight_memory),
             store_current=True,
         )
     )
@@ -1360,7 +1341,10 @@ def test_agent_run_records_frozen_tool_mode_violation_and_usage(
     )
     continuation = LLMProviderContinuationSchema(
         api="responses",
-        output_items=[{"type": "message", "id": "msg_1"}, {"type": "reasoning", "id": "rs_1"}],
+        output_items=[
+            {"type": "message", "id": "msg_1"},
+            {"type": "reasoning", "id": "rs_1"},
+        ],
     )
     provider = _ScriptedProvider(
         [
@@ -1494,9 +1478,9 @@ def test_consecutive_bare_text_until_rounds_exhausted_is_diagnosable_protocol_fa
     assert len(provider.completion_calls) == 2, "必须恰好消耗配置轮次，无隐藏纠错轮"
     assert "未调用任何工具" in str(excinfo.value)
     second_messages = provider.completion_calls[1]["messages"]
-    assert not any(
-        message.get("role") == "assistant" for message in second_messages
-    ), "裸文本轮不得作为 assistant 消息进入下一轮"
+    assert not any(message.get("role") == "assistant" for message in second_messages), (
+        "裸文本轮不得作为 assistant 消息进入下一轮"
+    )
     assert record["budget"]["rounds_used"] == 2
     assert record["budget"]["tool_calls_used"] == 0
     assert record["errors"], "轮次耗尽协议失败必须进入诊断错误列表"

@@ -50,20 +50,20 @@ require("agent_run_logger")
 require("character_binding")
 require("komari_decision")
 
-require("komari_memory")
+require("komari_context")
 from komari_bot.plugins.group_admission import (
     AdmissionQualification,
     adjudicate,
 )
-from komari_bot.plugins.komari_memory import KomariMemoryConfigSchema
+from komari_bot.plugins.komari_context import KomariContextConfigSchema
 
 config_manager = config_manager_plugin.get_config_manager(
     "group_history_summary", DynamicConfigSchema
 )
-# 失败通知开关复用 config_manager 唯一注册表里的 komari_memory 资源（不建立
+# 失败通知开关复用 config_manager 唯一注册表里的 komari_context 资源（不建立
 # 平行缓存）；每次通知都读取当前值。
-_memory_config_manager = config_manager_plugin.get_config_manager(
-    "komari_memory", KomariMemoryConfigSchema
+_context_config_manager = config_manager_plugin.get_config_manager(
+    "komari_context", KomariContextConfigSchema
 )
 
 __plugin_meta__ = PluginMetadata(
@@ -167,7 +167,7 @@ async def _evaluate_summary_candidate(  # noqa: PLR0911 - 每个停止分支都�
         # 先停止两条业务路径，再做任何通知 await。
         _stop_both_paths()
         # 失败通知资格与重复事实完全由判定引擎的持久行拥有：领不到资格
-        #（重复事件、停用、撤权、中断等既有静默终态）时什么都不发。
+        # （重复事件、停用、撤权、中断等既有静默终态）时什么都不发。
         try:
             claimed = await dispatch.claim_handoff("failure_notification")
         except Exception:
@@ -179,14 +179,14 @@ async def _evaluate_summary_candidate(  # noqa: PLR0911 - 每个停止分支都�
                 result.reason_code,
             )
             return None
-        # 通知开关复用既有 config_manager 的 komari_memory 资源；读取失败只
+        # 通知开关复用既有 config_manager 的 komari_context 资源；读取失败只
         # 静默私聊诊断（固定群提示保留，不打印原始异常）。
         notify_superusers = False
         try:
-            memory_config = cast(
-                "KomariMemoryConfigSchema", _memory_config_manager.get()
+            context_config = cast(
+                "KomariContextConfigSchema", _context_config_manager.get()
             )
-            notify_superusers = bool(memory_config.error_notify_enabled)
+            notify_superusers = bool(context_config.error_notify_enabled)
         except Exception:
             logger.debug(
                 "[GroupHistorySummary] 失败通知开关读取失败，静默 SUPERUSER 私聊"
@@ -251,9 +251,7 @@ async def handle_group_history_summary(  # noqa: PLR0911 - 每个门禁都是独
         return
 
     if not await check_group_history_supported(bot):
-        logger.info(
-            "[GroupHistorySummary] 当前 OneBot 实现不支持群历史，放行消息传播"
-        )
+        logger.info("[GroupHistorySummary] 当前 OneBot 实现不支持群历史，放行消息传播")
         return
 
     evaluated = await _evaluate_summary_candidate(bot, event, state)

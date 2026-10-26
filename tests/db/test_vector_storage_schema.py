@@ -10,81 +10,8 @@ from komari_bot.db.vector_storage_schema import (
     build_help_schema_statements,
     build_knowledge_embedding_index_statement,
     build_knowledge_schema_statements,
-    build_memory_schema_statements,
     render_schema_statements,
 )
-
-
-def test_build_memory_schema_statements_uses_requested_dimension() -> None:
-    statements = build_memory_schema_statements(1536)
-    assert "VECTOR(1536)" not in statements[1]
-    assert "importance_current INT DEFAULT 3" in statements[1]
-    assert "dedup_key VARCHAR(64)" in statements[1]
-    assert any(
-        "CREATE TABLE IF NOT EXISTS komari_memory_conversation_embeddings" in statement
-        and "embedding VECTOR(1536) NOT NULL" in statement
-        for statement in statements
-    )
-    assert any(
-        "CREATE TABLE IF NOT EXISTS komari_memory_interaction_embeddings" in statement
-        and "embedding VECTOR(1536) NOT NULL" in statement
-        for statement in statements
-    )
-    assert any("ADD COLUMN IF NOT EXISTS dedup_key VARCHAR(64)" in statement for statement in statements)
-    assert any(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_komari_memory_conv_dedup_key" in statement
-        and "WHERE dedup_key IS NOT NULL" in statement
-        for statement in statements
-    )
-    assert any(
-        "CREATE TABLE IF NOT EXISTS komari_memory_jobs" in statement
-        and "PRIMARY KEY (job_name, run_date)" in statement
-        and "lease_until TIMESTAMPTZ NOT NULL" in statement
-        for statement in statements
-    )
-    assert any(
-        "CREATE INDEX IF NOT EXISTS idx_komari_memory_jobs_lease" in statement
-        and "WHERE stage <> 'completed'" in statement
-        for statement in statements
-    )
-    assert any(
-        "ALTER COLUMN importance_current TYPE INTEGER" in statement
-        for statement in statements
-    )
-    assert any("komari_memory_user_profile" in statement for statement in statements)
-    assert any(
-        "komari_memory_interaction_history" in statement for statement in statements
-    )
-    assert any(
-        "ADD COLUMN IF NOT EXISTS source_dedup_key VARCHAR(64)" in statement
-        for statement in statements
-    )
-    assert any(
-        "CREATE UNIQUE INDEX IF NOT EXISTS "
-        "idx_komari_memory_interaction_source_dedup" in statement
-        and "WHERE source_dedup_key IS NOT NULL" in statement
-        for statement in statements
-    )
-    assert any(
-        "DROP INDEX IF EXISTS idx_komari_memory_interaction_embedding" in statement
-        for statement in statements
-    )
-    assert any(
-        "DROP COLUMN IF EXISTS embedding" in statement for statement in statements
-    )
-    assert any(
-        "idx_komari_memory_conv_embedding_vector" in statement for statement in statements
-    )
-    assert any(
-        "idx_komari_memory_interaction_embedding_vector" in statement
-        for statement in statements
-    )
-    legacy_migration = next(
-        statement
-        for statement in statements
-        if "旧互动历史表已重命名" in statement
-    )
-    assert legacy_migration.count("table_schema = current_schema()") == 3
 
 
 def test_render_schema_statements_preserves_blocks_and_adds_semicolons() -> None:
@@ -173,4 +100,4 @@ def test_build_help_schema_statements_skip_hnsw_for_unsupported_dimension() -> N
 
 def test_build_schema_statements_reject_invalid_dimension() -> None:
     with pytest.raises(ValueError, match="非法 embedding 维度"):
-        build_memory_schema_statements(0)
+        build_knowledge_schema_statements(0)

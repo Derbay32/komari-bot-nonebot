@@ -6,7 +6,7 @@ Komari Knowledge 常识库插件。
 
 from __future__ import annotations
 
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from nonebot import get_driver, logger
 from nonebot.plugin import PluginMetadata, require
@@ -22,6 +22,9 @@ from .engine import (
     initialize_engine,
 )
 from .models import KnowledgeCategory, KnowledgeEntry, KnowledgeListResponse
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 # 依赖其他插件
 require("config_manager")
@@ -100,11 +103,14 @@ async def search_knowledge(
     query: str,
     limit: int | None = None,
     query_embedding: list[float] | None = None,
+    *,
+    embedding_guard: Callable[[], bool] | None = None,
 ) -> list[SearchResult]:
     """
     检索相关知识。
 
-    这是供其他插件调用的主要接口。
+    这是供其他插件调用的主要接口。``embedding_guard`` 只保护需要即时
+    生成查询向量的聊天调用；不传时保持独立知识调用方的既有语义。
     """
     engine = get_engine()
     if engine is None:
@@ -115,7 +121,12 @@ async def search_knowledge(
     if not config.plugin_enable:
         return []
 
-    return await engine.search(query, limit, query_vec=query_embedding)
+    return await engine.search(
+        query,
+        limit,
+        query_vec=query_embedding,
+        embedding_guard=embedding_guard,
+    )
 
 
 async def search_by_keyword(keyword: str) -> list[SearchResult]:

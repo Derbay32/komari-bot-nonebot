@@ -675,7 +675,6 @@ def build_management_components() -> Any:
     from komari_bot.plugins.komari_management.managed_resources import (
         ManagedConfigResource,
     )
-    from komari_bot.plugins.komari_memory.api import register_memory_api
     from komari_bot.plugins.komari_search.api import register_search_api
     from komari_bot.plugins.user_ban.api import register_user_ban_api
 
@@ -690,9 +689,6 @@ def build_management_components() -> Any:
         knowledge_engine_getter=lambda: None,
         register_help_api=register_help_api,
         help_engine_getter=lambda: None,
-        register_memory_api=register_memory_api,
-        memory_service_getter=lambda: None,
-        memory_redis_getter=lambda: None,
         register_agent_run_log_api=register_agent_run_log_api,
         agent_run_log_reader_getter=lambda: None,
         register_search_api=register_search_api,

@@ -5,15 +5,18 @@
 删除；回复履约另有独立的回复时效字段
 ``reply_fulfillment_freshness_seconds``（TSK-81）。TSK-87 contract 后
 旧 outbox 时代的配置名已整体改名为 ``reply_fulfillment_*``，并新增
-``reply_fulfillment_retry_max_seconds`` 退避上限字段。
+``reply_fulfillment_retry_max_seconds`` 退避上限字段。TSK-192 phase B 起
+聊天生成槽位、常识库/上下文预算、表情反应、聊天开关与查询重写槽位也由
+本表独立拥有。
 """
 
-from typing import ClassVar, Literal
+from typing import Any, ClassVar, Literal
 
-from pydantic import model_validator
+from pydantic import field_validator, model_validator
 from sqlalchemy import CheckConstraint, Column, String
 
 from komari_bot.config.typed_config import Field, TypedConfigModel, typed_model_config
+from komari_bot.llm.llm_protocol import RequestApi
 
 
 class KomariChatConfigSchema(TypedConfigModel, table=True):
@@ -49,6 +52,120 @@ class KomariChatConfigSchema(TypedConfigModel, table=True):
             "vision_image_download_connect_timeout_seconds",
             name="ck_komari_chat_config_image_budget_timeout",
         ),
+    )
+
+    # 插件控制（TSK-192 phase B：chat 自己的业务开关）
+    plugin_enable: bool = Field(
+        default=False,
+        description="插件启用状态",
+        json_schema_extra={"apply_mode": "restart"},
+    )
+
+    # LLM 配置 - 对话模型（用于生成回复）
+    llm_model_chat: str = Field(
+        default="gemini-3-flash-preview", description="对话使用模型"
+    )
+    llm_temperature_chat: float = Field(
+        default=1.0, ge=0.0, le=2.0, description="对话模型温度参数"
+    )
+    llm_max_tokens_chat: int = Field(
+        default=4000, ge=20, le=8192, description="对话模型最大 token 数"
+    )
+    llm_request_api_chat: RequestApi = Field(
+        default="chat_completions",
+        sa_column=Column(String(32), nullable=False, default="chat_completions"),
+        description=(
+            "对话模型请求 API：chat_completions=OpenAI Chat Completions，"
+            "responses=OpenAI Responses。修改后从下一个业务任务开始生效。"
+        ),
+    )
+    llm_stream_enabled_chat: bool = Field(
+        default=False,
+        description=(
+            "对话模型是否启用流式传输（仅在网关内部聚合，业务插件无感知）。"
+            "修改后从下一个业务任务开始生效。"
+        ),
+    )
+    llm_thinking_mode_chat: bool = Field(
+        default=False,
+        description=(
+            "聊天主模型是否处于思考模式。"
+            "deepseek-v4 系模型默认开启思考，置 False 会注入 thinking:disabled 关闭；"
+            "其他模型置 True 时按 llm_reasoning_effort_chat 开启思考。"
+            "思考模式启用时将跳过 tool_choice 注入。"
+        ),
+    )
+    llm_reasoning_effort_chat: str = Field(
+        default="",
+        description=(
+            "聊天主模型思考强度（仅 thinking_mode=True 且非 deepseek-v4 系时生效）。"
+            "可选：minimal/low/medium/high；为空时不发送 reasoning_effort。"
+        ),
+    )
+    assistant_prefill_enabled: bool = Field(
+        default=False,
+        description="是否启用旧版 assistant 预填充消息（memory_ack 与 cot_prefix）",
+    )
+    dsv4_roleplay_instruct_mode: str = Field(
+        default="auto",
+        description=(
+            "DeepSeek V4 角色扮演思考指令注入模式："
+            "disabled=关闭，auto=仅 deepseek-v4 模型注入角色沉浸指令，"
+            "inner_os=强制角色沉浸，no_inner_os=强制纯分析"
+        ),
+    )
+
+    # 常识库与聊天检索配置
+    knowledge_enabled: bool = Field(default=True, description="是否启用常识库集成")
+    knowledge_limit: int = Field(
+        default=3, ge=1, le=10, description="常识库检索数量限制"
+    )
+    context_messages_limit: int = Field(
+        default=10, ge=5, le=50, description="获取最近消息上下文的最大数量"
+    )
+    context_max_utf8_bytes: int = Field(
+        default=24_000,
+        ge=1_024,
+        le=131_072,
+        description="单次聊天近期消息上下文的 UTF-8 字节预算",
+    )
+    context_max_estimated_tokens: int = Field(
+        default=6_000,
+        ge=256,
+        le=32_000,
+        description="单次聊天近期消息上下文的估算 token 预算",
+    )
+
+    # 表情反应配置
+    face_reaction_enabled: bool = Field(
+        default=False,
+        description="是否在触发聊天回复后对用户消息添加表情反应，用于提示正在生成回复",
+    )
+    face_reaction_id: str = Field(
+        default="76",
+        description="表情反应的 Face ID（QQ 表情 ID），如 76=赞。仅 face_reaction_enabled=true 时生效",
+    )
+
+    # 查询重写专用槽位（值一次性从 memory 总结槽位迁移，之后独立拥有）
+    query_rewrite_model: str = Field(
+        default="deepseek-v4-flash", description="查询重写使用模型"
+    )
+    query_rewrite_request_api: RequestApi = Field(
+        default="chat_completions",
+        sa_column=Column(String(32), nullable=False, default="chat_completions"),
+        description="查询重写模型请求 API。语义同 llm_request_api_summary。",
+    )
+    query_rewrite_stream_enabled: bool = Field(
+        default=False,
+        description="查询重写模型是否启用流式传输。语义同 llm_stream_enabled_summary。",
+    )
+    query_rewrite_thinking_mode: bool = Field(
+        default=False,
+        description="查询重写模型是否处于思考模式。语义同 llm_thinking_mode_summary。",
+    )
+    query_rewrite_reasoning_effort: str = Field(
+        default="",
+        description="查询重写模型思考强度。语义同 llm_reasoning_effort_summary。",
     )
 
     # 主动回复配置
@@ -160,9 +277,7 @@ class KomariChatConfigSchema(TypedConfigModel, table=True):
     # 但裸文本仍不构成成功回复。无兼容值/宽松规范化。
     agent_tool_call_mode: Literal["required", "prompt_guided"] = Field(
         default="required",
-        sa_column=Column(
-            String(32), nullable=False, default="required"
-        ),
+        sa_column=Column(String(32), nullable=False, default="required"),
         description=(
             "回复 Agent 工具调用约束模式：required=每轮强制模型提出工具调用；"
             "prompt_guided=省略服务端强制工具参数，仅经数据库 Prompt 引导"
@@ -175,9 +290,7 @@ class KomariChatConfigSchema(TypedConfigModel, table=True):
     # alias / 双读 / fallback。
     image_understanding_mode: Literal["native", "delegated"] = Field(
         default="delegated",
-        sa_column=Column(
-            String(32), nullable=False, default="delegated"
-        ),
+        sa_column=Column(String(32), nullable=False, default="delegated"),
         description=(
             "图片理解模式：native=图片经安全下载与校验后作为多模态输入直接"
             "给聊天主模型（不声明 read_image 工具）；delegated=向回复 Agent "
@@ -243,14 +356,20 @@ class KomariChatConfigSchema(TypedConfigModel, table=True):
         json_schema_extra={"apply_mode": "immediate"},
     )
 
+    @field_validator("dsv4_roleplay_instruct_mode", mode="before")
+    @classmethod
+    def normalize_dsv4_roleplay_instruct_mode(cls, value: Any) -> str:
+        """规范化 DeepSeek V4 角色扮演指令注入模式。"""
+        normalized = str(value or "auto").strip().lower()
+        if normalized not in {"disabled", "auto", "inner_os", "no_inner_os"}:
+            return "auto"
+        return normalized
+
     @model_validator(mode="after")
     def _validate_agent_budget(self) -> "KomariChatConfigSchema":
         """跨字段校验：单轮预算 <= 总预算 <= 轮次 x 单轮预算。"""
         if self.agent_max_tool_calls_per_round > self.agent_max_total_tool_calls:
-            msg = (
-                "agent_max_tool_calls_per_round 不能大于 "
-                "agent_max_total_tool_calls"
-            )
+            msg = "agent_max_tool_calls_per_round 不能大于 agent_max_total_tool_calls"
             raise ValueError(msg)
         if (
             self.agent_max_total_tool_calls

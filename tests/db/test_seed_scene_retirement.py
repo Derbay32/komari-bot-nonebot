@@ -2,7 +2,7 @@
 
 覆盖契约要求的播种侧正向证据：
 
-1. 全新库 ``upgrade head``（0025）后执行真实播种 CLI：三项必需 Prompt 行与
+1. 全新库 ``upgrade head``（0028）后执行真实播种 CLI：三项必需 Prompt 行与
    可选判定 Prompt 行完整落库，4 张退役场景表仍不存在，且播种没有新建任何
    数据表；
 2. 重复播种：Prompt 行（正文 / revision / updated_at）零变化，退役场景表
@@ -189,8 +189,8 @@ async def test_prompt_only_seed_initializes_at_head_without_retired_tables() -> 
         result = run_seed(url)
         output = f"{result.stdout}\n{result.stderr}"
         assert result.returncode == 0, output
-        assert "新建 4 行" in output, (
-            f"播种报告必须确认三项必需 Prompt 与可选判定 Prompt 均新建单行: {output}"
+        assert "新建 3 行" in output, (
+            f"播种报告必须确认两项必需 Prompt 与可选判定 Prompt 均新建单行: {output}"
         )
 
         connection = await asyncpg.connect(**scratch)

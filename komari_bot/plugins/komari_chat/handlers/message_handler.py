@@ -8,6 +8,7 @@ import time
 import traceback
 import uuid
 from collections.abc import Callable, Coroutine
+from contextlib import AsyncExitStack
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, runtime_checkable
 
@@ -26,6 +27,7 @@ from komari_bot.decision.jev import (  # noqa: TC001 - 消费方注解的契约�
     DecisionRequest,
     DecisionResult,
 )
+from komari_bot.llm.content_budget import QUERY_TEXT_BUDGET, normalize_required_text
 from komari_bot.onebot import (
     GroupTaskFailureNotification,
     GroupTaskFailureNotifier,
@@ -33,13 +35,17 @@ from komari_bot.onebot import (
     RedisFailureNotificationCooldown,
     image_failure_reason_code,
 )
-from komari_bot.plugins.komari_memory import MessageSchema, RedisManager
+from komari_bot.plugins.komari_context import (
+    MessageSchema,
+    RecentContextStore,
+    get_context_config,
+)
 from komari_bot.plugins.llm_provider.config_schema import DynamicConfigSchema
 
 from ..reply_fulfillment_domain import build_reply_fulfillment_id
 from ..services.admission_gate import effect_business_admitted
 from ..services.agent_budget import AgentExecutionBudget
-from ..services.config_interface import get_config, get_memory_config
+from ..services.config_interface import get_config
 from ..services.image_downloader import (
     download_images_as_base64_aligned,
     extract_image_sources,
@@ -53,15 +59,15 @@ from ..services.image_understanding import ImageUnderstandingPolicy
 from ..services.llm_service import (
     FETCH_PAGE_TOOL,
     READ_IMAGE_TOOL,
-    READ_PROFILE_TOOL,
+    RECALL_MEMORY_TOOL,
     RECORD_FAVORABILITY_DELTA_TOOL,
     SEARCH_WEB_TOOL,
-    InteractionHistoryRecord,
     NativeMultimodalRequestError,
     ReplyResult,
     generate_reply,
     generate_reply_with_tools,
 )
+from ..services.memory_candidate import build_candidate_retain_request
 from ..services.proactive_reservation import ReservationDenied, ReservationLostError
 from ..services.prompt_builder import build_prompt
 from ..services.query_rewrite_service import QueryRewriteService
@@ -87,7 +93,10 @@ if TYPE_CHECKING:
     from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
 
     from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
-    from komari_bot.plugins.komari_memory import MemoryService
+    from komari_bot.plugins.komari_memory import (
+        HindsightMemoryService,
+        HindsightRecallSession,
+    )
 
     from ..services.proactive_reservation import (
         ProactiveLease,
@@ -104,6 +113,7 @@ ReplyAction = Literal[
     "generation_failed",
     "blocked_by_user_ban",
     "decision_unavailable",
+    "memory_failed",
 ]
 ReplyTriggeredCallback = Callable[[], Coroutine[Any, Any, None]]
 
@@ -129,7 +139,6 @@ class DebugReplyResult:
     reply_to_message_id: str | None
     favorability_delta: int | None
     favorability_reason: str | None
-    interaction_history: InteractionHistoryRecord | None
     collector: LLMDiagnosticCollector
 
 
@@ -153,6 +162,7 @@ class PendingReply:
     fulfillment_id: str
     request_trace_id: str
     reply_timestamp: float
+    hindsight_target_fingerprint: str
     proactive_reservation_id: str | None = None
     proactive_handoff: ReservationHandoff | None = None
     reaction_sent: bool = False
@@ -160,6 +170,8 @@ class PendingReply:
 
 
 GROUP_ERROR_TEXT = "啊、啊呜……对不起，脑袋里刚才突然乱成一团了……"
+_MEDIA_ONLY_RECALL_QUERY = "当前交流"
+_MEMORY_CANDIDATE_FAILED = "memory_candidate_failed"
 
 
 @dataclass(frozen=True)
@@ -238,6 +250,20 @@ def _native_failure_summary(
     )
 
 
+def _memory_failure_code(error: BaseException) -> str:
+    """Return one fixed safe memory-failure code, never exception text.
+
+    Only the actual shared caller error owns a closed, normalized reason-code
+    set.  Every other exception is mapped to one fixed local code; arbitrary
+    ``reason_code`` attributes are never inspected or copied.
+    """
+    from komari_bot.plugins.komari_memory import HindsightUnavailableError
+
+    if isinstance(error, HindsightUnavailableError):
+        return error.reason_code
+    return _MEMORY_CANDIDATE_FAILED
+
+
 class _FavorabilityReadError(RuntimeError):
     """读取当前好感度失败。"""
 
@@ -247,15 +273,15 @@ class MessageHandler:
 
     def __init__(
         self,
-        redis: RedisManager,
-        memory: MemoryService,
+        redis: RecentContextStore,
+        hindsight_memory: HindsightMemoryService,
         reply_fulfillment: ReplyFulfillmentQueryProtocol,
         proactive_reservation: ProactiveReservationService,
         decision_engine: DecisionEngineProtocol,
     ) -> None:
         """初始化消息处理器。"""
         self.redis = redis
-        self.memory = memory
+        self.hindsight_memory = hindsight_memory
         self.reply_fulfillment = reply_fulfillment
         self.query_rewrite = QueryRewriteService()
         self._reaction_tasks: set[asyncio.Task[None]] = set()
@@ -428,6 +454,7 @@ class MessageHandler:
         result: DecisionResult,
         reply_action: ReplyAction,
         reason: AttemptReplyReason | None = None,
+        memory_failure_reason: str | None = None,
     ) -> dict[str, object]:
         """投影本次判定的安全诊断事实（无正文、无提示词、无旧评分字段）。"""
         return {
@@ -453,13 +480,14 @@ class MessageHandler:
             "summary_probability": self._safe_round(result.summary_probability),
             "reply_action": reply_action,
             "reply_reason": reason,
+            "memory_failure_reason": memory_failure_reason,
         }
 
     def _log_decision(self, payload: dict[str, object]) -> None:
         """输出判定日志：安全类型化事实，绝不回显正文或提示词。"""
         logger.info(
             "[KomariMemory] decision_summary group={} user={} msg={} "
-            "status={} reason={} route={} reply={} effective={} draw={}",
+            "status={} reason={} route={} reply={} effective={} draw={} memory_failure={}",
             payload.get("group_id"),
             payload.get("user_id"),
             payload.get("message_id"),
@@ -469,6 +497,7 @@ class MessageHandler:
             payload.get("reply_action"),
             payload.get("effective_reply"),
             payload.get("optional_selected"),
+            payload.get("memory_failure_reason"),
         )
         logger.debug(
             "[KomariMemory] decision_full={}",
@@ -579,9 +608,7 @@ class MessageHandler:
             # 表示不逐条刷群）。资格与重复事实由判定引擎的持久行拥有；设置/投递
             # 失败只记录安全诊断，绝不产生群错误、重试或第二条业务路径。
             try:
-                claimed = await decision_dispatch.claim_handoff(
-                    "failure_notification"
-                )
+                claimed = await decision_dispatch.claim_handoff("failure_notification")
             except Exception:
                 claimed = False
                 logger.error("[KomariChat] 判定失败通知资格领取异常")
@@ -594,14 +621,11 @@ class MessageHandler:
             notify_superusers = False
             chat_enabled = False
             try:
-                memory_config = get_memory_config()
-                notify_superusers = bool(memory_config.error_notify_enabled)
-                chat_enabled = bool(memory_config.plugin_enable)
+                notify_superusers = bool(get_context_config().error_notify_enabled)
+                chat_enabled = bool(get_config().plugin_enable)
             except Exception:
                 # 读取失败只静默私聊诊断（不打印原始异常，避免泄漏运行环境细节）。
-                logger.debug(
-                    "[KomariChat] 失败通知配置读取失败，静默 SUPERUSER 私聊"
-                )
+                logger.debug("[KomariChat] 失败通知配置读取失败，静默 SUPERUSER 私聊")
             if notify_superusers:
                 try:
                     # 通知前最后复检：聊天功能开关与目标群 BUSINESS 准入。
@@ -628,22 +652,29 @@ class MessageHandler:
                             ),
                         )
                     else:
-                        logger.debug(
-                            "[KomariChat] 判定失败通知复检未通过，保持静默"
-                        )
+                        logger.debug("[KomariChat] 判定失败通知复检未通过，保持静默")
                 except Exception:
                     logger.error("[KomariChat] 判定失败通知上报异常")
             return None
 
         if result.route != "chat":
             await self._store_or_drop(message, memory_candidate=memory_candidate)
+            failure_reason: str | None = None
+            if memory_candidate:
+                failure_reason = await self._submit_candidate_standalone(
+                    request=request,
+                    group_id=group_id,
+                )
             self._log_decision(
                 self._build_decision_payload(
                     group_id=group_id,
                     user_id=user_id,
                     message_id=message_id,
                     result=result,
-                    reply_action="not_replied",
+                    reply_action=(
+                        "memory_failed" if failure_reason is not None else "not_replied"
+                    ),
+                    memory_failure_reason=failure_reason,
                 )
             )
             return None
@@ -651,13 +682,24 @@ class MessageHandler:
         if not reply_allowed:
             # 聊天封禁仍允许分类与合格原文保存，但禁止回复生成与交接。
             await self._store_or_drop(message, memory_candidate=memory_candidate)
+            failure_reason = None
+            if memory_candidate:
+                failure_reason = await self._submit_candidate_standalone(
+                    request=request,
+                    group_id=group_id,
+                )
             self._log_decision(
                 self._build_decision_payload(
                     group_id=group_id,
                     user_id=user_id,
                     message_id=message_id,
                     result=result,
-                    reply_action="blocked_by_user_ban",
+                    reply_action=(
+                        "memory_failed"
+                        if failure_reason is not None
+                        else "blocked_by_user_ban"
+                    ),
+                    memory_failure_reason=failure_reason,
                 )
             )
             return None
@@ -699,21 +741,97 @@ class MessageHandler:
         )
 
         reason = self._attempt_reason(request, result)
-        pending_reply, stored, failure = await self._attempt_reply(
-            message=message,
-            reply_to_message_id=message_id,
-            image_urls=image_urls,
-            reply_context=reply_context_result.context,
-            reply_context_requested=platform_summoned and event.reply is not None,
-            reply_context_refetched=reply_context_result.refetched,
-            force_reply=result.force_reply,
-            reason=reason,
-            store_current=memory_candidate,
-            caller_is_superuser=await SUPERUSER(bot, event),
-            on_reply_triggered=on_reply_triggered,
-            bot_self_id=str(bot.self_id),
-            adapter_name=bot.type,
-        )
+        if not effect_business_admitted(group_id=message.group_id):
+            # 交接成功后、任何记忆会话/生成效果前复核当前群业务准入。
+            if memory_candidate:
+                await self._handle_normal_message(message)
+            self._log_decision(
+                self._build_decision_payload(
+                    group_id=group_id,
+                    user_id=user_id,
+                    message_id=message_id,
+                    result=result,
+                    reply_action="generation_failed",
+                    reason=reason,
+                )
+            )
+            return None
+
+        session_stack = AsyncExitStack()
+        try:
+            recall_session = await session_stack.enter_async_context(
+                self.hindsight_memory.open_session()
+            )
+        except Exception as exc:
+            await session_stack.aclose()
+            if memory_candidate:
+                await self._handle_normal_message(message)
+            failure_code = _memory_failure_code(exc)
+            self._log_decision(
+                self._build_decision_payload(
+                    group_id=group_id,
+                    user_id=user_id,
+                    message_id=message_id,
+                    result=result,
+                    reply_action="memory_failed",
+                    reason=reason,
+                    memory_failure_reason=failure_code,
+                )
+            )
+            # 会话/召回可用性失败沿用既有固定失败通知边界；此刻尚未贴出
+            # 生成中表情，因此只可能有私聊诊断，绝不补发群内错误文本。
+            await self.report_reply_failure(
+                bot=bot,
+                event=event,
+                failure=ReplyFailureInfo(
+                    stage="generate",
+                    error_type=type(exc).__name__,
+                    summary=failure_code,
+                    request_trace_id=f"chat-{message_id}",
+                    reaction_sent=False,
+                ),
+                reason=reason,
+            )
+            return None
+
+        try:
+            if memory_candidate:
+                try:
+                    await self._retain_candidate(request, recall_session)
+                except Exception as exc:
+                    # 候选在接受前失败：只补存当前合格原文一次，不创建履约、
+                    # 不生成、不重试、不发群错误文本。
+                    await self._handle_normal_message(message)
+                    self._log_decision(
+                        self._build_decision_payload(
+                            group_id=group_id,
+                            user_id=user_id,
+                            message_id=message_id,
+                            result=result,
+                            reply_action="memory_failed",
+                            reason=reason,
+                            memory_failure_reason=_memory_failure_code(exc),
+                        )
+                    )
+                    return None
+            pending_reply, stored, failure = await self._attempt_reply(
+                message=message,
+                reply_to_message_id=message_id,
+                image_urls=image_urls,
+                reply_context=reply_context_result.context,
+                reply_context_requested=platform_summoned and event.reply is not None,
+                reply_context_refetched=reply_context_result.refetched,
+                force_reply=result.force_reply,
+                reason=reason,
+                recall_session=recall_session,
+                store_current=memory_candidate,
+                caller_is_superuser=await SUPERUSER(bot, event),
+                on_reply_triggered=on_reply_triggered,
+                bot_self_id=str(bot.self_id),
+                adapter_name=bot.type,
+            )
+        finally:
+            await session_stack.aclose()
         if pending_reply is not None:
             # TSK-196：成功任务带图片失败摘要 → 最多提交一次 SUPERUSER 图片
             # 汇总卡（``group_text=None`` 无群消息），与失败路径共用共享通知
@@ -762,6 +880,43 @@ class MessageHandler:
             )
         return None
 
+    async def _submit_candidate_standalone(
+        self,
+        *,
+        request: DecisionRequest,
+        group_id: str,
+    ) -> str | None:
+        """Submit one non-chat/ban candidate without claiming chat handoff."""
+        if not effect_business_admitted(group_id=group_id):
+            return None
+        try:
+            async with self.hindsight_memory.open_session() as recall_session:
+                await self._retain_candidate(request, recall_session)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            code = _memory_failure_code(exc)
+            logger.debug("[KomariChat] memory candidate stopped: reason={}", code)
+            return code
+        return None
+
+    async def _retain_candidate(
+        self,
+        request: DecisionRequest,
+        recall_session: HindsightRecallSession,
+    ) -> None:
+        """Freeze and submit one candidate through the active task session."""
+        retain_request = build_candidate_retain_request(
+            request=request,
+            target_fingerprint=recall_session.target_fingerprint,
+        )
+        await recall_session.retain(
+            retain_request,
+            submission_guard=lambda: effect_business_admitted(
+                group_id=request.event.group_id
+            ),
+        )
+
     @staticmethod
     def _attempt_reason(
         request: DecisionRequest,
@@ -788,9 +943,17 @@ class MessageHandler:
         """处理低价值消息（直接丢弃，不存储）。"""
         logger.debug("[KomariMemory] 低价值消息已丢弃: {}...", message.content[:30])
 
-    async def _handle_normal_message(self, message: MessageSchema) -> None:
-        """处理普通消息（连续追加到当前会话缓冲区）。"""
+    async def _handle_normal_message(self, message: MessageSchema) -> bool:
+        """Append one admitted message to the current-group recent buffer.
+
+        The admission check is the last synchronous step before starting the
+        Redis write.  A denied write reports ``False`` so ``_read_buffers``
+        cannot claim the current trigger was stored.
+        """
+        if not effect_business_admitted(group_id=message.group_id):
+            return False
         await self.redis.push_message(message.group_id, message)
+        return True
 
     def _schedule_reply_reaction(
         self,
@@ -803,7 +966,7 @@ class MessageHandler:
         TSK-225：chat.reaction——表情 fire-and-forget 派发前按该群裁决；
         受限时在 ``asyncio.create_task`` 前同步判定并返回未派发，不启动回调。
         """
-        config = get_memory_config()
+        config = get_config()
         if (
             callback is None
             or not config.face_reaction_enabled
@@ -841,7 +1004,7 @@ class MessageHandler:
         任务取消（CancelledError）继续向上传播，不吞没。
         """
         try:
-            notify_superusers = get_memory_config().error_notify_enabled
+            notify_superusers = get_context_config().error_notify_enabled
         except Exception:
             logger.exception(
                 "[KomariChat] 回复失败通知配置读取失败，静默 SUPERUSER 私聊"
@@ -866,7 +1029,9 @@ class MessageHandler:
                 mapping_failed = True
                 # 不捕获 exc_info：本函数作用域可能持有 image_failure_summary，
                 # 避免任何含 URL/base64 的帧被写入日志（TSK-196 复审）。
-                logger.error("[KomariChat] 图片失败摘要→诊断映射失败，静默 SUPERUSER 私聊")
+                logger.error(
+                    "[KomariChat] 图片失败摘要→诊断映射失败，静默 SUPERUSER 私聊"
+                )
         try:
             notifier = GroupTaskFailureNotifier(
                 cooldown=RedisFailureNotificationCooldown(
@@ -932,11 +1097,9 @@ class MessageHandler:
             diagnostic = _to_image_diagnostic(summary)
             if diagnostic is None:
                 return
-            notify_superusers = get_memory_config().error_notify_enabled
+            notify_superusers = get_context_config().error_notify_enabled
         except Exception:
-            logger.error(
-                "[KomariChat] 图片失败汇总配置/映射失败，静默 SUPERUSER 私聊"
-            )
+            logger.error("[KomariChat] 图片失败汇总配置/映射失败，静默 SUPERUSER 私聊")
             return
         try:
             notifier = GroupTaskFailureNotifier(
@@ -999,16 +1162,15 @@ class MessageHandler:
         self,
         *,
         group_id: str,
-        user_id: str,
         message: MessageSchema,
         store_current: bool,
-    ) -> tuple[list[MessageSchema], list[dict[str, object]], bool]:
-        """读取已有缓冲：recent messages + global interaction buffer。
+    ) -> tuple[list[MessageSchema], bool]:
+        """读取已有缓冲：同群 recent messages（含已确认角色回复）。
 
         Returns:
-            (recent_messages, interaction_records, stored)
+            (recent_messages, stored)
         """
-        config = get_memory_config()
+        config = get_config()
         stored = False
 
         context_messages_limit = int(getattr(config, "context_messages_limit", 10))
@@ -1024,31 +1186,17 @@ class MessageHandler:
                 getattr(config, "context_max_estimated_tokens", 6_000)
             ),
         )
-        try:
-            interaction_records = await self.redis.get_global_interaction_buffer(
-                user_id,
-                limit=10,
-            )
-        except Exception:
-            logger.debug(
-                "[KomariChat] 近期互动原始缓冲读取失败，跳过注入: user={}",
-                user_id,
-                exc_info=True,
-            )
-            interaction_records = []
 
         if store_current:
-            await self._handle_normal_message(message)
-            stored = True
+            stored = await self._handle_normal_message(message)
 
-        return recent_messages, interaction_records, stored
+        return recent_messages, stored
 
     async def _generate_reply_core(
         self,
         *,
         message: MessageSchema,
         recent_messages: list[MessageSchema],
-        interaction_records: list[dict[str, object]],
         image_urls: list[str] | None,
         reply_context: ReplyContext | None,
         reply_context_requested: bool,
@@ -1056,21 +1204,71 @@ class MessageHandler:
         request_trace_id: str,
         caller_is_superuser: bool = False,
         collector: LLMDiagnosticCollector | None = None,
+        recall_session: HindsightRecallSession | None = None,
     ) -> ReplyResult:
-        """纯读取/生成核心：查询重写、记忆/画像/好感度读取、prompt 构建、LLM 回复生成。
+        """Run the read/generate core with a supplied task memory session.
+
+        Ordinary chat supplies its candidate session; standalone debug opens
+        its own session. Annotate the result from that same active session,
+        never from model arguments or a later configuration read.
+        """
+        try:
+            if not effect_business_admitted(group_id=message.group_id):
+                return ReplyResult(content="")
+            async with AsyncExitStack() as session_stack:
+                active_session = recall_session
+                if active_session is None:
+                    active_session = await session_stack.enter_async_context(
+                        self.hindsight_memory.open_session()
+                    )
+                reply_result = await self._generate_reply_with_session(
+                    message=message,
+                    recent_messages=recent_messages,
+                    image_urls=image_urls,
+                    reply_context=reply_context,
+                    reply_context_requested=reply_context_requested,
+                    reply_context_refetched=reply_context_refetched,
+                    request_trace_id=request_trace_id,
+                    caller_is_superuser=caller_is_superuser,
+                    collector=collector,
+                    recall_session=active_session,
+                )
+                return replace(
+                    reply_result,
+                    hindsight_target_fingerprint=active_session.target_fingerprint,
+                )
+        except Exception:
+            # TSK-196：委托核心的敏感图片 locals 已由其单点安全抛出点清空；
+            # 本包装帧同样重绑参数与 collector，保持既有 traceback 投影边界。
+            image_urls = None
+            reply_context = None
+            collector = None
+            raise
+
+    async def _generate_reply_with_session(
+        self,
+        *,
+        message: MessageSchema,
+        recent_messages: list[MessageSchema],
+        image_urls: list[str] | None,
+        reply_context: ReplyContext | None,
+        reply_context_requested: bool,
+        reply_context_refetched: bool,
+        request_trace_id: str,
+        recall_session: HindsightRecallSession,
+        caller_is_superuser: bool = False,
+        collector: LLMDiagnosticCollector | None = None,
+    ) -> ReplyResult:
+        """纯读取/生成核心：查询重写、记忆召回、prompt 构建、LLM 回复生成。
 
         不执行任何副作用：不写 Redis、不调好感度、不写互动历史、不设冷却。
         """
-        config = get_memory_config()
-        # TSK-192：任务起点从 komari_chat 配置冻结回复 Agent 执行预算，
-        # 普通 / debug / 简单三条入口共享同一份冻结快照；
-        # 任务中配置变更不影响当前任务，只作用于下一个任务。
-        # TSK-194 / ADR-0010：图片理解模式与下载预算同为任务级冻结值——
-        # 普通 / debug 入口都在此处读取一次；原生模式图片直接交给聊天模型
-        # 多模态输入，委托模式暴露 read_image 工具。
-        chat_config = get_config()
-        agent_budget = AgentExecutionBudget.from_config(chat_config)
-        image_policy = ImageUnderstandingPolicy.from_config(chat_config)
+        # TSK-192：任务起点从 komari_chat 配置冻结回复 Agent 执行预算、
+        # 图片理解/下载预算、上下文检索限制与生成槽位；普通 / debug / 简单
+        # 三条入口共享同一份冻结快照，任务中配置变更只作用于下一个任务。
+        config = get_config()
+        agent_budget = AgentExecutionBudget.from_config(config)
+        image_policy = ImageUnderstandingPolicy.from_config(config)
 
         # 查询重写（带 trace）
         if collector is not None:
@@ -1085,53 +1283,18 @@ class MessageHandler:
             collector=collector,
         )
 
-        try:
-            from komari_bot.plugins import embedding_provider
+        # TSK-225 / TSK-193：召回实际外呼前按当前群重新裁决。准入拒绝走
+        # 既有安静空 ReplyResult 控制路径，不调用 SDK/provider，也不记录记忆故障。
+        if not effect_business_admitted(group_id=message.group_id):
+            return ReplyResult(content="")
 
-            if not effect_business_admitted(group_id=message.group_id):
-                # TSK-225：chat.embedding——查询向量化（Embedding 子效果）前
-                # 按该群裁决；受限时不发起 embed 外呼，静默降级为无向量。
-                query_embedding = None
-            else:
-                query_embedding = await embedding_provider.embed(rewritten_query)
-        except Exception as e:
-            logger.warning("[KomariMemory] 预生成查询特征向量失败: {}", e)
-            query_embedding = None
-
-        memories = await self.memory.search_conversations(
-            query=rewritten_query,
-            group_id=message.group_id,
-            user_id=message.user_id,
-            limit=config.memory_search_limit,
-            query_embedding=query_embedding,
+        recall_query_source = rewritten_query.strip() or _MEDIA_ONLY_RECALL_QUERY
+        recall_query = normalize_required_text(
+            recall_query_source,
+            label="召回查询",
+            budget=QUERY_TEXT_BUDGET,
         )
-        try:
-            interaction_memories = await self.memory.search_interaction_events(
-                user_id=message.user_id,
-                query=rewritten_query,
-                limit=config.memory_search_limit,
-                query_embedding=query_embedding,
-            )
-        except Exception:
-            logger.debug(
-                "[KomariChat] 长期互动事件记忆检索失败，跳过注入: user={}",
-                message.user_id,
-                exc_info=True,
-            )
-            interaction_memories = []
-
-        try:
-            current_user_profile = await self.memory.get_user_profile(
-                user_id=message.user_id,
-                group_id=message.group_id,
-            )
-        except Exception:
-            logger.debug(
-                "[KomariChat] 当前用户画像读取失败，跳过注入: user={}",
-                message.user_id,
-                exc_info=True,
-            )
-            current_user_profile = None
+        recall_response = await recall_session.recall(recall_query)
 
         reply_sources = list(reply_context.image_sources) if reply_context else []
         current_sources = image_urls or []
@@ -1200,20 +1363,14 @@ class MessageHandler:
                 len(combined_sources), image_policy.download.max_images
             )
             native_download_failures = sum(
-                1
-                for image in aligned_images[:effective_total]
-                if image is None
+                1 for image in aligned_images[:effective_total] if image is None
             )
             reply_boundary = len(reply_sources)
             reply_image_urls = [
-                image
-                for image in aligned_images[:reply_boundary]
-                if image is not None
+                image for image in aligned_images[:reply_boundary] if image is not None
             ] or None
             base64_image_urls = [
-                image
-                for image in aligned_images[reply_boundary:]
-                if image is not None
+                image for image in aligned_images[reply_boundary:] if image is not None
             ] or None
             if effective_total > 0 and not reply_image_urls and not base64_image_urls:
                 # TSK-196 复审：不在此直接 raise（该 frame 仍持有 raw locals）；
@@ -1226,24 +1383,8 @@ class MessageHandler:
                 )
 
         if _image_failure_summary is None:
-            use_search_tool = bool(
-                komari_search_plugin.is_search_available()
-            )
-            use_fetch_tool = bool(
-                komari_search_plugin.is_fetch_available()
-            )
-            allowed_profile_user_ids = {message.user_id}
-            allowed_profile_user_ids.update(
-                item.user_id
-                for item in recent_messages
-                if not item.is_bot and item.group_id == message.group_id and item.user_id
-            )
-            if (
-                reply_context is not None
-                and reply_context.source_side == "user"
-                and reply_context.user_id
-            ):
-                allowed_profile_user_ids.add(reply_context.user_id)
+            use_search_tool = bool(komari_search_plugin.is_search_available())
+            use_fetch_tool = bool(komari_search_plugin.is_fetch_available())
 
             if reply_context_requested:
                 logger.info(
@@ -1287,13 +1428,15 @@ class MessageHandler:
                     current_viewable,
                     len(message.content),
                     base64_chars,
-                    len(memories),
+                    len(recall_response.results or []),
                     image_policy.mode,
                     use_vision_tool,
                 )
 
             try:
-                favorability = await user_data_plugin.get_user_favorability(message.user_id)
+                favorability = await user_data_plugin.get_user_favorability(
+                    message.user_id
+                )
             except Exception as exc:
                 logger.warning("[KomariChat] 获取当前好感度失败，终止本次回复: {}", exc)
                 raise _FavorabilityReadError(str(exc)) from exc
@@ -1301,21 +1444,16 @@ class MessageHandler:
             prompt_messages = await build_prompt(
                 user_message=message.content,
                 search_query=rewritten_query,
-                memories=memories,
+                recall_response=recall_response,
                 config=config,
                 recent_messages=recent_messages,
                 current_user_id=message.user_id,
                 current_user_nickname=message.user_nickname,
-                memory_service=self.memory,
                 group_id=message.group_id,
                 image_urls=base64_image_urls if image_session is None else None,
                 reply_context=reply_context,
                 reply_image_urls=reply_image_urls if image_session is None else None,
-                query_embedding=query_embedding,
                 favorability=favorability,
-                current_user_profile=current_user_profile,
-                interaction_records=interaction_records,
-                interaction_memories=interaction_memories,
                 delegated_image_mode=use_vision_tool,
                 delegated_quoted_image_count=(
                     image_session.quoted_count if image_session is not None else None
@@ -1327,7 +1465,10 @@ class MessageHandler:
                 fetch_tool_mode=use_fetch_tool,
             )
 
-            tools: list[dict[str, Any]] = [READ_PROFILE_TOOL, RECORD_FAVORABILITY_DELTA_TOOL]
+            tools: list[dict[str, Any]] = [
+                RECALL_MEMORY_TOOL,
+                RECORD_FAVORABILITY_DELTA_TOOL,
+            ]
             if use_vision_tool:
                 tools.append(READ_IMAGE_TOOL)
             if use_search_tool:
@@ -1345,10 +1486,8 @@ class MessageHandler:
                         tools=tools,
                         request_trace_id=request_trace_id,
                         image_session=image_session if use_vision_tool else None,
-                        memory_service=self.memory,
+                        recall_session=recall_session,
                         group_id=message.group_id,
-                        allowed_profile_user_ids=frozenset(allowed_profile_user_ids),
-                        caller_user_id=message.user_id,
                         caller_group_id=message.group_id,
                         caller_is_superuser=caller_is_superuser,
                         max_favorability_delta=user_data_plugin.get_config().max_favorability_delta_per_reply,
@@ -1450,6 +1589,7 @@ class MessageHandler:
         reply_context_refetched: bool,
         force_reply: bool,
         reason: AttemptReplyReason,
+        recall_session: HindsightRecallSession,
         store_current: bool,
         bot_self_id: str,
         adapter_name: str,
@@ -1464,7 +1604,7 @@ class MessageHandler:
             频控冷却/超限/重复等正常控制流返回 (None, False, None)。
         """
         config = get_config()
-        memory_config = get_memory_config()
+        context_config = get_context_config()
         reservation_id: str | None = None
         request_trace_id = f"chat-{message.message_id}"
 
@@ -1482,12 +1622,16 @@ class MessageHandler:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                return None, False, ReplyFailureInfo(
-                    stage="reserve",
-                    error_type=type(exc).__name__,
-                    summary=str(exc),
-                    request_trace_id=request_trace_id,
-                    reaction_sent=False,
+                return (
+                    None,
+                    False,
+                    ReplyFailureInfo(
+                        stage="reserve",
+                        error_type=type(exc).__name__,
+                        summary=str(exc),
+                        request_trace_id=request_trace_id,
+                        reaction_sent=False,
+                    ),
                 )
             if isinstance(reserve_result, ReservationDenied):
                 match reserve_result.reason:
@@ -1498,12 +1642,16 @@ class MessageHandler:
                     case "duplicate":
                         logger.debug("[KomariChat] 主动回复消息已预占或已送达")
                     case _:
-                        return None, False, ReplyFailureInfo(
-                            stage="reserve",
-                            error_type="UnknownReservationStatusError",
-                            summary=f"未知的主动回复预占状态: {reserve_result.reason}",
-                            request_trace_id=request_trace_id,
-                            reaction_sent=False,
+                        return (
+                            None,
+                            False,
+                            ReplyFailureInfo(
+                                stage="reserve",
+                                error_type="UnknownReservationStatusError",
+                                summary=f"未知的主动回复预占状态: {reserve_result.reason}",
+                                request_trace_id=request_trace_id,
+                                reaction_sent=False,
+                            ),
                         )
                 return None, False, None
             lease = reserve_result
@@ -1520,21 +1668,24 @@ class MessageHandler:
 
             # === 读取已有缓冲 ===
             try:
-                recent_messages, interaction_records, stored = await self._read_buffers(
+                recent_messages, stored = await self._read_buffers(
                     group_id=message.group_id,
-                    user_id=message.user_id,
                     message=message,
                     store_current=store_current,
                 )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                return None, False, ReplyFailureInfo(
-                    stage="read_buffers",
-                    error_type=type(exc).__name__,
-                    summary=str(exc),
-                    request_trace_id=request_trace_id,
-                    reaction_sent=False,
+                return (
+                    None,
+                    False,
+                    ReplyFailureInfo(
+                        stage="read_buffers",
+                        error_type=type(exc).__name__,
+                        summary=str(exc),
+                        request_trace_id=request_trace_id,
+                        reaction_sent=False,
+                    ),
                 )
 
             # === 生成前贴出“生成中”表情（与生成并列，fire-and-forget） ===
@@ -1550,7 +1701,6 @@ class MessageHandler:
                 input_data={
                     "message": message,
                     "recent_messages": recent_messages,
-                    "interaction_records": interaction_records,
                     "image_urls": image_urls,
                     "reply_context": reply_context,
                     "reason": reason,
@@ -1561,7 +1711,6 @@ class MessageHandler:
                 reply_result = await self._generate_reply_core(
                     message=message,
                     recent_messages=recent_messages,
-                    interaction_records=interaction_records,
                     image_urls=image_urls,
                     reply_context=reply_context,
                     reply_context_requested=reply_context_requested,
@@ -1569,6 +1718,7 @@ class MessageHandler:
                     request_trace_id=request_trace_id,
                     caller_is_superuser=caller_is_superuser,
                     collector=collector,
+                    recall_session=recall_session,
                 )
             except asyncio.CancelledError as exc:
                 await agent_run_logger_plugin.finalize_collector(
@@ -1583,12 +1733,16 @@ class MessageHandler:
                     status="error",
                     error=exc,
                 )
-                return None, stored, ReplyFailureInfo(
-                    stage="generate",
-                    error_type=type(exc).__name__,
-                    summary=str(exc),
-                    request_trace_id=request_trace_id,
-                    reaction_sent=reaction_sent,
+                return (
+                    None,
+                    stored,
+                    ReplyFailureInfo(
+                        stage="generate",
+                        error_type=type(exc).__name__,
+                        summary=str(exc),
+                        request_trace_id=request_trace_id,
+                        reaction_sent=reaction_sent,
+                    ),
                 )
             except Exception as exc:
                 await agent_run_logger_plugin.finalize_collector(
@@ -1596,16 +1750,20 @@ class MessageHandler:
                     status="error",
                     error=exc,
                 )
-                return None, stored, ReplyFailureInfo(
-                    stage="generate",
-                    error_type=type(exc).__name__,
-                    summary=str(exc),
-                    request_trace_id=request_trace_id,
-                    reaction_sent=reaction_sent,
-                    image_failure_summary=(
-                        exc.summary
-                        if isinstance(exc, ImageUnderstandingFailureError)
-                        else None
+                return (
+                    None,
+                    stored,
+                    ReplyFailureInfo(
+                        stage="generate",
+                        error_type=type(exc).__name__,
+                        summary=str(exc),
+                        request_trace_id=request_trace_id,
+                        reaction_sent=reaction_sent,
+                        image_failure_summary=(
+                            exc.summary
+                            if isinstance(exc, ImageUnderstandingFailureError)
+                            else None
+                        ),
                     ),
                 )
             else:
@@ -1622,22 +1780,47 @@ class MessageHandler:
                     message.group_id,
                     reason,
                 )
-                return None, stored, ReplyFailureInfo(
-                    stage="generate",
-                    error_type="EmptyReplyError",
-                    summary="LLM 返回空回复",
-                    request_trace_id=request_trace_id,
-                    reaction_sent=reaction_sent,
+                return (
+                    None,
+                    stored,
+                    ReplyFailureInfo(
+                        stage="generate",
+                        error_type="EmptyReplyError",
+                        summary="LLM 返回空回复",
+                        request_trace_id=request_trace_id,
+                        reaction_sent=reaction_sent,
+                    ),
                 )
 
             if reply_result.favorability_delta is None:
                 logger.warning("[KomariChat] 回复缺少好感度变化记录，按生成失败处理")
-                return None, stored, ReplyFailureInfo(
-                    stage="generate",
-                    error_type="FavorabilityDeltaMissingError",
-                    summary="回复缺少好感度变化记录",
-                    request_trace_id=request_trace_id,
-                    reaction_sent=reaction_sent,
+                return (
+                    None,
+                    stored,
+                    ReplyFailureInfo(
+                        stage="generate",
+                        error_type="FavorabilityDeltaMissingError",
+                        summary="回复缺少好感度变化记录",
+                        request_trace_id=request_trace_id,
+                        reaction_sent=reaction_sent,
+                    ),
+                )
+
+            hindsight_target_fingerprint = reply_result.hindsight_target_fingerprint
+            if not hindsight_target_fingerprint:
+                logger.warning(
+                    "[KomariChat] 回复缺少 Hindsight 目标指纹，按生成失败处理"
+                )
+                return (
+                    None,
+                    stored,
+                    ReplyFailureInfo(
+                        stage="generate",
+                        error_type="HindsightTargetFingerprintMissingError",
+                        summary="回复缺少 Hindsight 目标指纹",
+                        request_trace_id=request_trace_id,
+                        reaction_sent=reaction_sent,
+                    ),
                 )
 
             # === 生成完成：内联一次续租裁决，成功后才移交窄凭据 ===
@@ -1648,22 +1831,30 @@ class MessageHandler:
                     logger.warning(
                         "[KomariChat] 主动回复生成完成时预占租约已丢失，取消发送"
                     )
-                    return None, stored, ReplyFailureInfo(
-                        stage="generate",
-                        error_type="ProactiveReservationLostError",
-                        summary="生成完成时主动回复预占租约已丢失",
-                        request_trace_id=request_trace_id,
-                        reaction_sent=reaction_sent,
+                    return (
+                        None,
+                        stored,
+                        ReplyFailureInfo(
+                            stage="generate",
+                            error_type="ProactiveReservationLostError",
+                            summary="生成完成时主动回复预占租约已丢失",
+                            request_trace_id=request_trace_id,
+                            reaction_sent=reaction_sent,
+                        ),
                     )
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    return None, stored, ReplyFailureInfo(
-                        stage="generate",
-                        error_type=type(exc).__name__,
-                        summary=str(exc),
-                        request_trace_id=request_trace_id,
-                        reaction_sent=reaction_sent,
+                    return (
+                        None,
+                        stored,
+                        ReplyFailureInfo(
+                            stage="generate",
+                            error_type=type(exc).__name__,
+                            summary=str(exc),
+                            request_trace_id=request_trace_id,
+                            reaction_sent=reaction_sent,
+                        ),
                     )
             else:
                 handoff = None
@@ -1679,13 +1870,14 @@ class MessageHandler:
                 message=message,
                 reply_result=reply_result,
                 force_reply=force_reply,
-                bot_nickname=memory_config.bot_nickname,
+                bot_nickname=context_config.bot_nickname,
                 bot_self_id=bot_self_id,
                 adapter_name=adapter_name,
                 reason=reason,
                 fulfillment_id=self._reply_fulfillment_id(message),
                 request_trace_id=request_trace_id,
                 reply_timestamp=time.time(),
+                hindsight_target_fingerprint=hindsight_target_fingerprint,
                 proactive_reservation_id=reservation_id,
                 proactive_handoff=handoff,
                 reaction_sent=reaction_sent,
@@ -1725,7 +1917,7 @@ class MessageHandler:
 
         Returns:
             DebugReplyResult（reply, favorability_delta, favorability_reason,
-            interaction_history, collector）
+            collector）
 
         Raises:
             RuntimeError: 底层服务未初始化
@@ -1779,9 +1971,8 @@ class MessageHandler:
             )
 
             # === 读取已有缓冲（不 store_current，不写当前消息） ===
-            recent_messages, interaction_records, _stored = await self._read_buffers(
+            recent_messages, _stored = await self._read_buffers(
                 group_id=group_id,
-                user_id=user_id,
                 message=message,
                 store_current=False,
             )
@@ -1810,7 +2001,6 @@ class MessageHandler:
             reply_result = await self._generate_reply_core(
                 message=message,
                 recent_messages=recent_messages,
-                interaction_records=interaction_records,
                 image_urls=image_urls,
                 reply_context=reply_context,
                 reply_context_requested=reply_context is not None,
@@ -1864,7 +2054,6 @@ class MessageHandler:
             ),
             favorability_delta=reply_result.favorability_delta,
             favorability_reason=reply_result.favorability_reason,
-            interaction_history=reply_result.interaction_history,
             collector=collector,
         )
         await agent_run_logger_plugin.finalize_collector(

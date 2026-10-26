@@ -17,6 +17,11 @@ from importlib import import_module
 from types import SimpleNamespace
 from typing import Any
 
+from tests.komari_chat.hindsight_commitment_support import (
+    HindsightServiceDouble,
+    memory_payload,
+)
+
 
 def module(name: str) -> Any:
     return import_module(name)
@@ -276,6 +281,8 @@ class ParentChildRepository:
             "not_delivered_at": None,
             "completed_at": None,
         }
+
+
 class ReservationHandoff:
     """移交凭据：冻结身份快照 + 幂等 release() 记录。"""
 
@@ -377,8 +384,8 @@ class CommitmentDownstreams:
         return True
 
     async def push_global_interaction_once(self, **_: object) -> bool:
-        self.interaction.append("interaction")
-        return True
+        msg = "interaction_history 协议已退役"
+        raise AssertionError(msg)
 
     async def recover_alerts(self) -> None:
         self.alerted.append("alert")
@@ -416,14 +423,7 @@ class CommitmentRepo:
                 "reply_content": "回复正文",
                 "reply_timestamp": 2.0,
             },
-            "interaction_history": {
-                "user_id": "user-1",
-                "display_name": "测试用户",
-                "trigger_size": 20,
-                "reply_timestamp": 2.0,
-                "trigger_message_id": "message-1",
-                "record": {"event": "发言", "result": "回复", "emotion": "平静"},
-            },
+            "hindsight_memory": memory_payload(),
         }
 
     def seed(
@@ -499,9 +499,7 @@ class CommitmentRepo:
         self.completed.add(fulfillment_id)
         return True
 
-    async def release_lease(
-        self, fulfillment_id: str, *, owner_token: str
-    ) -> bool:
+    async def release_lease(self, fulfillment_id: str, *, owner_token: str) -> bool:
         parent = self.parents[fulfillment_id]
         if parent["lease_owner"] != owner_token:
             return False
@@ -552,7 +550,9 @@ def build_commitment_workflow(
     downstream: CommitmentDownstreams,
 ) -> tuple[Any, Any]:
     """装配真实 ``ReplyCommitmentWorkflow``，注入下游 Fake。"""
-    cw_module = module("komari_bot.plugins.komari_chat.services.reply_commitment_workflow")
+    cw_module = module(
+        "komari_bot.plugins.komari_chat.services.reply_commitment_workflow"
+    )
     workflow = cw_module.ReplyCommitmentWorkflow(
         repository=repository,
         redis=SimpleNamespace(
@@ -563,5 +563,6 @@ def build_commitment_workflow(
         proactive_reservation=downstream,
         user_data=downstream,
         config_getter=config,
+        hindsight_memory=HindsightServiceDouble(),
     )
     return workflow, downstream

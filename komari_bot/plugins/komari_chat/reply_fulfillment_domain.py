@@ -13,14 +13,13 @@ import json
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
-from types import MappingProxyType
 from typing import Any
 
 COMMITMENT_TYPES: tuple[str, ...] = (
     "proactive_reply_confirmation",
     "favorability_adjustment",
     "assistant_reply_history",
-    "interaction_history",
+    "hindsight_memory",
 )
 
 # 承诺固定顺序的唯一权威定义（由 COMMITMENT_TYPES 推导）：仓储模块
@@ -46,7 +45,9 @@ def _require_text(value: object, field_name: str) -> str:
 
 def _require_sha256(value: object, field_name: str) -> str:
     text = _require_text(value, field_name)
-    if len(text) != 64 or any(character not in "0123456789abcdef" for character in text):
+    if len(text) != 64 or any(
+        character not in "0123456789abcdef" for character in text
+    ):
         msg = f"{field_name} 必须是 64 位小写 SHA-256"
         raise ValueError(msg)
     return text
@@ -144,60 +145,54 @@ class AssistantReplyHistoryPayload:
 
 
 @dataclass(frozen=True, slots=True)
-class InteractionHistoryPayload:
-    """互动历史承诺的固定载荷。"""
+class HindsightMemoryPayload:
+    """Hindsight 送达记忆承诺的固定载荷。
 
-    user_id: str
-    display_name: str
-    trigger_size: int
-    reply_timestamp: float
-    trigger_message_id: str
-    record: Mapping[str, str]
+    只保存一份不可变的规范化 JSON 文本（``HindsightRetainRequest.to_json``
+    的规范序列化），不在这里复制 SDK 请求 schema、不 import 记忆插件、
+    也不在准备阶段之外重建正文。真实请求由履约准备边界构造，并在承诺
+    执行边界经 ``HindsightRetainRequest.from_json`` 严格重建；任一校验
+    失败都按 ``invalid_payload`` 永久处置，绝不触达 SDK。
+    """
+
+    request: str
 
     def __post_init__(self) -> None:
-        _require_text(self.user_id, "user_id")
-        _require_text(self.display_name, "display_name")
-        _require_int(self.trigger_size, "trigger_size", minimum=1)
-        object.__setattr__(
-            self,
-            "reply_timestamp",
-            _require_finite_float(self.reply_timestamp, "reply_timestamp"),
+        _require_text(self.request, "request")
+        try:
+            decoded = json.loads(self.request)
+        except (TypeError, ValueError):
+            msg = "request 必须是规范化 JSON 对象文本"
+            raise ValueError(msg) from None
+        if not isinstance(decoded, dict):
+            msg = "request 必须是规范化 JSON 对象文本"
+            raise TypeError(msg)
+        canonical = json.dumps(
+            decoded,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
         )
-        _require_text(self.trigger_message_id, "trigger_message_id")
-        if not isinstance(self.record, Mapping):
-            msg = "record 必须是字符串键值映射"
-            raise TypeError(msg)
-        if any(
-            not isinstance(key, str) or not isinstance(value, str)
-            for key, value in self.record.items()
-        ):
-            msg = "record 必须是字符串键值映射"
-            raise TypeError(msg)
-        object.__setattr__(self, "record", MappingProxyType(dict(self.record)))
+        if canonical != self.request:
+            msg = "request 必须是规范化 JSON 对象文本"
+            raise ValueError(msg)
 
     def to_json(self) -> dict[str, Any]:
-        return {
-            "user_id": self.user_id,
-            "display_name": self.display_name,
-            "trigger_size": self.trigger_size,
-            "reply_timestamp": self.reply_timestamp,
-            "trigger_message_id": self.trigger_message_id,
-            "record": dict(self.record),
-        }
+        return {"request": self.request}
 
 
 CommitmentPayload = (
     ProactiveReplyConfirmationPayload
     | FavorabilityAdjustmentPayload
     | AssistantReplyHistoryPayload
-    | InteractionHistoryPayload
+    | HindsightMemoryPayload
 )
 
 _COMMITMENT_PAYLOAD_TYPES: dict[str, type[Any]] = {
     "proactive_reply_confirmation": ProactiveReplyConfirmationPayload,
     "favorability_adjustment": FavorabilityAdjustmentPayload,
     "assistant_reply_history": AssistantReplyHistoryPayload,
-    "interaction_history": InteractionHistoryPayload,
+    "hindsight_memory": HindsightMemoryPayload,
 }
 
 
@@ -214,10 +209,7 @@ class ReplyCommitmentInput:
             raise ValueError(msg)
         expected_type = _COMMITMENT_PAYLOAD_TYPES[self.commitment_type]
         if not isinstance(self.payload, expected_type):
-            msg = (
-                f"承诺 {self.commitment_type!r} 必须使用 "
-                f"{expected_type.__name__}"
-            )
+            msg = f"承诺 {self.commitment_type!r} 必须使用 {expected_type.__name__}"
             raise TypeError(msg)
 
     def to_json(self) -> dict[str, Any]:
@@ -268,9 +260,10 @@ class ReplyFulfillmentDraft:
         required_types = {
             "favorability_adjustment",
             "assistant_reply_history",
+            "hindsight_memory",
         }
         if not required_types.issubset(commitment_types):
-            msg = "commitments 必须包含好感度调整与角色回复历史"
+            msg = "commitments 必须包含好感度调整、角色回复历史与 Hindsight 记忆"
             raise ValueError(msg)
         if len(commitment_types) != len(set(commitment_types)):
             msg = "commitments 不能包含重复承诺类型"
@@ -434,7 +427,7 @@ __all__ = [
     "AssistantReplyHistoryPayload",
     "CommitmentPayload",
     "FavorabilityAdjustmentPayload",
-    "InteractionHistoryPayload",
+    "HindsightMemoryPayload",
     "ProactiveReplyConfirmationPayload",
     "ReplyCommitmentInput",
     "ReplyFulfillmentConflictError",

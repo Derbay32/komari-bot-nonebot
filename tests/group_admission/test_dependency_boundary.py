@@ -18,7 +18,7 @@
   立 JSONL）。
 - TSK-246 消费方硬依赖声明：从生产代码识别 ``group_admission`` 顶层消费
   者，断言其所属插件入口（``__init__.py``）显式 ``require("group_admission")``；
-  三插件（komari_memory / user_ban / character_binding）经 NoneBot 装载器
+  消费插件（user_ban / character_binding）经 NoneBot 装载器
   runtime seam 逐入口装载验证声明，消费 import 只落在顶层 ``__all__`` 内。
 
 生产包目录缺失时以断言失败（red）报告，而非跳过。
@@ -370,23 +370,24 @@ def test_phase_b_observability_keeps_operational_diagnostic_boundaries() -> None
 #   来新增消费者漏声明时精确失败；兼容既有 komari_help 约定——消费模块与
 #   ``require`` 同文件声明且该模块在插件装载期被入口 import（NoneBot 加载
 #   期即完成声明）。
-# - NoneBot 装载器 runtime seam：recording require 逐插件装载三插件
-#   （komari_memory / user_ban / character_binding）生产入口，断言装载期间
+# - NoneBot 装载器 runtime seam：recording require 逐插件装载消费插件
+#   （user_ban / character_binding）生产入口，断言装载期间
 #   记录到 ``group_admission`` 声明；装载副作用（matcher / preprocessor /
 #   driver 生命周期钩子）精确恢复。
 # - 消费 import 只落在 ``group_admission`` 顶层 ``__all__`` 内（ADR-0006 只
 #   消费顶层暴露面），不引入 deep import（既有用例覆盖）。
 #
 # 本票不新增 public bool helper、不改群号解析/准入资格/命令回复——由既有
-# user_ban / character_binding / komari_memory 公共行为测试守住零行为变化
+# user_ban / character_binding 公共行为测试守住零行为变化
 # （见测试命令中对应目录）。
 # ---------------------------------------------------------------------------
 
 GROUP_ADMISSION_PLUGIN = "group_admission"
 GROUP_ADMISSION_MODULE = "komari_bot.plugins.group_admission"
 
-#: TSK-246 明确要求补齐硬依赖声明的三个消费者。
-CONSUMER_PLUGINS = ("user_ban", "character_binding", "komari_memory")
+#: TSK-246 明确要求补齐硬依赖声明的消费者。komari_memory 的旧群工作
+#: 消费者已随 TSK-197 退役，Hindsight 调用侧不再声明 group_admission。
+CONSUMER_PLUGINS = ("user_ban", "character_binding")
 
 
 def _module_require_names(path: Path) -> set[str]:
@@ -580,7 +581,7 @@ def test_plugin_entry_declares_group_admission_require_on_load(
     plugin_name: str,
     _recorded_requires: list[str],
 ) -> None:
-    """NoneBot 装载器 seam：三插件生产入口装载期必须声明
+    """NoneBot 装载器 seam：消费插件生产入口装载期必须声明
     ``require("group_admission")``。
 
     recording require 逐插件装载真实生产入口（spec_from_file_location 唯一

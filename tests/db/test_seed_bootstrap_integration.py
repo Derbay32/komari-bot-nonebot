@@ -154,7 +154,7 @@ async def _prepare_head_scratch() -> tuple[dict[str, Any], str]:
 
 
 def _prompt_tables() -> tuple[str, ...]:
-    """必需三个 Prompt 表 + 可选判定 Prompt 表（表名来自强类型 Schema）。"""
+    """必需 Prompt 表 + 可选判定 Prompt 表（表名来自强类型 Schema）。"""
     decision_model = ensure_typed_prompt_model(DECISION_RESOURCE_ID)
     assert decision_model is not None, "无法加载 komari_decision Prompt Schema"
     return (

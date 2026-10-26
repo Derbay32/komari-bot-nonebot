@@ -25,7 +25,6 @@ if TYPE_CHECKING:
     from komari_bot.onebot import GroupTaskFailureNotification
 
 
-
 class _Event:
     group_id = 10000
     message_id = 30000
@@ -262,28 +261,28 @@ def _install_failure_notifier(
     return notifier
 
 
-def _install_memory_config(
+def _install_context_config(
     summary_module: Any,
     monkeypatch: pytest.MonkeyPatch,
     *,
     error_notify_enabled: bool = True,
     error: BaseException | None = None,
 ) -> SimpleNamespace:
-    """替身既有 config_manager factory 返回的 komari_memory 资源。"""
-    memory_config = SimpleNamespace(error_notify_enabled=error_notify_enabled)
+    """替身既有 config_manager factory 返回的 komari_context 通知策略资源。"""
+    context_config = SimpleNamespace(error_notify_enabled=error_notify_enabled)
 
     def _get() -> object:
         if error is not None:
             raise error
-        return memory_config
+        return context_config
 
     monkeypatch.setattr(
         summary_module,
-        "_memory_config_manager",
+        "_context_config_manager",
         SimpleNamespace(get=_get),
         raising=False,
     )
-    return memory_config
+    return context_config
 
 
 def _install_effect_admission(
@@ -294,6 +293,7 @@ def _install_effect_admission(
 ) -> dict[str, bool]:
     """可控的通知前业务准入复检（不复制裁决实现）。"""
     flag = {"value": allowed}
+
     def _admitted(*, group_id: int) -> bool:
         del group_id
         return flag["value"]
@@ -393,7 +393,9 @@ async def test_summary_miss_keeps_propagation_open_for_shared_chat_handoff(
         summary_module,
         monkeypatch,
         calls,
-        result=_summary_result(status="success", route="chat", reason_code="classified"),
+        result=_summary_result(
+            status="success", route="chat", reason_code="classified"
+        ),
     )
     monkeypatch.setattr(
         summary_module,
@@ -477,7 +479,7 @@ async def test_unavailable_summary_judgement_notifies_fixed_group_text_only(
     calls: list[str] = []
     _install_config(summary_module, monkeypatch)
     _install_permission(summary_module, monkeypatch, allowed=True, calls=calls)
-    _install_memory_config(summary_module, monkeypatch, error_notify_enabled=True)
+    _install_context_config(summary_module, monkeypatch, error_notify_enabled=True)
     _install_effect_admission(summary_module, monkeypatch, allowed=True)
     monkeypatch.setattr(
         summary_module,
@@ -488,9 +490,7 @@ async def test_unavailable_summary_judgement_notifies_fixed_group_text_only(
         summary_module,
         monkeypatch,
         calls,
-        result=_summary_result(
-            status="failed", route="none", reason_code=reason_code
-        ),
+        result=_summary_result(status="failed", route="none", reason_code=reason_code),
     )
     matcher = _Matcher()
     notifier = _install_failure_notifier(summary_module, monkeypatch, matcher=matcher)
@@ -580,7 +580,7 @@ async def test_refused_failure_notification_claim_keeps_engine_eligibility(
     calls: list[str] = []
     _install_config(summary_module, monkeypatch)
     _install_permission(summary_module, monkeypatch, allowed=True, calls=calls)
-    _install_memory_config(summary_module, monkeypatch, error_notify_enabled=True)
+    _install_context_config(summary_module, monkeypatch, error_notify_enabled=True)
     _install_effect_admission(summary_module, monkeypatch, allowed=True)
     monkeypatch.setattr(
         summary_module,
@@ -591,9 +591,7 @@ async def test_refused_failure_notification_claim_keeps_engine_eligibility(
         summary_module,
         monkeypatch,
         calls,
-        result=_summary_result(
-            status="failed", route="none", reason_code=reason_code
-        ),
+        result=_summary_result(status="failed", route="none", reason_code=reason_code),
         failure_claim=False,
     )
     matcher = _Matcher()
@@ -616,7 +614,7 @@ async def test_failure_notification_switch_off_mutes_private_but_keeps_group_tex
     calls: list[str] = []
     _install_config(summary_module, monkeypatch)
     _install_permission(summary_module, monkeypatch, allowed=True, calls=calls)
-    _install_memory_config(summary_module, monkeypatch, error_notify_enabled=False)
+    _install_context_config(summary_module, monkeypatch, error_notify_enabled=False)
     _install_effect_admission(summary_module, monkeypatch, allowed=True)
     monkeypatch.setattr(
         summary_module,
@@ -652,7 +650,7 @@ async def test_failure_notification_switch_read_failure_only_mutes_private(
     calls: list[str] = []
     _install_config(summary_module, monkeypatch)
     _install_permission(summary_module, monkeypatch, allowed=True, calls=calls)
-    _install_memory_config(
+    _install_context_config(
         summary_module,
         monkeypatch,
         error=RuntimeError("模拟配置读取失败"),
@@ -692,7 +690,7 @@ async def test_failure_notification_rechecks_summary_switch_before_notify(
     calls: list[str] = []
     config = _install_config(summary_module, monkeypatch)
     _install_permission(summary_module, monkeypatch, allowed=True, calls=calls)
-    _install_memory_config(summary_module, monkeypatch, error_notify_enabled=True)
+    _install_context_config(summary_module, monkeypatch, error_notify_enabled=True)
     _install_effect_admission(summary_module, monkeypatch, allowed=True)
     monkeypatch.setattr(
         summary_module,
@@ -725,7 +723,7 @@ async def test_failure_notification_rechecks_effect_admission_before_notify(
     calls: list[str] = []
     _install_config(summary_module, monkeypatch)
     _install_permission(summary_module, monkeypatch, allowed=True, calls=calls)
-    _install_memory_config(summary_module, monkeypatch, error_notify_enabled=True)
+    _install_context_config(summary_module, monkeypatch, error_notify_enabled=True)
     admission = _install_effect_admission(summary_module, monkeypatch, allowed=True)
     monkeypatch.setattr(
         summary_module,

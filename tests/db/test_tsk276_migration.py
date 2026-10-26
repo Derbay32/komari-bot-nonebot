@@ -24,8 +24,8 @@ from tests.db.tsk197_gate_support import (
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MIGRATIONS_DIR = PROJECT_ROOT / "migrations"
 SQLALCHEMY_URL = os.getenv("SQLALCHEMY_DATABASE_URL", "")
-HEAD = "0025"
-#: 历史 0020 收据/履约迁移，保留其专属源文本断言（不被新 head 0025 覆盖）。
+HEAD = "0031"
+#: 历史 0020 收据/履约迁移，保留其专属源文本断言（不被新 head 0031 覆盖）。
 RECEIPT_REVISION = "0020"
 RECEIPT_TABLE = "komari_roulette_command_receipts"
 FULFILLMENT_TABLE = "komari_roulette_fulfillments"
@@ -100,7 +100,9 @@ async def _copy_row_with_overrides(
     for column in columns:
         if column in overrides:
             parameters.append(overrides[column])
-            select_expressions.append(f"${len(parameters)} AS {_quote_identifier(column)}")
+            select_expressions.append(
+                f"${len(parameters)} AS {_quote_identifier(column)}"
+            )
         else:
             select_expressions.append(_quote_identifier(column))
     parameters.append(source_value)
@@ -200,7 +202,9 @@ async def _has_exact_key(
 
 @PG_REQUIRED
 @pytest.mark.asyncio
-async def test_fresh_database_upgrade_head_creates_receipt_and_fulfillment_schema() -> None:
+async def test_fresh_database_upgrade_head_creates_receipt_and_fulfillment_schema() -> (
+    None
+):
     if not same_database(POSTGRES_URL, SQLALCHEMY_URL):
         pytest.skip("KOMARI_TEST_POSTGRES_URL 与 SQLALCHEMY_DATABASE_URL 不一致")
 
@@ -211,7 +215,10 @@ async def test_fresh_database_upgrade_head_creates_receipt_and_fulfillment_schem
         assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
         connection = await asyncpg.connect(**scratch)
         try:
-            assert await connection.fetchval("SELECT version_num FROM alembic_version") == HEAD
+            assert (
+                await connection.fetchval("SELECT version_num FROM alembic_version")
+                == HEAD
+            )
             tables = {
                 str(row["table_name"])
                 for row in await connection.fetch(
@@ -416,7 +423,10 @@ async def test_upgrade_from_0019_preserves_all_275_tables() -> None:
                 RECEIPT_TABLE,
                 FULFILLMENT_TABLE,
             } <= tables
-            assert await connection.fetchval("SELECT version_num FROM alembic_version") == HEAD
+            assert (
+                await connection.fetchval("SELECT version_num FROM alembic_version")
+                == HEAD
+            )
         finally:
             await connection.close()
     finally:

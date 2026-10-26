@@ -126,11 +126,11 @@ class DynamicConfigSchema(TypedConfigModel, table=True):
     )
     summary_planning_thinking_mode: bool = Field(
         default=False,
-        description="群聊总结规划阶段模型是否处于思考模式。语义同 komari_memory.llm_thinking_mode_chat。",
+        description="群聊总结规划阶段模型是否处于思考模式。语义同 komari_chat.llm_thinking_mode_chat。",
     )
     summary_planning_reasoning_effort: str = Field(
         default="",
-        description="群聊总结规划阶段模型思考强度。语义同 komari_memory.llm_reasoning_effort_chat。",
+        description="群聊总结规划阶段模型思考强度。语义同 komari_chat.llm_reasoning_effort_chat。",
     )
     summary_tool_scan_limit: int = Field(
         default=300, ge=10, le=500, description="总结工具本地扫描历史硬上限"
@@ -156,11 +156,11 @@ class DynamicConfigSchema(TypedConfigModel, table=True):
     )
     summary_thinking_mode: bool = Field(
         default=False,
-        description="群聊总结执行模型是否处于思考模式。语义同 komari_memory.llm_thinking_mode_chat。",
+        description="群聊总结执行模型是否处于思考模式。语义同 komari_chat.llm_thinking_mode_chat。",
     )
     summary_reasoning_effort: str = Field(
         default="",
-        description="群聊总结执行模型思考强度。语义同 komari_memory.llm_reasoning_effort_chat。",
+        description="群聊总结执行模型思考强度。语义同 komari_chat.llm_reasoning_effort_chat。",
     )
     assistant_prefill_enabled: bool = Field(
         default=False,

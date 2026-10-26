@@ -98,7 +98,7 @@ SQLALCHEMY_DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/komari_bot \
 - 耗尽重试次数的承诺会触发私聊告警；处置后通过管理 API 对指定承诺续跑，
   再次耗尽可能产生新一代告警。
 
-### 失败回滚矩阵
+### 0010 / 0011 历史回滚矩阵（仅历史记录）
 
 | 故障点 | 结果 | 回滚动作 |
 | --- | --- | --- |
@@ -132,19 +132,30 @@ Schema、管理 API 与数据库中一并消失。
   下载预算；按旧图片开关 bool 双分支精确迁移（开→`delegated`、关→`native`）并把
   预算原样复制到 chat，随后从 `komari_memory_config` 删除旧开关与 8 项预算列
   （不留 alias / 双读 / fallback）。
+- **0026–0027** 最近上下文 Redis 资源与聊天/上下文中性配置所有权迁移。
+- **0028** `komari_memory_config` 追加 5 个 Hindsight 连接列。
+- **0029** 回复履约送达记忆承诺与旧输出协议退役（不可逆）。
+- **0030** 旧记忆运行面、专用配置列与记忆总结 Prompt 退役（不可逆）。
+- **0031** 删除无调用方的 `komari_chat_config.memory_search_limit`（不可逆）。
 
 0012–0015 只做结构迁移，不写入 Prompt 或场景正文：新增/删除列并搬运旧配置值
 （0012 删除旧输出协议列，0015 把旧图片配置值迁入 chat 并删除 memory 旧列）。
 当前 `seed_bootstrap` 只初始化 Prompt。
-聊天、记忆总结、群总结的 Prompt 缺失会阻止冷启动。
+聊天与群总结的 Prompt 缺失会阻止冷启动。
+记忆总结 Prompt 已随 `0030` 退役。
 判定 Prompt 使用独立的可选初始化步骤。
 迁移 `0025` 删除旧场景四表与 38 个判定专用字段。
 这项删除不可逆，不提供旧场景恢复入口。
+迁移 `0030` 删除旧记忆专用配置列、上下文互动列、聊天死 Prompt 列与记忆总结 Prompt 表。
+`0030` 不删除正式来源记忆表、向量、索引或旧任务表。
+`0031` 只删除失效配置列。
+`0031` 保留其余聊天配置值。
+正式来源数据仍需由运维在停写窗口内一次性导出后再另行处置。
 Prompt 初始化规则见 ADR-0011。
 
 ### 升级步骤（全新库与旧库通用）
 
-全新空库执行完整 `0001 → 0015` 版本链；已在 `0011` 或更早 revision 的旧库沿既有
+全新空库执行完整 `0001 → 0031` 版本链；已在 `0011` 或更早 revision 的旧库沿既有
 版本链顺序升级，不手工 stamp 到 `0011`，也不跳过中间迁移。
 
 1. 备份数据库：运行
@@ -155,7 +166,7 @@ Prompt 初始化规则见 ADR-0011。
 2. 升级到 `head`：运行
    `poetry run python -m komari_bot.db.orm_bootstrap upgrade head`。
    检查：运行 `poetry run python -m komari_bot.db.orm_bootstrap current`，
-   输出 `0025 (head)`。
+   输出 `0031 (head)`。
    回退：失败时该迁移事务已回滚、版本停留原样，修复后重跑本步骤。
 3. 播种初始数据：运行 `poetry run python -m komari_bot.db.seed_bootstrap`。
    检查：命令退出码为 `0`。
@@ -164,6 +175,8 @@ Prompt 初始化规则见 ADR-0011。
    播种保留非空自定义值。
    播种不访问已退役的场景表。
    旧 `output_instruction` 自定义内容不并入任何字段。
+   `seed_bootstrap` 只补种两个必需 Prompt 资源；记忆总结 Prompt 不再创建。
+   可选判定 Prompt 由独立资产单独初始化。
    回退：失败时数据库未满足冷启动校验，恢复备份或修复后重跑本步骤。
 4. 校验模型元数据零漂移：运行
    `poetry run python -m komari_bot.db.orm_bootstrap check`。
@@ -187,10 +200,14 @@ KOMARI_TEST_POSTGRES_URL=postgresql+asyncpg://user:pass@host:5432/komari_bot_tes
     tests/db/test_tsk197_legacy_upgrade_gate.py
 ```
 
-### 失败回滚矩阵
+### 历史迁移回滚矩阵（0012–0029；当前 Hindsight 发布只允许向前修复）
+
+以下回退行只记录历史版本事实，不构成当前 Hindsight 发布的重启旧运行时步骤。
 
 | 故障点 | 结果 | 回滚动作 |
 | --- | --- | --- |
 | 0012–0015 任一执行失败 | 该 revision 事务回滚，版本停留原样 | 修复后重试升级 |
 | 0012 成功完成后退回 | 0012 downgrade 不可逆，无降级路径 | 停新版，恢复升级前备份，启动旧版 |
 | 0013–0015 成功完成后退回 | 可对称 `downgrade` 到 0012，但回退后新配置列消失 | 恢复备份或继续升级 |
+| 0030 成功完成后退回 | `0030` downgrade 不可逆，无降级路径 | 保持聊天禁用，保留正式来源数据，诊断后在新版本上向前修复；不得恢复旧运行时 |
+| 0031 成功完成后退回 | `0031` downgrade 拒绝恢复失效配置 | 在新版本上向前修复配置故障 |

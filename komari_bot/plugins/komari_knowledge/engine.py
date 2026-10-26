@@ -15,6 +15,7 @@ import hashlib
 import logging
 import sys
 from collections import defaultdict
+from collections.abc import Callable
 from typing import Any, Final, cast
 
 from komari_bot.db.orm_connection import get_shared_orm_connection_pool
@@ -61,6 +62,7 @@ def _get_engine_initialize_lock() -> asyncio.Lock:
         _engine_initialize_lock = asyncio.Lock()
         _engine_initialize_lock_loop = loop
     return _engine_initialize_lock
+
 
 # 只有在 NoneBot 环境中才尝试加载 config_manager
 if state.nonebot_mode:
@@ -331,7 +333,12 @@ class KnowledgeEngine:
         return rewritten
 
     async def search(
-        self, query: str, limit: int | None = None, query_vec: list[float] | None = None
+        self,
+        query: str,
+        limit: int | None = None,
+        query_vec: list[float] | None = None,
+        *,
+        embedding_guard: Callable[[], bool] | None = None,
     ) -> list[SearchResult]:
         """
         混合检索：关键词 + 向量。
@@ -340,7 +347,8 @@ class KnowledgeEngine:
             query: 用户查询文本
             limit: 最大返回数量，None 使用配置默认值
             query_vec: 预先计算好的查询特征向量，若提供则跳过模型推理
-
+            embedding_guard: 仅在需要即时生成查询向量时调用；返回 False 或
+                抛出普通异常时跳过向量层，不发起 embedding 或向量查询。
 
         Returns:
             检索结果列表，按相关性排序
@@ -417,6 +425,7 @@ class KnowledgeEngine:
                 vector_limit,
                 seen_ids,
                 query_vec=query_vec,
+                embedding_guard=embedding_guard,
             )
             results.extend(vector_hits)
 
@@ -543,6 +552,8 @@ class KnowledgeEngine:
         limit: int,
         exclude_ids: set[int],
         query_vec: list[float] | None = None,
+        *,
+        embedding_guard: Callable[[], bool] | None = None,
     ) -> list[SearchResult]:
         """
         Layer 2: 向量语义检索。
@@ -554,7 +565,7 @@ class KnowledgeEngine:
             limit: 最大返回数量
             exclude_ids: 要排除的知识 ID（已被关键词匹配）
             query_vec: 预先计算好的查询向量
-
+            embedding_guard: 即时生成查询向量前的最后一道同步准入检查。
 
         Returns:
             检索结果列表
@@ -565,8 +576,16 @@ class KnowledgeEngine:
         # 获取配置
         config = get_config()
 
-        # 生成查询向量
+        # 生成查询向量。准入只保护紧随其后的 embedding 效果；已提供的
+        # query_vec 不需要生成向量，因此无需调用 guard。
         if query_vec is None:
+            if embedding_guard is not None:
+                try:
+                    admitted = embedding_guard()
+                except Exception:
+                    return []
+                if not admitted:
+                    return []
             query_vec = await self._get_embedding(query)
 
         async with self._pool.acquire() as conn:

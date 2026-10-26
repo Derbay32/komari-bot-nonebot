@@ -10,6 +10,7 @@ from nonebot.plugin import PluginMetadata, require
 require("user_data")
 require("character_binding")
 require("komari_chat")
+require("komari_context")
 require("group_history_summary")
 require("group_admission")
 require("agent_run_logger")

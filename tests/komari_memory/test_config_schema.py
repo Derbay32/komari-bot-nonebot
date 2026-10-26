@@ -1,167 +1,133 @@
-"""KomariMemory 配置清理测试。"""
+"""TSK-197: KomariMemory keeps exactly the six live Hindsight fields."""
 
 from __future__ import annotations
 
+import pytest
+
 from komari_bot.plugins.komari_memory.config_schema import KomariMemoryConfigSchema
 
+LIVE_FIELDS = {
+    "plugin_enable",
+    "hindsight_base_url",
+    "hindsight_api_key",
+    "hindsight_bank_id",
+    "hindsight_request_timeout_seconds",
+    "hindsight_recovery_interval_seconds",
+}
 
-def test_config_schema_no_longer_exposes_removed_bert_fields() -> None:
-    fields = KomariMemoryConfigSchema.model_fields
+RETIRED_MEMORY_FIELDS = {
+    "llm_model_summary",
+    "llm_temperature_summary",
+    "llm_max_tokens_summary",
+    "llm_request_api_summary",
+    "llm_stream_enabled_summary",
+    "llm_thinking_mode_summary",
+    "llm_reasoning_effort_summary",
+    "summary_idle_timeout",
+    "summary_min_messages",
+    "summary_max_buffer_size",
+    "conversation_snapshot_ttl_seconds",
+    "conversation_processing_lease_seconds",
+    "profile_snapshot_ttl_seconds",
+    "profile_snapshot_enable",
+    "profile_trait_limit",
+    "memory_agent_max_rounds",
+    "memory_agent_staging_ttl_seconds",
+    "memory_agent_max_tool_calls",
+    "memory_agent_max_read_profiles",
+    "memory_agent_max_write_operations",
+    "memory_agent_lock_timeout_seconds",
+    "global_interaction_summary_interval_minutes",
+    "global_interaction_processing_lease_seconds",
+    "response_tag",
+    "forgetting_enabled",
+    "forgetting_importance_threshold",
+    "forgetting_decay_factor",
+    "forgetting_access_boost",
+    "forgetting_min_age_days",
+    "forgetting_fuzzify_concurrency",
+    "forgetting_job_lease_seconds",
+    "query_rewrite_history_limit",
+    "bot_aliases",
+}
 
-    assert "bert_service_url" not in fields
-    assert "bert_timeout" not in fields
+
+def test_memory_schema_exposes_exactly_the_live_hindsight_fields() -> None:
+    assert set(KomariMemoryConfigSchema.model_fields) == {
+        "id",
+        "revision",
+        "updated_at",
+        *LIVE_FIELDS,
+    }
+    assert not RETIRED_MEMORY_FIELDS & set(KomariMemoryConfigSchema.model_fields)
+    assert not RETIRED_MEMORY_FIELDS & set(KomariMemoryConfigSchema().model_dump())
+    assert len(RETIRED_MEMORY_FIELDS) == 33
 
 
-def test_config_schema_defaults_no_longer_contain_dead_fields() -> None:
-    config = KomariMemoryConfigSchema().model_dump()
-
-    assert "bert_service_url" not in config
-    assert "bert_timeout" not in config
-    assert "llm_provider" not in config
-    assert "api_enabled" not in config
-    assert config["profile_trait_limit"] == 20
+def test_memory_config_resource_is_optional_at_startup() -> None:
+    assert KomariMemoryConfigSchema.startup_required is False
+    assert "startup_required" not in KomariMemoryConfigSchema.model_fields
+    assert "startup_required" not in KomariMemoryConfigSchema().model_dump()
 
 
-def test_config_schema_exposes_profile_trait_limit() -> None:
+def test_plugin_enable_defaults_false_and_applies_immediately() -> None:
     config = KomariMemoryConfigSchema()
 
-    assert "api_enabled" not in KomariMemoryConfigSchema.model_fields
-    assert config.profile_trait_limit == 20
+    assert config.plugin_enable is False
+    field_extra = KomariMemoryConfigSchema.model_fields[
+        "plugin_enable"
+    ].json_schema_extra
+    assert isinstance(field_extra, dict)
+    assert field_extra["apply_mode"] == "immediate"
 
 
-def test_config_schema_declares_non_immediate_lifecycle_fields() -> None:
-    expected_modes = {
-        "plugin_enable": "restart",
-        "redis_db": "rebuild",
-        "global_interaction_summary_interval_minutes": "rebuild",
-    }
+def test_hindsight_config_defaults_and_secret_metadata() -> None:
+    """TSK-193：Hindsight 连接字段默认空、超时/恢复间隔有显式默认值。"""
+    config = KomariMemoryConfigSchema()
 
-    assert KomariMemoryConfigSchema.model_config.get("json_schema_extra") == {
-        "default_apply_mode": "immediate"
-    }
-    for field_name, expected_mode in expected_modes.items():
+    assert config.hindsight_base_url == ""
+    assert config.hindsight_api_key == ""
+    assert config.hindsight_bank_id == ""
+    assert config.hindsight_request_timeout_seconds == 10.0
+    assert config.hindsight_recovery_interval_seconds == 30.0
+
+    api_key_extra = KomariMemoryConfigSchema.model_fields[
+        "hindsight_api_key"
+    ].json_schema_extra
+    assert isinstance(api_key_extra, dict)
+    assert api_key_extra["secret"] is True
+
+    for field_name in (
+        "hindsight_base_url",
+        "hindsight_api_key",
+        "hindsight_bank_id",
+        "hindsight_request_timeout_seconds",
+        "hindsight_recovery_interval_seconds",
+    ):
         field_extra = KomariMemoryConfigSchema.model_fields[
             field_name
         ].json_schema_extra
         assert isinstance(field_extra, dict)
-        assert field_extra["apply_mode"] == expected_mode
-
-
-def test_config_schema_rejects_too_small_profile_trait_limit() -> None:
-    import pytest
+        assert field_extra["apply_mode"] == "immediate"
 
     with pytest.raises(ValueError):
-        KomariMemoryConfigSchema(profile_trait_limit=0)
-
-
-MIGRATED_TO_KOMARI_CHAT_FIELDS = (
-    "proactive_enabled",
-    "proactive_score_threshold",
-    "proactive_cooldown",
-    "proactive_max_per_hour",
-    "proactive_reservation_ttl_seconds",
-    "reply_commit_worker_interval_seconds",
-    "reply_commit_batch_size",
-    "reply_commit_lease_seconds",
-    "reply_commit_max_attempts",
-    "reply_commit_retry_base_seconds",
-    "reply_commit_tombstone_retention_days",
-)
-
-# TSK-194：图片理解模式与 8 项下载预算整体迁入 komari_chat_config；
-# memory 侧物理删除（不保留 alias / 双读 / fallback）。
-MIGRATED_TO_KOMARI_CHAT_VISION_FIELDS = (
-    "vision_tool_enabled",
-    "vision_image_download_max_count",
-    "vision_image_download_max_bytes",
-    "vision_image_download_total_max_bytes",
-    "vision_image_download_max_pixels",
-    "vision_image_download_concurrency",
-    "vision_image_download_connect_timeout_seconds",
-    "vision_image_download_read_timeout_seconds",
-    "vision_image_download_total_timeout_seconds",
-)
-
-
-def test_config_schema_no_longer_exposes_migrated_proactive_fields() -> None:
-    """频控/outbox 字段已迁入 komari_chat_config（KOMARIBOT-7）。"""
-    fields = KomariMemoryConfigSchema.model_fields
-
-    for field_name in MIGRATED_TO_KOMARI_CHAT_FIELDS:
-        assert field_name not in fields
-
-
-def test_config_schema_no_longer_exposes_migrated_vision_fields() -> None:
-    """TSK-194：9 个旧图片字段从 komari_memory_config 物理删除。"""
-    fields = KomariMemoryConfigSchema.model_fields
-
-    for field_name in MIGRATED_TO_KOMARI_CHAT_VISION_FIELDS:
-        assert field_name not in fields
-    dumped = KomariMemoryConfigSchema().model_dump()
-    for field_name in MIGRATED_TO_KOMARI_CHAT_VISION_FIELDS:
-        assert field_name not in dumped
-
-
-def test_interaction_processing_lease_has_bounded_immediate_config() -> None:
-    import pytest
-
-    config = KomariMemoryConfigSchema()
-    field_extra = KomariMemoryConfigSchema.model_fields[
-        "global_interaction_processing_lease_seconds"
-    ].json_schema_extra
-
-    assert config.global_interaction_processing_lease_seconds == 1800
-    assert isinstance(field_extra, dict)
-    assert field_extra["apply_mode"] == "immediate"
+        KomariMemoryConfigSchema(hindsight_request_timeout_seconds=0.0)
     with pytest.raises(ValueError):
-        KomariMemoryConfigSchema(global_interaction_processing_lease_seconds=59)
+        KomariMemoryConfigSchema(hindsight_request_timeout_seconds=120.1)
     with pytest.raises(ValueError):
-        KomariMemoryConfigSchema(global_interaction_processing_lease_seconds=7201)
+        KomariMemoryConfigSchema(hindsight_recovery_interval_seconds=0.0)
+    with pytest.raises(ValueError):
+        KomariMemoryConfigSchema(hindsight_recovery_interval_seconds=3600.1)
 
 
-def test_vision_image_download_budget_no_longer_lives_in_memory() -> None:
-    """TSK-194：图片下载预算字段已迁入 komari_chat_config，memory 无对应列。"""
+def test_hindsight_config_has_no_legacy_connection_aliases() -> None:
+    """TSK-193：新字段不兼容旧连接字段，不提供别名或默认回退。"""
     fields = KomariMemoryConfigSchema.model_fields
+
     assert not {
-        "vision_image_download_max_count",
-        "vision_image_download_max_bytes",
-        "vision_image_download_total_max_bytes",
-        "vision_image_download_max_pixels",
-        "vision_image_download_concurrency",
-        "vision_image_download_connect_timeout_seconds",
-        "vision_image_download_read_timeout_seconds",
-        "vision_image_download_total_timeout_seconds",
-    }.intersection(fields)
-
-
-def test_config_schema_request_protocol_defaults() -> None:
-    config = KomariMemoryConfigSchema()
-
-    assert config.llm_request_api_chat == "chat_completions"
-    assert config.llm_stream_enabled_chat is False
-    assert config.llm_request_api_summary == "chat_completions"
-    assert config.llm_stream_enabled_summary is False
-
-
-def test_config_schema_accepts_responses_request_api() -> None:
-    config = KomariMemoryConfigSchema(
-        llm_request_api_chat="responses",
-        llm_stream_enabled_chat=True,
-        llm_request_api_summary="responses",
-        llm_stream_enabled_summary=True,
-    )
-
-    assert config.llm_request_api_chat == "responses"
-    assert config.llm_stream_enabled_chat is True
-    assert config.llm_request_api_summary == "responses"
-    assert config.llm_stream_enabled_summary is True
-
-
-def test_config_schema_rejects_invalid_request_api() -> None:
-    import pytest
-    from pydantic import ValidationError
-
-    with pytest.raises(ValidationError):
-        KomariMemoryConfigSchema(llm_request_api_chat="websocket")  # type: ignore[arg-type]
-    with pytest.raises(ValidationError):
-        KomariMemoryConfigSchema(llm_request_api_summary="websocket")  # type: ignore[arg-type]
+        "hindsight_url",
+        "hindsight_token",
+        "hindsight_target_bank",
+        "hindsight_timeout",
+        "hindsight_retry_interval",
+    } & set(fields)

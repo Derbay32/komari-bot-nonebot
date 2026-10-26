@@ -1,243 +1,85 @@
-"""Komari Memory - 智能记忆与对话插件。"""
+"""Komari Memory - Hindsight shared long-term memory caller."""
 
-from typing import TYPE_CHECKING
+from __future__ import annotations
+
+import asyncio
 
 from nonebot import get_driver, logger
-from nonebot.plugin import PluginMetadata, require
+from nonebot.plugin import PluginMetadata
 
-from komari_bot.db.pgvector_schema import ensure_vector_column_dimension
-
-if TYPE_CHECKING:
-    from .config_schema import KomariMemoryConfigSchema
-
-# 依赖插件
-require("nonebot_plugin_apscheduler")
-require("agent_run_logger")
-require("group_admission")
-
-from .api import register_memory_api
 from .config_schema import KomariMemoryConfigSchema
-from .core.retry import retry_async
-from .database.connection import create_pool
-from .handlers.forgetting_worker import (
-    register_forgetting_task,
-    unregister_forgetting_task,
-)
-from .handlers.interaction_event_worker import (
-    register_interaction_event_task,
-    unregister_interaction_event_task,
-)
-from .handlers.summary_worker import register_summary_task, unregister_summary_task
-from .repositories.conversation_repository import ConversationRepository
-from .repositories.entity_repository import EntityRepository
-from .repositories.interaction_event_repository import InteractionEventRepository
 from .services.config_interface import get_config_async
-from .services.forgetting_service import ForgettingService
-from .services.memory_service import MemoryService
-from .services.redis_manager import MessageSchema, RedisManager
+from .services.hindsight_retain import HindsightRetainRequest
+from .services.hindsight_service import (
+    HindsightMemoryService,
+    HindsightRecallSession,
+    HindsightUnavailableError,
+)
 
 __plugin_meta__ = PluginMetadata(
     name="小鞠记忆",
-    description="智能记忆与对话插件，支持向量检索和常识库集成",
+    description="Hindsight 共享长期记忆调用侧",
     usage="自动运行，无需命令",
 )
 
 __all__ = [
+    "HindsightMemoryService",
+    "HindsightRecallSession",
+    "HindsightRetainRequest",
+    "HindsightUnavailableError",
     "KomariMemoryConfigSchema",
-    "MemoryService",
-    "MessageSchema",
-    "PluginManager",
-    "RedisManager",
-    "get_memory_service",
-    "get_plugin_manager",
-    "get_redis_manager",
-    "register_memory_api",
-    "retry_async",
+    "get_hindsight_memory",
 ]
 
 
-class PluginManager:
-    """插件管理器，负责组件的生命周期管理。"""
+class PluginState:
+    """Mutable process-local state owned by this plugin lifecycle."""
 
-    def __init__(self, config: KomariMemoryConfigSchema) -> None:
-        """初始化插件管理器。
-
-        Args:
-            config: 插件配置
-        """
-        self.startup_config = config
-        self.redis: RedisManager | None = None
-        self.memory: MemoryService | None = None
-        self.forgetting: ForgettingService | None = None
-        self.pg_pool = None
-
-    async def initialize(self) -> None:
-        """初始化所有组件。"""
-        logger.info("[KomariMemory] 正在初始化组件...")
-
-        try:
-            # 1. 初始化 PostgreSQL 连接池 (用于向量检索)
-            self.pg_pool = await create_pool()
-            logger.info("[KomariMemory] PostgreSQL 连接池已建立")
-
-            expected_dimension = self._resolve_expected_embedding_dimension()
-            await self._validate_embedding_dimension(expected_dimension)
-
-            # 2. 初始化 Redis 管理器
-            self.redis = RedisManager(self.startup_config)
-            await self.redis.initialize()
-            # 3. 初始化数据访问层
-            conversation_repo = ConversationRepository(self.pg_pool)
-            entity_repo = EntityRepository(self.pg_pool)
-            interaction_event_repo = InteractionEventRepository(self.pg_pool)
-            # 4. 初始化记忆服务
-            self.memory = MemoryService(
-                conversation_repo,
-                entity_repo,
-                interaction_event_repo,
-            )
-
-            # 5. 注册总结定时任务
-            register_summary_task(self.redis, self.memory)
-
-            # 6. 初始化忘却服务并注册定时任务
-            self.forgetting = ForgettingService(self.pg_pool)
-            register_forgetting_task(self.forgetting, self.redis)
-            register_interaction_event_task(self.redis, self.memory)
-        except Exception:
-            logger.exception("[KomariMemory] 初始化失败")
-            try:
-                await self.shutdown()
-            except Exception:
-                logger.exception("[KomariMemory] 初始化失败后的清理失败")
-            raise
-
-        logger.info("[KomariMemory] 组件初始化完成")
-
-    def _resolve_expected_embedding_dimension(self) -> int | None:
-        """解析当前 embedding_provider 的目标维度。"""
-        from komari_bot.plugins import embedding_provider
-
-        get_dimension = getattr(embedding_provider, "get_embedding_dimension", None)
-        expected_dimension: int | None = None
-        if callable(get_dimension):
-            raw_dimension = get_dimension()
-            if isinstance(raw_dimension, int):
-                expected_dimension = raw_dimension
-            elif isinstance(raw_dimension, str):
-                expected_dimension = int(raw_dimension)
-            elif raw_dimension is not None:
-                msg = f"embedding_provider 返回了无效维度类型: {type(raw_dimension)!r}"
-                raise TypeError(msg)
-        return expected_dimension
-
-    async def _validate_embedding_dimension(
-        self,
-        expected_dimension: int | None,
-    ) -> None:
-        """校验会话向量列与 embedding_provider 的维度一致。"""
-        if self.pg_pool is None:
-            msg = "PostgreSQL 连接池未初始化"
-            raise RuntimeError(msg)
-
-        await ensure_vector_column_dimension(
-            self.pg_pool,
-            table_name="komari_memory_conversation_embeddings",
-            column_name="embedding",
-            expected_dimension=expected_dimension,
-            label="KomariMemory",
-        )
-        await ensure_vector_column_dimension(
-            self.pg_pool,
-            table_name="komari_memory_interaction_embeddings",
-            column_name="embedding",
-            expected_dimension=expected_dimension,
-            label="KomariMemory",
-        )
-
-    async def shutdown(self) -> None:
-        """关闭所有组件。"""
-        # 取消定时任务
-        unregister_summary_task()
-        unregister_forgetting_task()
-        unregister_interaction_event_task()
-        # 清理记忆服务
-        if self.memory:
-            await self.memory.cleanup()
-            self.memory = None
-
-        self.forgetting = None
-
-        # 关闭 Redis 连接
-        if self.redis:
-            await self.redis.close()
-            self.redis = None
-
-        # 关闭 PostgreSQL 连接池
-        if self.pg_pool:
-            await self.pg_pool.close()
-            self.pg_pool = None
-
-        logger.info("[KomariMemory] 已关闭")
+    def __init__(self) -> None:
+        self.service: HindsightMemoryService | None = None
 
 
-# 创建插件管理器实例
-_plugin_manager: PluginManager | None = None
+_state = PluginState()
 
 
-def get_plugin_manager() -> PluginManager | None:
-    """获取插件管理器实例。
-
-    Returns:
-        插件管理器实例，如果未初始化则返回 None
-    """
-    return _plugin_manager
+def get_hindsight_memory() -> HindsightMemoryService | None:
+    """Return the stable runtime caller, or ``None`` outside the lifecycle."""
+    return _state.service
 
 
-def get_memory_service() -> MemoryService | None:
-    manager = get_plugin_manager()
-    if manager is None:
-        return None
-    return manager.memory
-
-
-def get_redis_manager() -> RedisManager | None:
-    """获取 Redis 管理器实例。"""
-    manager = get_plugin_manager()
-    if manager is None:
-        return None
-    return manager.redis
-
-
-# 在插件加载时初始化
 driver = get_driver()
 
 
 @driver.on_startup
 async def startup() -> None:
-    """启动时初始化。"""
-    global _plugin_manager  # noqa: PLW0603
-
-    config = await get_config_async()
-
-    if config.plugin_enable:
-        logger.info("[KomariMemory] 插件已启用（记忆/持久化子系统）")
-        manager = PluginManager(config)
-        try:
-            await manager.initialize()
-        except Exception:
-            _plugin_manager = None
-            raise
-        _plugin_manager = manager
-    else:
-        logger.warning("[KomariMemory] 插件未启用，请在配置中设置 plugin_enable=true")
+    """Build the caller and attempt one isolated bounded probe."""
+    service = HindsightMemoryService(config_getter=get_config_async)
+    _state.service = service
+    try:
+        await service.startup_probe()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        # Configuration or transport failure never aborts unrelated plugins.
+        logger.error(
+            "[KomariMemory] Hindsight 启动探测异常: error_type={}",
+            type(exc).__name__,
+        )
 
 
 @driver.on_shutdown
 async def shutdown() -> None:
-    """关闭时清理。"""
-    global _plugin_manager  # noqa: PLW0603
-    manager = get_plugin_manager()
-    if manager:
-        await manager.shutdown()
-    _plugin_manager = None
+    """Close only the caller and its owned session clients."""
+    service = _state.service
+    _state.service = None
+    if service is None:
+        return
+    try:
+        await service.close()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.error(
+            "[KomariMemory] Hindsight 关闭异常: error_type={}",
+            type(exc).__name__,
+        )

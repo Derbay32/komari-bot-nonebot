@@ -17,7 +17,12 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -34,13 +39,62 @@ PRE_START_SCRIPT = PROJECT_ROOT / "docker" / "prestart.sh"
 
 
 def _tracked_doc_files() -> list[Path]:
-    files = [path for path in DOC_PATHS if path.is_file()]
-    files.extend(sorted((PROJECT_ROOT / "docs").rglob("*.md")))
-    return files
+    result = subprocess.run(
+        [
+            "git",
+            "ls-files",
+            "-z",
+            "--",
+            *(str(path.relative_to(PROJECT_ROOT)) for path in DOC_PATHS),
+            "docs/",
+        ],
+        cwd=PROJECT_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    files = [PROJECT_ROOT / name for name in result.stdout.split("\0") if name]
+    return [
+        path
+        for path in files
+        if path.is_file() and (path in DOC_PATHS or path.suffix == ".md")
+    ]
 
 
 def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
+
+
+def test_tracked_doc_inventory_excludes_ignored_and_untracked_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Historical local material must not enter the tracked-doc inventory."""
+    tracked = tmp_path / "docs" / "adr" / "current.md"
+    tracked.parent.mkdir(parents=True)
+    tracked.write_text("Current decision\n", encoding="utf-8")
+    ignored = tmp_path / "docs" / "handoff" / "old.md"
+    ignored.parent.mkdir(parents=True)
+    ignored.write_text("vision_tool_enabled\n", encoding="utf-8")
+    (tmp_path / "docs" / "draft.md").write_text("Untracked draft\n", encoding="utf-8")
+    (tmp_path / ".gitignore").write_text("docs/handoff/\n", encoding="utf-8")
+    agents = tmp_path / "AGENTS.md"
+    agents.write_text("Current instructions\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(
+        ["git", "add", "AGENTS.md", "docs/adr/current.md"],
+        cwd=tmp_path,
+        check=True,
+    )
+    monkeypatch.setattr(f"{__name__}.PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(f"{__name__}.DOC_PATHS", (agents,))
+
+    actual = _tracked_doc_files()
+
+    assert ignored not in actual
+    assert sorted(path.relative_to(tmp_path).as_posix() for path in actual) == [
+        "AGENTS.md",
+        "docs/adr/current.md",
+    ]
 
 
 def test_ai_context_documents_new_chat_contract() -> None:
@@ -81,7 +135,9 @@ def test_ai_context_does_not_present_removed_output_instruction() -> None:
 
 def test_adr_0009_records_output_instruction_removal_context_only() -> None:
     """AC10：ADR-0009 只在移除语境中提及 output_instruction。"""
-    adr = _read(PROJECT_ROOT / "docs" / "adr" / "0009-configurable-chat-agent-tool-protocol.md")
+    adr = _read(
+        PROJECT_ROOT / "docs" / "adr" / "0009-configurable-chat-agent-tool-protocol.md"
+    )
     assert "output_instruction" in adr
     assert "不再作为" in adr and "删除" in adr, (
         "ADR-0009 必须把 output_instruction 记录为已删除/不再作为真源"

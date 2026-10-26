@@ -79,6 +79,7 @@ def _ensure_package_shim(plugin_name: str) -> None:
     sys.modules[package_name] = shim
 
 
+_ensure_package_shim("komari_context")
 _ensure_package_shim("komari_memory")
 _ensure_package_shim("komari_knowledge")
 _ensure_package_shim("llm_provider")
@@ -263,8 +264,23 @@ class _DummyUserBanPlugin:
 
 class _DummyMemoryPlugin:
     @staticmethod
-    def get_plugin_manager() -> object | None:
+    def get_hindsight_memory() -> object | None:
         return None
+
+
+class _DummyContextPlugin:
+    @staticmethod
+    def get_context_store() -> object | None:
+        return None
+
+    @staticmethod
+    def get_context_config() -> object:
+        return SimpleNamespace(
+            bot_nickname="小鞠知花",
+            error_notify_enabled=True,
+            global_interaction_enabled=True,
+            global_interaction_trigger_size=20,
+        )
 
 
 class _DummyKnowledgePlugin:
@@ -440,6 +456,7 @@ _REQUIRE_REGISTRY: dict[str, object] = {
     "embedding_provider": _DummyEmbeddingPlugin(),
     "user_data": _DummyUserDataPlugin(),
     "user_ban": _DummyUserBanPlugin(),
+    "komari_context": _DummyContextPlugin(),
     "komari_memory": _DummyMemoryPlugin(),
     "komari_knowledge": _DummyKnowledgePlugin(),
     "character_binding": _DummyCharacterBindingPlugin(),
@@ -532,23 +549,39 @@ _inject_package_exports(
 # KOMARIBOT-12：komari_memory 顶层暴露面符号（ADR-0006 边界）同步注入
 # shim；符号取真实实现（shim 下子模块仍按真实路径加载），保证
 # komari_chat 经顶层包导入后测试中的构造与调用语义不变
+from komari_bot.context.redis_store import MessageSchema, RecentContextStore
+from komari_bot.plugins.komari_context.config_schema import (
+    KomariContextConfigSchema,
+)
 from komari_bot.plugins.komari_memory.config_schema import KomariMemoryConfigSchema
-from komari_bot.plugins.komari_memory.core.retry import retry_async
-from komari_bot.plugins.komari_memory.services.memory_service import MemoryService
-from komari_bot.plugins.komari_memory.services.redis_manager import (
-    MessageSchema,
-    RedisManager,
+from komari_bot.plugins.komari_memory.services.hindsight_retain import (
+    HindsightRetainRequest,
+)
+from komari_bot.plugins.komari_memory.services.hindsight_service import (
+    HindsightMemoryService,
+    HindsightRecallSession,
+    HindsightUnavailableError,
 )
 
 _inject_package_exports(
+    "komari_context",
+    {
+        "KomariContextConfigSchema": KomariContextConfigSchema,
+        "MessageSchema": MessageSchema,
+        "RecentContextStore": RecentContextStore,
+        "get_context_config": _DummyContextPlugin.get_context_config,
+        "get_context_store": _DummyContextPlugin.get_context_store,
+    },
+)
+_inject_package_exports(
     "komari_memory",
     {
-        "get_plugin_manager": _DummyMemoryPlugin.get_plugin_manager,
+        "get_hindsight_memory": _DummyMemoryPlugin.get_hindsight_memory,
         "KomariMemoryConfigSchema": KomariMemoryConfigSchema,
-        "MemoryService": MemoryService,
-        "MessageSchema": MessageSchema,
-        "RedisManager": RedisManager,
-        "retry_async": retry_async,
+        "HindsightMemoryService": HindsightMemoryService,
+        "HindsightRecallSession": HindsightRecallSession,
+        "HindsightRetainRequest": HindsightRetainRequest,
+        "HindsightUnavailableError": HindsightUnavailableError,
     },
 )
 _inject_package_exports(

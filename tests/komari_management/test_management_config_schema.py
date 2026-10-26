@@ -35,6 +35,7 @@ def _load_schema_class(plugin_name: str, class_name: str) -> type[Any]:
     [
         ("komari_management", "DynamicConfigSchema", "restart"),
         ("embedding_provider", "DynamicConfigSchema", "restart"),
+        ("komari_context", "KomariContextConfigSchema", "immediate"),
         ("komari_memory", "KomariMemoryConfigSchema", "immediate"),
         ("komari_chat", "KomariChatConfigSchema", "immediate"),
         ("komari_sentry", "KomariSentryConfigSchema", "restart"),
@@ -65,6 +66,7 @@ def test_managed_config_schemas_declare_default_apply_mode(
         ("komari_management", "DynamicConfigSchema", "api_credentials"),
         ("embedding_provider", "DynamicConfigSchema", "embedding_api_key"),
         ("embedding_provider", "DynamicConfigSchema", "rerank_api_key"),
+        ("komari_memory", "KomariMemoryConfigSchema", "hindsight_api_key"),
         ("komari_sentry", "KomariSentryConfigSchema", "dsn"),
         ("llm_provider", "DynamicConfigSchema", "api_token"),
     ],
@@ -79,6 +81,23 @@ def test_managed_secret_fields_use_explicit_schema_metadata(
 
     assert isinstance(field_extra, dict)
     assert field_extra["secret"] is True
+
+
+def test_management_registers_komari_context_config_resource() -> None:
+    """TSK-192：context Redis 资源进入统一配置管理面。"""
+    init_path = (
+        Path(__file__).resolve().parents[2]
+        / "komari_bot"
+        / "plugins"
+        / "komari_management"
+        / "__init__.py"
+    )
+    source = init_path.read_text(encoding="utf-8")
+
+    config_block = source.split("config_resources=(", 1)[1].split(
+        "prompt_resources", 1
+    )[0]
+    assert '"komari_context"' in config_block
 
 
 def test_management_registers_komari_chat_config_resource() -> None:

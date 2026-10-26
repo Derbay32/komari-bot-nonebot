@@ -30,6 +30,7 @@ import pytest
 from komari_bot.plugins.komari_chat.reply_fulfillment_domain import (
     AssistantReplyHistoryPayload,
     FavorabilityAdjustmentPayload,
+    HindsightMemoryPayload,
     ProactiveReplyConfirmationPayload,
     ReplyCommitmentInput,
     ReplyFulfillmentDraft,
@@ -37,14 +38,17 @@ from komari_bot.plugins.komari_chat.reply_fulfillment_domain import (
 from komari_bot.plugins.komari_chat.repositories.reply_fulfillment_repository import (
     ReplyFulfillmentRepository,
 )
+from tests.komari_chat.hindsight_commitment_support import (
+    serialized_retain_request,
+)
 
 POSTGRES_URL = os.getenv("KOMARI_TEST_POSTGRES_URL", "")
 SQLALCHEMY_URL = os.getenv("SQLALCHEMY_DATABASE_URL", "")
 
 
-def _db_identity(url: str) -> tuple[str, None | int, int]:
+def _db_identity(url: str) -> tuple[str, None | int, str]:
     parsed = urlsplit(url.replace("postgresql+asyncpg://", "postgresql://"))
-    return parsed.hostname or "", parsed.port, len(parsed.path)
+    return parsed.hostname or "", parsed.port, parsed.path
 
 
 DATABASE_CONFIGURED = bool(POSTGRES_URL and SQLALCHEMY_URL) and (
@@ -70,18 +74,40 @@ def _draft(fulfillment_id: str) -> ReplyFulfillmentDraft:
             ReplyCommitmentInput(
                 commitment_type="proactive_reply_confirmation",
                 payload=ProactiveReplyConfirmationPayload(
-                    group_id="group-1", reservation_id="r-1", cooldown_seconds=300),
+                    group_id="group-1", reservation_id="r-1", cooldown_seconds=300
+                ),
             ),
             ReplyCommitmentInput(
                 commitment_type="favorability_adjustment",
                 payload=FavorabilityAdjustmentPayload(
-                    user_id="user-1", delta=1, reason="互动"),
+                    user_id="user-1", delta=1, reason="互动"
+                ),
             ),
             ReplyCommitmentInput(
                 commitment_type="assistant_reply_history",
                 payload=AssistantReplyHistoryPayload(
-                    group_id="group-1", bot_nickname="小鞠",
-                    reply_content="正文", reply_timestamp=2.0),
+                    group_id="group-1",
+                    bot_nickname="小鞠",
+                    reply_content="正文",
+                    reply_timestamp=2.0,
+                ),
+            ),
+            ReplyCommitmentInput(
+                commitment_type="hindsight_memory",
+                payload=HindsightMemoryPayload(
+                    request=serialized_retain_request(
+                        fulfillment_id=fulfillment_id,
+                        reply_content="正文",
+                        group_id="group-1",
+                        bot_self_id="bot-1",
+                        adapter_name="onebot.v11",
+                        trigger_message_id=f"message-{fulfillment_id}",
+                        trigger_user_id="user-1",
+                        reply_target_message_id="target-1",
+                        generated_at=2.0,
+                        bot_nickname="小鞠",
+                    ),
+                ),
             ),
         ),
     )
@@ -134,13 +160,29 @@ def _slots_key(group_id: str) -> str:
     return f"{_PROACTIVE_SLOTS_KEY_PREFIX}{group_id}"
 
 
+def _case_cleanup_keys(group_id: str) -> tuple[str, str]:
+    from komari_bot.plugins.komari_chat.services.proactive_reservation import (
+        _PROACTIVE_COOLDOWN_KEY_PREFIX,
+        _PROACTIVE_SLOTS_KEY_PREFIX,
+    )
+
+    return (
+        f"{_PROACTIVE_COOLDOWN_KEY_PREFIX}{group_id}",
+        f"{_PROACTIVE_SLOTS_KEY_PREFIX}{group_id}",
+    )
+
+
 async def _redis_client() -> Any:
     import redis.asyncio as aioredis
 
     return aioredis.from_url(REDIS_URL, decode_responses=True)
 
 
-def _service(client: Any, **overrides: object) -> Any:
+def _service(
+    client: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    **overrides: object,
+) -> Any:
     from komari_bot.plugins.komari_chat.services import proactive_reservation as pr
 
     def _cfg() -> Any:
@@ -154,16 +196,18 @@ def _service(client: Any, **overrides: object) -> Any:
         base.update(overrides)
         return SimpleNamespace(**base)
 
-    pr.get_config = _cfg
+    monkeypatch.setattr(pr, "get_config", _cfg)
     return pr.ProactiveReservationService(client)
 
 
-async def test_real_redis_release_idempotent_and_confirmed_not_revoked() -> None:
+async def test_real_redis_release_idempotent_and_confirmed_not_revoked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """预占释放幂等，已确认名额绝不因 release 撤销。"""
     if not REDIS_URL:
         pytest.skip("未配置真实 Redis")
     client = await _redis_client()
-    service = _service(client)
+    service = _service(client, monkeypatch)
     gid = f"tsk228r-{uuid4().hex[:10]}"
     slots = _slots_key(gid)
     try:
@@ -174,16 +218,18 @@ async def test_real_redis_release_idempotent_and_confirmed_not_revoked() -> None
         assert await handoff.release() is False, "重复释放应幂等"
         assert await client.zscore(slots, f"pending:{rid}") is None
     finally:
-        await client.flushdb()
+        await client.delete(*_case_cleanup_keys(gid))
         await client.aclose()
 
 
-async def test_real_redis_confirm_idempotent_and_confirmed_survives_release() -> None:
+async def test_real_redis_confirm_idempotent_and_confirmed_survives_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """confirm 幂等，已确认名额持续存在且 release 不撤销。"""
     if not REDIS_URL:
         pytest.skip("未配置真实 Redis")
     client = await _redis_client()
-    service = _service(client)
+    service = _service(client, monkeypatch)
     gid = f"tsk228c-{uuid4().hex[:10]}"
     slots = _slots_key(gid)
     try:
@@ -195,11 +241,13 @@ async def test_real_redis_confirm_idempotent_and_confirmed_survives_release() ->
         await service.release(gid, rid)
         assert await client.zscore(slots, f"confirmed:{rid}") is not None
     finally:
-        await client.flushdb()
+        await client.delete(*_case_cleanup_keys(gid))
         await client.aclose()
 
 
-async def test_real_redis_pending_expires_by_ttl() -> None:
+async def test_real_redis_pending_expires_by_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """pending 预占超过短 TTL 后按纯 TTL 淘汰，handoff 抛 ReservationLostError。"""
     if not REDIS_URL:
         pytest.skip("未配置真实 Redis")
@@ -209,7 +257,7 @@ async def test_real_redis_pending_expires_by_ttl() -> None:
     )
 
     client = await _redis_client()
-    service = _service(client, proactive_reservation_ttl_seconds=1)
+    service = _service(client, monkeypatch, proactive_reservation_ttl_seconds=1)
     gid = f"tsk228t-{uuid4().hex[:10]}"
     rid = f"res-{uuid4().hex[:10]}"
     try:
@@ -218,5 +266,5 @@ async def test_real_redis_pending_expires_by_ttl() -> None:
         with pytest.raises(ReservationLostError):
             await lease.handoff()
     finally:
-        await client.flushdb()
+        await client.delete(*_case_cleanup_keys(gid))
         await client.aclose()

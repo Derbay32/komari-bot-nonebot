@@ -1,256 +1,106 @@
 # Komari Memory
 
-小鞠记忆与对话插件，负责群聊消息缓冲、对话总结、记忆检索、忘却策略。
+本插件是 Hindsight 共享长期记忆的调用侧。
+本插件不维护对话摘要、用户画像、互动历史或忘却任务。
 
-## 当前状态
+## 代码边界
 
-- 插件入口：`komari_bot/plugins/komari_memory/__init__.py`
-- 数据访问：`repositories/`
-- 核心服务：`services/`
-- 后台任务：`handlers/summary_worker.py`、`handlers/forgetting_worker.py`
-- Schema 唯一权威：`migrations/` Alembic 版本链（`0001_baseline_full_schema.py`）；`komari_bot/db/vector_storage_schema.py` 仅用于离线渲染对照 SQL
+保留文件：
 
-运行时特性：
+- `__init__.py`
+- `config_schema.py`
+- `services/config_interface.py`
+- `services/hindsight_service.py`
+- `services/hindsight_retain.py`
 
-- 连接统一经 `komari_bot/db/orm_connection.py` 共享引擎 raw 适配层（nonebot-plugin-orm 托管，保留 asyncpg 风格 `$n` SQL）
-- 表结构与 HNSW 索引由 Alembic 迁移统一管理，运行时无任何 DDL
-- 启动阶段校验向量列维度；维度不匹配时通过迁移脚本升级
+顶层只暴露：
 
-历史 `database/init_orm.sql` 已废弃并会直接退出，避免旧表结构被误用。手工预建、
-运维或排障时，通过 `scripts/render_memory_schema.py` 从迁移结构生成一次性 SQL。
+- `KomariMemoryConfigSchema`
+- `HindsightMemoryService`
+- `HindsightRecallSession`
+- `HindsightRetainRequest`
+- `HindsightUnavailableError`
+- `get_hindsight_memory`
 
-## 依赖
+TSK-197 已删除旧 agent、core、database、handlers、repositories、api、
+prompt_schema 与旧服务文件。
+旧总结、画像、互动与忘却 worker 不再注册。
 
-- PostgreSQL 12+，并安装 `pgvector`；连接由 nonebot-plugin-orm（`SQLALCHEMY_DATABASE_URL`）统一托管
-- Redis 5+
-- `embedding_provider`
-- `llm_provider`
-- `config_manager`
-- `nonebot_plugin_apscheduler`
+## 生命周期
 
-## 快速开始
+1. 插件启动时创建一个稳定 caller。
+2. 启动探测最多执行一次。
+3. 配置读取失败或探测失败时记录安全诊断。
+4. 探测失败不影响其他插件启动。
+5. 插件关闭时只关闭自有客户端与在途会话。
+6. 插件关闭时不关闭 Redis 与共享 ORM。
 
-### 1. 配置数据库与 Redis
+## 配置
 
-数据库连接唯一权威是 `SQLALCHEMY_DATABASE_URL`（`.env` / `.env.dev` / `.env.prod` 或进程环境变量，旧 `PG_*` 配置已下线）；Redis 引导配置为 `REDIS_HOST` / `REDIS_PORT` / `REDIS_PASSWORD`（见 `komari_bot/config/redis_config.py`）。
+配置表为 `komari_memory_config`。
+正文只有 6 个字段：
 
-插件动态配置存储在强类型单行表 `komari_memory_config`，首次缺失时由 schema 默认值或 dotenv 初始化。
-
-最小示例：
-
-```json
-{
-  "plugin_enable": true,
-  "redis_host": "localhost",
-  "redis_port": 6379
-}
-```
-
-### 2. 启动插件
-
-Bot 启动后：
-
-- 会初始化共享引擎连接租约（nonebot-plugin-orm）
-- 表结构由 Alembic 迁移统一管理，无需运行时补齐
-- 会校验独立 embedding 表与 provider 维度一致
-- 会初始化 Redis 缓冲区管理
-- 会注册总结任务和忘却任务
-
-## 手工初始化与迁移
-
-### 从运行时 DDL 生成运维 SQL
-
-大多数场景不需要手工执行。确需预建或排障时，先按当前
-`embedding_provider` 维度生成并审阅一次性 SQL：
-
-```bash
-poetry run python scripts/render_memory_schema.py \
-  --embedding-dimension 512 \
-  --output /tmp/komari-memory-schema.sql
-```
-
-确认 SQL 与备份后再执行；`ON_ERROR_STOP` 禁止部分成功后继续：
-
-```bash
-psql -v ON_ERROR_STOP=1 \
-  -h localhost -U your_username -d komari_bot \
-  -f /tmp/komari-memory-schema.sql
-```
-
-不要执行 `database/init_orm.sql`；它只保留 fail-closed 的迁移提示。
-
-### 对话向量迁移
-
-切换 embedding 模型后，先做 dry-run：
-
-```bash
-poetry run python scripts/migrate_embeddings.py --target memory
-```
-
-执行真实迁移：
-
-```bash
-poetry run python scripts/migrate_embeddings.py --apply --target memory
-```
-
-### 单表实体拆表
-
-记忆四层与独立 embedding 表的最终结构已由 Alembic 基线 `0001` 一次性建立；
-v1.x 时代的手工拆表脚本（`split_komari_memory_entity_tables.py` 等）已随
-v2.0.0 删除，不再需要单独执行。
-
-## 核心能力
-
-### 对话总结
-
-- 群聊消息先进入 Redis 缓冲
-- 达到消息数 / token / 时间阈值后，触发总结任务
-- 总结结果写入 `komari_memory_conversations`
-- 用户画像写入 `komari_memory_user_profile`
-- 跨群互动事件写入 `komari_memory_interaction_history`，向量写入独立 embedding 表
-
-### 记忆检索
-
-- 用 `embedding_provider` 生成查询向量
-- 在 `komari_memory_conversations` 上做 pgvector 检索
-- 如启用 rerank，会先取更大的候选集，再只对最终命中结果更新访问时间与重要性
-
-### 忘却策略
-
-忘却任务每天凌晨 4 点运行，核心规则：
-
-- `importance_current` 使用整数模型，每天执行 `-1`，最低降到 `0`
-- 记忆被命中后，`importance_current` 直接恢复为 `importance_initial`
-- `importance_initial <= forgetting_importance_threshold` 的低价值记忆，归零后会直接删除
-- `importance_initial > forgetting_importance_threshold` 的高价值记忆，第一次归零会交给 LLM 模糊化并重置重要性，下一次归零再删除
-- `forgetting_fuzzify_concurrency`：首次归零模糊化时的并发上限
-- `forgetting_min_age_days`：未达到最小保留天数的记忆不会被删除或模糊化
-
-## 主要配置
-
-完整定义见：
-
-- `komari_bot/plugins/komari_memory/config_schema.py`
-
-常用项如下：
-
-### 基础与连接
-
-| 配置项 | 默认值 | 说明 |
+| 字段 | 默认值 | 说明 |
 | --- | --- | --- |
-| `plugin_enable` | `false` | 插件总开关 |
-| `plugin_enable` 由本插件自持开启
-| `redis_host` | `localhost` | Redis 主机 |
-| `redis_port` | `6379` | Redis 端口 |
-| `redis_db` | `1` | Redis DB |
+| `plugin_enable` | `false` | 插件启用状态 |
+| `hindsight_base_url` | `""` | Hindsight 服务基础地址 |
+| `hindsight_api_key` | `""` | Hindsight 服务凭据 |
+| `hindsight_bank_id` | `""` | 共享记忆库标识 |
+| `hindsight_request_timeout_seconds` | `10.0` | 单次请求超时 |
+| `hindsight_recovery_interval_seconds` | `30.0` | 失败后恢复探测最小间隔 |
 
-### 总结与检索
+`hindsight_api_key` 标记为秘密字段。
+`plugin_enable` 使用即时生效模式。
+`startup_required=False` 保留。
 
-| 配置项 | 默认值 | 说明 |
-| --- | --- | --- |
-| `summary_message_threshold` | `50` | 触发总结的消息数阈值 |
-| `summary_token_threshold` | `1000` | 触发总结的 token 阈值 |
-| `summary_time_threshold` | `3600` | 触发总结的时间阈值（秒） |
-| `summary_max_messages` | `200` | 总结时读取的最大消息数 |
-| `profile_trait_limit` | `20` | 每个用户画像允许保留的长期稳定 traits 最大数量 |
-| `message_buffer_size` | `200` | Redis 缓冲大小 |
-| `memory_search_limit` | `3` | 记忆检索数量 |
-| `context_messages_limit` | `10` | 最近上下文消息数 |
-| `knowledge_enabled` | `true` | 是否启用常识库联动 |
-| `knowledge_limit` | `3` | 常识库检索数量 |
+## 召回
 
-其中 `summary_token_threshold` 用于决定“什么时候触发总结”，`profile_trait_limit` 用于限制“每个用户画像最终最多保留多少条长期稳定 traits”。画像 Agent 会在显式提交前校验该上限，超限时要求先压缩再提交。
+1. 每次回复任务打开一个会话。
+2. 会话开始时读取一次设置快照。
+3. 会话复用一个官方客户端。
+4. 聊天只执行一次自动召回。
+5. 模型工具 `recall_memory` 复用同一会话。
+6. 召回失败时停止本次回复。
+7. 空召回视为成功。
+8. 召回内容经 `UntrustedContext(source_type="memory")` 进入非 system 上下文。
+9. 不按来源群过滤已接收记忆。
+10. 工具参数不能选择 bank、地址或凭据。
 
-### 忘却策略
+## 写入
 
-| 配置项 | 默认值 | 说明 |
-| --- | --- | --- |
-| `forgetting_enabled` | `true` | 是否启用忘却 |
-| `forgetting_importance_threshold` | `3` | 低价值记忆直接删除阈值，高于该值的记忆首次归零会先模糊化 |
-| `forgetting_decay_factor` | `0.95` | 兼容旧配置，当前整数忘却模型未使用 |
-| `forgetting_access_boost` | `1.2` | 兼容旧配置，当前整数忘却模型未使用 |
-| `forgetting_min_age_days` | `3` | 最小保留天数 |
-| `forgetting_fuzzify_concurrency` | `3` | 首次归零模糊化时的 LLM 最大并发数 |
+1. 只有 `DELIVERED` 父履约允许提交角色回复记忆。
+2. 回复准备阶段冻结请求。
+3. 请求的 `source_id` 为 `reply:<fulfillment_id>`。
+4. 执行器按冻结的目标指纹打开会话。
+5. 地址或 bank 变化时拒绝改投。
+6. 接收确认表示 Hindsight 已接收。
+7. 接收确认不表示提取或索引已完成。
+8. 记忆失败不撤销已确认送达事实。
 
-### 主动回复与判定
+## 正式来源存储
 
-> 主动回复频控（`proactive_*`）与回复履约副作用（`reply_fulfillment_*`，
-> TSK-87 前为 `reply_commit_*`）字段自 KOMARIBOT-7 起归 `komari_chat`
-> 自有配置表 `komari_chat_config` 所有，不再由本插件配置承载；死字段
-> `proactive_score_threshold` 已随迁出删除。
+旧四层表仍保留在数据库中：
 
-| 配置项 | 默认值 | 说明 |
-| --- | --- | --- |
-| `reply_threshold` | `0.72` | 回复阈值 |
-| `noise_conf_threshold` | `0.76` | NOISE 置信度阈值 |
-| `noise_margin_threshold` | `0.1` | NOISE 领先阈值 |
-| `call_margin_threshold` | `0.08` | call intent 领先阈值 |
+- `komari_memory_conversations`
+- `komari_memory_user_profile`
+- `komari_memory_interaction_history`
+- 旧实体与兼容历史表
 
-非强制主动回复会在调用 LLM 前通过 Redis Lua 原子检查冷却与最近一小时名额，并用平台消息 ID 建立有 TTL 的预占。生成失败、回复为空或 QQ 发送失败会幂等释放预占；发送成功后将同一预占原子确认为一小时滑动窗口记录，并开始正式冷却。进程中断遗留的生成中预占会在 TTL 到期后由下一次操作清理。
+运行时不读取这些表。
+迁移 `0030` 不删除这些表、向量、来源索引或旧任务表。
+运维在停写窗口内用 `scripts/migrate_memory_to_hindsight.py` 一次性导出。
+导出完成后再由运维处置来源存储。
+代码退役不表示生产数据已迁移或删除。
 
-### 视觉图片下载预算（已迁出）
+## 验证
 
-图片理解模式（`image_understanding_mode`）与 8 项下载预算
-（`vision_image_download_*`）自 TSK-194 / ADR-0010 起归 `komari_chat`
-自有配置表 `komari_chat_config` 所有（迁移 0015 从本插件一次性迁入后
-删除），本插件不再承载这些配置项，也没有跨表 alias / 双读 / 运行时
-fallback。模式与预算在聊天任务起点从 `komari_chat` 配置读取一次并冻结，
-任务执行期间配置变更只影响下一个任务。
-
-下载安全边界保持不变：下载器只允许 HTTP/HTTPS 的 80/443 端口；DNS
-地址在实际建连阶段校验，任何内网、回环、链路本地或保留地址都会拒绝。
-每一跳重定向都会重新经过相同边界。响应头和文件后缀不作为图片类型依据，
-下载完成后会按真实文件格式、完整解码结果及像素规模验图，只接受 JPEG、
-PNG、GIF 和 WebP。
-
-## 对外使用方式
-
-`komari_memory` 没有稳定的用户命令接口，主要作为内部服务插件使用。
-
-其他插件通常通过：
-
-- `komari_bot.plugins.komari_memory.get_plugin_manager()`
-
-拿到 `PluginManager`，再访问：
-
-- `manager.memory`
-- `manager.pg_pool`（`SharedEngineConnectionPool`：nonebot-plugin-orm 共享引擎的 asyncpg 兼容连接租约，`acquire()` 借出底层连接）
-- `manager.redis`
-
-旧场景存储已由迁移 `0025` 删除。
-本次退役不改变四层记忆的存储与召回。
-
-## 排障
-
-### 插件启动后立即跳过
-
-检查：
-
-- `plugin_enable` 是否为 `true`
-- 统一准入策略是否放行目标群
-- `SQLALCHEMY_DATABASE_URL` 是否已正确配置（旧 `pg_user` / `pg_password` 已随 v2.0.0 下线）
-
-### 向量维度不匹配
-
-先执行 dry-run：
+Hindsight 行为使用 SDK 边界替身验证。
+近期上下文上限使用真实本地 Redis 验证。
+迁移链使用真实 PostgreSQL 一次性库验证。
+验收命令：
 
 ```bash
-poetry run python scripts/migrate_embeddings.py --target memory
+poetry run pytest tests/komari_memory tests/komari_context
+poetry run pytest tests/db/test_migration_0030_hindsight_memory_retirement.py
+poetry run python -m komari_bot.db.orm_bootstrap check
 ```
-
-确认后执行：
-
-```bash
-poetry run python scripts/migrate_embeddings.py --apply --target memory
-```
-
-### 忘却策略看起来没生效
-
-检查：
-
-- `forgetting_enabled`
-- `forgetting_decay_factor`
-- `forgetting_access_boost`
-- `forgetting_min_age_days`
-
-注意：未达到最小保留天数的记忆不会被删除或模糊化；rerank 模式下也只会刷新最终命中的结果。

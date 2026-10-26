@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -19,13 +21,51 @@ from komari_bot.plugins.komari_chat.reply_fulfillment_domain import (
 from komari_bot.plugins.komari_chat.repositories.reply_fulfillment_repository import (
     AssistantReplyHistoryPayload,
     FavorabilityAdjustmentPayload,
-    InteractionHistoryPayload,
+    HindsightMemoryPayload,
     ProactiveReplyConfirmationPayload,
     ReplyCommitmentInput,
     ReplyFulfillmentConflictError,
     ReplyFulfillmentDraft,
     ReplyFulfillmentRepository,
 )
+from komari_bot.plugins.komari_memory.services.hindsight_retain import (
+    HindsightRetainRequest,
+)
+
+_MEMORY_TARGET = "a" * 64
+
+
+def _memory_payload(fulfillment_id: str) -> HindsightMemoryPayload:
+    request = HindsightRetainRequest.create(
+        target_fingerprint=_MEMORY_TARGET,
+        source_id=f"reply:{fulfillment_id}",
+        content=json.dumps(
+            {
+                "adapter_name": "onebot.v11",
+                "bot_self_id": "bot-1",
+                "generated_at": "1970-01-01T00:02:03.500000Z",
+                "group_id": "group-1",
+                "reply_content": "持久化的角色回复",
+                "reply_target_message_id": "message-target-1",
+                "trigger_message_id": f"message-{fulfillment_id}",
+                "trigger_user_id": "user-1",
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        timestamp=datetime.fromtimestamp(123.5, UTC),
+        metadata={"bot_nickname": "小鞠"},
+    )
+    return HindsightMemoryPayload(
+        request=json.dumps(
+            request.to_json(),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -98,19 +138,8 @@ def _draft(fulfillment_id: str) -> ReplyFulfillmentDraft:
                 ),
             ),
             ReplyCommitmentInput(
-                commitment_type="interaction_history",
-                payload=InteractionHistoryPayload(
-                    user_id="user-1",
-                    display_name="测试用户",
-                    trigger_size=20,
-                    reply_timestamp=123.5,
-                    trigger_message_id=f"message-{fulfillment_id}",
-                    record={
-                        "event": "用户发言",
-                        "result": "机器人回复",
-                        "emotion": "平静",
-                    },
-                ),
+                commitment_type="hindsight_memory",
+                payload=_memory_payload(fulfillment_id),
             ),
         ),
     )
@@ -191,7 +220,7 @@ async def test_claimed_commitments_include_validated_payloads_in_domain_order() 
             "proactive_reply_confirmation",
             "favorability_adjustment",
             "assistant_reply_history",
-            "interaction_history",
+            "hindsight_memory",
         ]
         assert commitments[0]["payload"] == {
             "group_id": "group-1",
@@ -209,18 +238,7 @@ async def test_claimed_commitments_include_validated_payloads_in_domain_order() 
             "reply_content": "持久化的角色回复",
             "reply_timestamp": 123.5,
         }
-        assert commitments[3]["payload"] == {
-            "user_id": "user-1",
-            "display_name": "测试用户",
-            "trigger_size": 20,
-            "reply_timestamp": 123.5,
-            "trigger_message_id": f"message-{fulfillment_id}",
-            "record": {
-                "event": "用户发言",
-                "result": "机器人回复",
-                "emotion": "平静",
-            },
-        }
+        assert commitments[3]["payload"] == _memory_payload(fulfillment_id).to_json()
 
 
 async def test_concurrent_prepare_creates_one_parent_and_fixed_children() -> None:
@@ -257,7 +275,7 @@ async def test_concurrent_prepare_creates_one_parent_and_fixed_children() -> Non
             "proactive_reply_confirmation",
             "favorability_adjustment",
             "assistant_reply_history",
-            "interaction_history",
+            "hindsight_memory",
         }
         assert all(row["state"] == "PENDING" for row in children)
         assert all(row["attempt_count"] == 0 for row in children)
@@ -478,16 +496,20 @@ async def test_recovery_rows_project_proactive_identity_from_child_payload() -> 
     async with _repository_context(fulfillment_ids) as (repository, pool):
         for fulfillment_id in fulfillment_ids:
             draft = _draft(fulfillment_id)
-            assert await repository.prepare(
-                replace(
-                    draft,
-                    commitments=tuple(
-                        commitment
-                        for commitment in draft.commitments
-                        if commitment.commitment_type != "proactive_reply_confirmation"
-                    ),
+            assert (
+                await repository.prepare(
+                    replace(
+                        draft,
+                        commitments=tuple(
+                            commitment
+                            for commitment in draft.commitments
+                            if commitment.commitment_type
+                            != "proactive_reply_confirmation"
+                        ),
+                    )
                 )
-            ) is True
+                is True
+            )
 
         async with pool.acquire() as connection:
             await connection.execute(
@@ -547,7 +569,7 @@ async def test_claim_pending_reclaims_parent_with_all_children_completed() -> No
             "proactive_reply_confirmation",
             "favorability_adjustment",
             "assistant_reply_history",
-            "interaction_history",
+            "hindsight_memory",
         ):
             assert (
                 await repository.mark_commitment_completed(
@@ -753,7 +775,7 @@ async def test_commitments_retry_independently_and_gate_parent_completion() -> N
         for commitment_type in (
             "proactive_reply_confirmation",
             "assistant_reply_history",
-            "interaction_history",
+            "hindsight_memory",
         ):
             assert (
                 await repository.mark_commitment_completed(
@@ -868,7 +890,7 @@ async def test_exhausted_child_blocks_completion_without_poisoning_siblings() ->
         for commitment_type in (
             "proactive_reply_confirmation",
             "assistant_reply_history",
-            "interaction_history",
+            "hindsight_memory",
         ):
             assert (
                 await repository.mark_commitment_completed(
@@ -943,7 +965,7 @@ async def test_terminal_transitions_minimize_only_no_longer_needed_payloads() ->
         for commitment_type in (
             "proactive_reply_confirmation",
             "assistant_reply_history",
-            "interaction_history",
+            "hindsight_memory",
         ):
             assert await repository.mark_commitment_completed(
                 needs_disposition_id,
@@ -1042,7 +1064,7 @@ async def test_parent_completion_defensively_minimizes_all_terminal_payloads() -
             "proactive_reply_confirmation",
             "favorability_adjustment",
             "assistant_reply_history",
-            "interaction_history",
+            "hindsight_memory",
         ):
             assert await repository.mark_commitment_completed(
                 fulfillment_id,
@@ -1128,7 +1150,7 @@ async def test_terminal_cleanup_respects_protection_and_evidence_gate() -> None:
                 "proactive_reply_confirmation",
                 "favorability_adjustment",
                 "assistant_reply_history",
-                "interaction_history",
+                "hindsight_memory",
             ):
                 assert await repository.mark_commitment_completed(
                     fulfillment_id,
@@ -1240,7 +1262,9 @@ async def test_terminal_cleanup_respects_protection_and_evidence_gate() -> None:
             assert await repository.has_fulfillment(fulfillment_id)
 
 
-async def test_management_projection_filters_derived_states_without_sensitive_payloads() -> None:
+async def test_management_projection_filters_derived_states_without_sensitive_payloads() -> (
+    None
+):
     """管理读取按派生状态筛选，只返回最小事实且不返回子 payload。"""
     pending_id = f"ops-pending-{uuid4().hex}"
     processing_id = f"ops-processing-{uuid4().hex}"
@@ -1294,7 +1318,7 @@ async def test_management_projection_filters_derived_states_without_sensitive_pa
             "proactive_reply_confirmation",
             "favorability_adjustment",
             "assistant_reply_history",
-            "interaction_history",
+            "hindsight_memory",
         ):
             assert await repository.mark_commitment_completed(
                 completed_id,
@@ -1388,10 +1412,13 @@ async def test_management_reconciliation_and_resume_use_atomic_state_guards() ->
             "outcome": "state_conflict"
         }
 
-        assert await repository.reconcile_delivered(
-            resume_id,
-            platform_message_id=None,
-        ) == "updated"
+        assert (
+            await repository.reconcile_delivered(
+                resume_id,
+                platform_message_id=None,
+            )
+            == "updated"
+        )
         assert (
             await repository.claim_lease(
                 resume_id,
@@ -1455,7 +1482,9 @@ async def test_management_reconciliation_and_resume_use_atomic_state_guards() ->
         assert resumed["payload"] == payload_before
 
 
-async def test_mark_delivered_clears_parent_content_immediately_and_missing_returns_false() -> None:
+async def test_mark_delivered_clears_parent_content_immediately_and_missing_returns_false() -> (
+    None
+):
     """进入已送达即清父正文但保留全部子 payload；不存在返回 False 且不回填平台 ID。"""
     fulfillment_id = f"delivered-clear-{uuid4().hex}"
     missing_id = f"delivered-missing-{uuid4().hex}"
@@ -1651,7 +1680,9 @@ async def test_reconcile_delivered_backfills_missing_platform_id_atomically() ->
         assert stored == "platform-late-1"
 
 
-async def test_reconcile_delivered_concurrent_backfill_loser_rechecks_conflict() -> None:
+async def test_reconcile_delivered_concurrent_backfill_loser_rechecks_conflict() -> (
+    None
+):
     """并发后补平台 ID 只有一个生效，落败方复核最新证据判平台消息 ID 冲突。"""
     fulfillment_id = f"reconcile-race-{uuid4().hex}"
     async with _repository_context([fulfillment_id], max_size=6) as (
@@ -1689,7 +1720,9 @@ async def test_reconcile_delivered_concurrent_backfill_loser_rechecks_conflict()
         assert stored == winner
 
 
-async def test_reconcile_not_delivered_clears_payloads_within_same_transaction() -> None:
+async def test_reconcile_not_delivered_clears_payloads_within_same_transaction() -> (
+    None
+):
     """对账未送达同事务清父正文与全部子 payload；缺失与非法状态分支明确。"""
     fulfillment_id = f"reconcile-nd-updated-{uuid4().hex}"
     not_started_id = f"reconcile-nd-not-started-{uuid4().hex}"
@@ -1740,7 +1773,9 @@ async def test_reconcile_not_delivered_clears_payloads_within_same_transaction()
         assert all(row["payload"] is None for row in children)
 
 
-async def test_management_derived_status_consistent_with_domain_function_for_all_branches() -> None:
+async def test_management_derived_status_consistent_with_domain_function_for_all_branches() -> (
+    None
+):
     """管理列表筛选与详情投影的 SQL 派生状态与领域函数全分支一致。"""
     not_started_fresh_id = f"derive-ns-fresh-{uuid4().hex}"
     not_started_stale_id = f"derive-ns-stale-{uuid4().hex}"
@@ -1812,7 +1847,7 @@ async def test_management_derived_status_consistent_with_domain_function_for_all
             "proactive_reply_confirmation",
             "favorability_adjustment",
             "assistant_reply_history",
-            "interaction_history",
+            "hindsight_memory",
         ):
             assert await repository.mark_commitment_completed(
                 completed_id,

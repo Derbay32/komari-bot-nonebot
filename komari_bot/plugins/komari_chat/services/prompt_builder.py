@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import json
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -16,14 +17,17 @@ from komari_bot.llm.untrusted_context import (
     UntrustedContext,
     render_untrusted_context,
 )
-from komari_bot.memory.profile_operations import profile_traits_to_list
-from komari_bot.plugins.komari_memory import KomariMemoryConfigSchema  # noqa: TC001
+from komari_bot.plugins.komari_chat.config_schema import (
+    KomariChatConfigSchema,  # noqa: TC001
+)
 
+from .admission_gate import effect_business_admitted
 from .prompt_template import get_template
 from .reply_context import ReplyContext  # noqa: TC001
 
 if TYPE_CHECKING:
-    from komari_bot.plugins.komari_memory import MemoryService
+    from hindsight_client import RecallResponse
+
     from komari_bot.plugins.user_data.models import UserFavorability
 
 # 获取常识库插件
@@ -50,45 +54,6 @@ def _clean_untrusted_line(value: object) -> str:
     return str(value).replace("\r", " ").replace("\n", " ").strip()
 
 
-def _format_time(value: object) -> str | None:
-    """把时间戳或 ISO 时间转换为人类可读短时间。"""
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        return value.astimezone().strftime("%Y-%m-%d %H:%M")
-    if isinstance(value, int | float):
-        return datetime.fromtimestamp(float(value)).astimezone().strftime("%Y-%m-%d %H:%M")
-    if isinstance(value, str) and value.strip():
-        text = value.strip()
-        try:
-            normalized = text.replace("Z", "+00:00")
-            return datetime.fromisoformat(normalized).astimezone().strftime("%Y-%m-%d %H:%M")
-        except ValueError:
-            return text[:16]
-    return None
-
-
-def _format_profile_traits_yaml(
-    profile: dict[str, Any],
-    *,
-    fallback_user_id: str | None,
-    fallback_name: str | None,
-) -> str:
-    """将当前用户画像格式化为精简 YAML 风格文本。"""
-    name = _clean_yaml_text(
-        profile.get("display_name") or profile.get("name") or fallback_name or fallback_user_id or "当前用户"
-    )
-    traits = profile_traits_to_list(profile.get("traits"))
-    lines = [f"name: {name}"]
-    if traits:
-        lines.append("traits:")
-        for item in traits:
-            key = _clean_yaml_text(item["key"])
-            value = _clean_yaml_text(item["value"])
-            lines.append(f"  - {key}: {value}")
-    return "\n".join(lines)
-
-
 def _format_user_keyword_knowledge_yaml(items: list[dict[str, Any]]) -> str:
     lines = ["items:"]
     for item in items:
@@ -109,33 +74,46 @@ def _format_visible_users_yaml(users: dict[str, str]) -> str:
     return "\n".join(lines) if len(lines) > 1 else ""
 
 
-def _format_interaction_records_yaml(records: list[dict[str, Any]]) -> str:
-    lines = ["records:"]
-    for record in records:
-        parts = [
-            _clean_yaml_text(record.get("event", "")),
-            _clean_yaml_text(record.get("result", "")),
-            _clean_yaml_text(record.get("emotion", "")),
-        ]
-        content = "；".join(part for part in parts if part)
-        if not content:
-            continue
-        lines.append(f"  - content: {content}")
-        if time_text := _format_time(record.get("timestamp")):
-            lines.append(f"    time: {time_text}")
-    return "\n".join(lines) if len(lines) > 1 else ""
+_RECALL_PROMPT_MAX_CHARS = 4_000
 
 
-def _format_interaction_memories_yaml(memories: list[dict[str, Any]]) -> str:
-    lines = ["memories:"]
-    for memory in memories:
-        content = _clean_yaml_text(memory.get("event_summary", ""))
-        if not content:
-            continue
-        lines.append(f"  - content: {content}")
-        if time_text := _format_time(memory.get("last_seen_at")):
-            lines.append(f"    time: {time_text}")
-    return "\n".join(lines) if len(lines) > 1 else ""
+def format_recall_payload(response: RecallResponse) -> str:
+    """Serialize an official RecallResponse into a deterministic payload.
+
+    Result/document identifiers and available provenance stay inside the
+    payload; the caller wraps the whole payload in the untrusted boundary.
+    """
+    results: list[dict[str, Any]] = []
+    for result in response.results or []:
+        item: dict[str, Any] = {
+            "id": str(result.id),
+            "text": str(result.text),
+        }
+        for field_name in (
+            "type",
+            "context",
+            "occurred_start",
+            "occurred_end",
+            "mentioned_at",
+            "document_id",
+            "chunk_id",
+        ):
+            value = getattr(result, field_name, None)
+            if value is not None and value != "":
+                item[field_name] = str(value)
+        if result.tags:
+            item["tags"] = [str(tag) for tag in result.tags]
+        if result.metadata:
+            item["metadata"] = {
+                str(key): str(value) for key, value in result.metadata.items()
+            }
+        results.append(item)
+    return json.dumps(
+        {"results": results},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
 
 
 def get_festival_info() -> str | None:
@@ -205,22 +183,17 @@ def get_festival_info() -> str | None:
 
 async def build_prompt(
     user_message: str,
-    memories: list[dict],
-    config: KomariMemoryConfigSchema,
+    config: KomariChatConfigSchema,
+    recall_response: RecallResponse | None = None,
     recent_messages: list | None = None,
     current_user_id: str | None = None,
     current_user_nickname: str | None = None,
     search_query: str | None = None,
-    memory_service: MemoryService | None = None,
     group_id: str | None = None,
     image_urls: list[str] | None = None,
     reply_context: ReplyContext | None = None,
     reply_image_urls: list[str] | None = None,
-    query_embedding: list[float] | None = None,
     favorability: UserFavorability | None = None,
-    current_user_profile: dict[str, Any] | None = None,
-    interaction_records: list[dict[str, Any]] | None = None,
-    interaction_memories: list[dict[str, Any]] | None = None,
     *,
     delegated_image_mode: bool = False,
     delegated_quoted_image_count: int | None = None,
@@ -240,18 +213,16 @@ async def build_prompt(
 
     Args:
         user_message: 用户原始消息（用于生成回复）
-        memories: 检索到的对话记忆
         config: 插件配置
+        recall_response: Hindsight 官方召回响应（可为空结果）
         recent_messages: 最近的消息列表（可选）
         current_user_id: 当前用户 ID（可选）
         current_user_nickname: 当前用户昵称（可选）
         search_query: 重写后的搜索查询（用于知识库检索）
-        memory_service: 记忆服务（保留兼容参数，prompt_builder 不再主动读取全部用户画像）
         group_id: 群组 ID（保留兼容参数）
         image_urls: 用户消息中的图片 URL 列表（可选）
         reply_context: 当前消息引用的上下文（可选）
         reply_image_urls: 当前消息引用图片的可见 URL 列表（可选）
-        query_embedding: 预先计算好的查询特征向量，用于知识库检索（可选）
         delegated_image_mode: 委托读图模式（read_image 工具）。开启时注入
             委托行为引导与动态图片索引说明，不把 base64 图片块嵌入 (user)
             消息；视觉描述正文（vision_description_prompt）只供
@@ -290,18 +261,6 @@ async def build_prompt(
     # ═══════════════════════════════════════
     messages.append({"role": "system", "content": template["system_prompt"]})
     messages.append({"role": "system", "content": template["tool_call_instruction"]})
-    messages.append(
-        {
-            "role": "system",
-            "content": (
-                "<profile_tool_hint>\n"
-                f"{template['profile_read_instruction']}\n"
-                "需要其他用户画像或缺失字段时调用 read_profile(user_id)，"
-                "不要猜测未提供的长期事实。\n"
-                "</profile_tool_hint>"
-            ),
-        }
-    )
     messages.append({"role": "system", "content": LLM_SECURITY_SYSTEM_INSTRUCTION})
     if delegated_image_mode:
         messages.append(
@@ -412,14 +371,21 @@ async def build_prompt(
     if festival_info:
         dynamic_parts.append(f"<festival_info>{festival_info}</festival_info>")
 
-    # 对话记忆
-    if memories:
-        memory_items = "\n".join(
-            [f"- {_escape_prompt_text(m['summary'])}" for m in memories]
-        )
-        dynamic_parts.append(
-            f"<memory>\n以下是过往的对话记忆:\n{memory_items}\n</memory>"
-        )
+    # Hindsight 长期记忆：官方召回内容只经不可信上下文边界进入非 system 上下文。
+    if recall_response is not None and recall_response.results:
+        recall_payload = format_recall_payload(recall_response)
+        if recall_payload:
+            dynamic_parts.append(
+                render_untrusted_context(
+                    UntrustedContext(
+                        source_type="memory",
+                        source_id="hindsight:recall",
+                        content=recall_payload,
+                        trust_level="untrusted",
+                    ),
+                    max_chars=_RECALL_PROMPT_MAX_CHARS,
+                )
+            )
 
     # 常识库
     if config.knowledge_enabled:
@@ -429,7 +395,9 @@ async def build_prompt(
             knowledge_results = await komari_knowledge.search_knowledge(
                 query=query_for_search,
                 limit=config.knowledge_limit,
-                query_embedding=query_embedding,
+                embedding_guard=lambda: effect_business_admitted(
+                    group_id=lookup_group_id
+                ),
             )
             if knowledge_results:
                 dynamic_parts.extend(
@@ -447,7 +415,7 @@ async def build_prompt(
         except Exception:
             logger.debug("[KomariMemory] 常识库检索失败", exc_info=True)
 
-    # 收集对话中的用户 ID（供常识检索和 read_profile 工具提示使用）
+    # 收集对话中的用户 ID（供常识检索使用）
     all_user_ids: set[str] = set()
     visible_users: dict[str, str] = {}
     if recent_messages:
@@ -505,42 +473,15 @@ async def build_prompt(
                     )
                 )
 
-    # 当前触发用户画像：只注入当前用户，其他用户由 read_profile 工具按需读取。
-    if current_user_profile and profile_traits_to_list(current_user_profile.get("traits")):
-        profile_text = _format_profile_traits_yaml(
-            current_user_profile,
-            fallback_user_id=current_user_id,
-            fallback_name=current_user_nickname,
-        )
-        dynamic_parts.append(
-            f"<current_user_profile>\n{profile_text}\n</current_user_profile>"
-        )
-
     visible_users_text = _format_visible_users_yaml(visible_users)
     if visible_users_text:
         dynamic_parts.append(f"<visible_users>\n{visible_users_text}\n</visible_users>")
 
-    interaction_memory_text = _format_interaction_memories_yaml(interaction_memories or [])
-    if interaction_memory_text:
-        dynamic_parts.append(
-            f"<interaction_memory>\n{interaction_memory_text}\n</interaction_memory>"
-        )
-
-    recent_interaction_text = _format_interaction_records_yaml(interaction_records or [])
-    if recent_interaction_text:
-        dynamic_parts.append(
-            f"<recent_interaction_history>\n{recent_interaction_text}\n</recent_interaction_history>"
-        )
-
-    del memory_service
-
     if favorability is not None:
-        favor_display_name = (
-            character_binding.get_character_name(
-                group_id=lookup_group_id,
-                user_id=favorability.user_id,
-                fallback_nickname=current_user_nickname,
-            )
+        favor_display_name = character_binding.get_character_name(
+            group_id=lookup_group_id,
+            user_id=favorability.user_id,
+            fallback_nickname=current_user_nickname,
         )
         dynamic_parts.append(
             "\n".join(
@@ -630,7 +571,9 @@ async def build_prompt(
             vision_lines.append(
                 f"- 当前用户发送了 {current_image_count} 张图片，可用 read_image 查看，索引范围为 {current_start_index} 到 {current_end_index}。"
             )
-        text_parts = [part for part in [reply_intro_text, current_text, *vision_lines] if part]
+        text_parts = [
+            part for part in [reply_intro_text, current_text, *vision_lines] if part
+        ]
         messages.append({"role": "user", "content": "\n".join(text_parts)})
     elif has_multimodal_content:
         content_parts: list[dict[str, Any]] = []

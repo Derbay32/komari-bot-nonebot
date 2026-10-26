@@ -200,9 +200,10 @@ async def test_optional_failure_diagnostics_carry_no_exception_body(
     assert "komari_decision" in joined
     assert "RuntimeError" in joined
     assert storage.fetch_calls == ["komari_decision", "komari_help"]
-    assert cast(
-        "Any", required_manager.get_cached_versioned_snapshot().value
-    ).total_limit == 4
+    assert (
+        cast("Any", required_manager.get_cached_versioned_snapshot().value).total_limit
+        == 4
+    )
 
 
 @pytest.mark.asyncio
@@ -276,7 +277,10 @@ class _FatalSignal(BaseException):
 
 @pytest.mark.parametrize(
     "signal",
-    [pytest.param(asyncio.CancelledError(), id="cancelled"), pytest.param(_FatalSignal(), id="fatal")],
+    [
+        pytest.param(asyncio.CancelledError(), id="cancelled"),
+        pytest.param(_FatalSignal(), id="fatal"),
+    ],
 )
 @pytest.mark.asyncio
 async def test_optional_manager_never_swallows_base_exceptions(
@@ -319,7 +323,13 @@ class _LiteralFalseSchema(BaseModel):
 
 @pytest.mark.parametrize(
     "declaration",
-    [pytest.param(0, id="zero"), pytest.param(None, id="none"), pytest.param("", id="empty"), pytest.param("false", id="string-false"), pytest.param(1, id="true")],
+    [
+        pytest.param(0, id="zero"),
+        pytest.param(None, id="none"),
+        pytest.param("", id="empty"),
+        pytest.param("false", id="string-false"),
+        pytest.param(1, id="true"),
+    ],
 )
 def test_only_literal_false_opts_out(declaration: Any) -> None:
     """任意假值都不是 opt-out，只有字面量 False 表示可选。"""
@@ -333,7 +343,9 @@ def test_only_literal_false_opts_out(declaration: Any) -> None:
 
 def test_missing_declaration_defaults_to_required() -> None:
     """未声明启动策略的 Schema 一律按启动必需处理。"""
-    assert ConfigManager("undeclared-policy", _UndeclaredSchema).startup_required is True
+    assert (
+        ConfigManager("undeclared-policy", _UndeclaredSchema).startup_required is True
+    )
 
 
 def test_literal_false_declaration_opts_out() -> None:
@@ -356,19 +368,17 @@ def test_optional_declaration_is_not_persisted_or_writable() -> None:
     assert "startup_required" not in public_config_field_names(instance)
     assert "startup_required" not in instance.model_dump()
     assert "startup_required" not in instance.model_dump_json()
-    assert "startup_required" not in {column.name for column in schema.__table__.columns}
+    assert "startup_required" not in {
+        column.name for column in schema.__table__.columns
+    }
     assert (
-        "startup_required"
-        not in get_config_section_metadata(schema).field_section_ids
+        "startup_required" not in get_config_section_metadata(schema).field_section_ids
     )
 
     # 管理接口的可写字段就是 model_fields ∩ 对外 model_dump 的交集。
     assert "startup_required" not in config_api._get_fields(instance)
-    assert (
-        "startup_required"
-        not in config_api._get_field_metadata(
-            instance, get_config_section_metadata(schema)
-        )
+    assert "startup_required" not in config_api._get_field_metadata(
+        instance, get_config_section_metadata(schema)
     )
 
 
@@ -416,3 +426,54 @@ async def test_real_lifespan_runs_later_startup_hooks_after_isolated_failure(
     assert storage.fetch_calls == ["komari_decision", "komari_help"]
     with pytest.raises(RuntimeError):
         optional_manager.get_cached_versioned_snapshot()
+
+
+@pytest.mark.asyncio
+async def test_memory_config_failure_does_not_block_chat_config_warmup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TSK-192/TSK-197: memory config is optional; chat stays required."""
+    memory_schema = _schema("komari_memory")
+    chat_schema = _schema("komari_chat")
+    context_schema = _schema("komari_context")
+    storage = _FaultStorage(
+        {
+            "komari_context": _stored(
+                "komari_context",
+                _valid_data(context_schema, bot_nickname="上下文实例"),
+                4,
+            ),
+            "komari_chat": _stored(
+                "komari_chat",
+                _valid_data(
+                    chat_schema,
+                    plugin_enable=True,
+                    context_messages_limit=17,
+                ),
+                6,
+            ),
+            "komari_memory": _stored(
+                "komari_memory",
+                {"hindsight_request_timeout_seconds": "not-a-number"},
+                8,
+            ),
+        }
+    )
+    _install_storage(monkeypatch, storage)
+    memory_manager = get_config_manager("komari_memory", memory_schema)
+    chat_manager = get_config_manager("komari_chat", chat_schema)
+    context_manager = get_config_manager("komari_context", context_schema)
+
+    assert memory_manager.startup_required is False
+    assert chat_manager.startup_required is True
+    assert context_manager.startup_required is True
+
+    await initialize_registered_config_managers_async()
+
+    context_snapshot = context_manager.get_cached_versioned_snapshot()
+    assert cast("Any", context_snapshot.value).bot_nickname == "上下文实例"
+    chat_snapshot = chat_manager.get_cached_versioned_snapshot()
+    assert cast("Any", chat_snapshot.value).context_messages_limit == 17
+    assert chat_snapshot.revision == 6
+    with pytest.raises(RuntimeError):
+        memory_manager.get_cached_versioned_snapshot()

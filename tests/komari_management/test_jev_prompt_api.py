@@ -434,7 +434,6 @@ _REAL_MANAGEMENT_INIT = _MGMT_DIR / "__init__.py"
 
 _SHIM_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "komari_knowledge": ("register_knowledge_api", "get_engine"),
-    "komari_memory": ("register_memory_api", "get_memory_service", "get_redis_manager"),
     "agent_run_logger": ("register_agent_run_log_api", "get_agent_run_log_reader"),
     "user_ban": ("register_user_ban_api", "get_service"),
     "komari_chat": ("get_reply_fulfillment_ops_service",),
@@ -504,4 +503,8 @@ def test_management_registers_decision_prompt_resource(
     }
     assert RESOURCE_ID in prompt_resources
     assert prompt_resources[RESOURCE_ID].display_name == DISPLAY_NAME
-    assert len(components.prompt_resources) == 4
+    assert set(prompt_resources) == {
+        "komari_chat",
+        "group_history_summary",
+        "komari_decision",
+    }

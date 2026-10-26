@@ -9,10 +9,10 @@ TSK-190：聊天 Prompt 的完整初始正文由版本化初始数据（``seed_b
 
 - ``tool_call_instruction`` / ``image_read_instruction`` 是 TSK-188 决策 26
   精确点名的行为字段；
-- 画像读取、联网搜索、网页抓取、委托图片理解、视觉描述各自拥有互相独立
-  的行为字段（``profile_read_instruction`` / ``search_web_instruction`` /
-  ``fetch_page_instruction`` / ``delegated_vision_instruction`` /
-  ``vision_description_prompt``）；
+- 工具调用、图片读取、联网搜索、网页抓取、委托图片理解、视觉描述各自拥有
+  互相独立的行为字段（``tool_call_instruction`` / ``image_read_instruction`` /
+  ``search_web_instruction`` / ``fetch_page_instruction`` /
+  ``delegated_vision_instruction`` / ``vision_description_prompt``）；
 - 工具名称、工具 JSON Schema、参数错误、动态图片索引与短协议纠错仍由
   代码拥有，不进入数据库。
 
@@ -48,7 +48,6 @@ class KomariChatPromptSchema(TypedPromptModel, table=True):
     memory_ack_role: str = Field(default="", sa_type=Text, description="记忆确认回复角色")
     tool_call_instruction: str = Field(default="", sa_type=Text, description="工具调用行为引导")
     image_read_instruction: str = Field(default="", sa_type=Text, description="图片读取行为引导")
-    profile_read_instruction: str = Field(default="", sa_type=Text, description="画像读取行为引导")
     search_web_instruction: str = Field(default="", sa_type=Text, description="联网搜索行为引导")
     fetch_page_instruction: str = Field(default="", sa_type=Text, description="网页抓取行为引导")
     delegated_vision_instruction: str = Field(default="", sa_type=Text, description="委托图片理解行为引导")

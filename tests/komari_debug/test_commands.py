@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 from importlib import import_module
+from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -107,6 +108,24 @@ def debug_commands(app: App) -> Any:
 def debug_reporting(app: App) -> Any:
     del app
     return import_module("komari_bot.plugins.komari_debug.reporting")
+
+
+def test_debug_declares_context_dependency_before_commands_import() -> None:
+    """commands consumes the public context schema; the plugin must declare it."""
+    init_path = (
+        Path(__file__).resolve().parents[2]
+        / "komari_bot"
+        / "plugins"
+        / "komari_debug"
+        / "__init__.py"
+    )
+    source = init_path.read_text(encoding="utf-8")
+    require_line = 'require("komari_context")'
+    commands_import = "from . import commands"
+
+    assert require_line in source
+    assert commands_import in source
+    assert source.index(require_line) < source.index(commands_import)
 
 
 # ─── 非 SUPERUSER 拒绝测试 ─────────────────────────────────────
@@ -748,7 +767,7 @@ async def test_notify_on_success(
     mock_updated = SimpleNamespace(error_notify_enabled=True)
     monkeypatch.setattr(
         debug_commands,
-        "_komari_memory_config_mgr",
+        "_komari_context_config_mgr",
         SimpleNamespace(
             update_field_async=_make_async_spy(
                 SimpleNamespace(), "_x", return_value=mock_updated
@@ -776,7 +795,7 @@ async def test_notify_off_success(
     mock_updated = SimpleNamespace(error_notify_enabled=False)
     monkeypatch.setattr(
         debug_commands,
-        "_komari_memory_config_mgr",
+        "_komari_context_config_mgr",
         SimpleNamespace(
             update_field_async=_make_async_spy(
                 SimpleNamespace(), "_x", return_value=mock_updated
@@ -808,7 +827,7 @@ async def test_notify_toggle_failure(
 
     monkeypatch.setattr(
         debug_commands,
-        "_komari_memory_config_mgr",
+        "_komari_context_config_mgr",
         SimpleNamespace(update_field_async=_fail_update_field_async),
     )
 

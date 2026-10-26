@@ -71,11 +71,8 @@ _IMAGE_READ_NO_PREMATURE_CLAIM_MARKERS: tuple[str, ...] = (
 _IMAGE_READ_UNRELATED_SKIP_MARKERS: tuple[str, ...] = ("不读", "跳过")
 
 
-#: TSK-191 迁入版本化初始数据的两个新资源（三资源一起验证）。
-MEMORY_GROUP_RESOURCE_IDS: tuple[str, str] = (
-    "komari_memory_summary",
-    "group_history_summary",
-)
+#: TSK-191 迁入版本化初始数据的两个必需资源（TSK-197 后剩余集合）。
+REQUIRED_RESOURCE_IDS: tuple[str, ...] = PROMPT_RESOURCE_IDS
 
 
 def _load_default_seed() -> dict[str, Any]:
@@ -257,11 +254,11 @@ def test_seed_cli_rejects_chat_prompt_with_missing_field(
     )
 
 
-def _require_memory_group_mapping(
+def _require_required_mapping(
     raw: dict[str, Any],
     resource_id: str,
 ) -> dict[str, Any]:
-    """定位 memory/group Prompt 块；缺失即视为 TSK-191 资产回归。"""
+    """定位必需 Prompt 块；缺失即视为 TSK-191 资产回归。"""
     mapping = find_prompt_mapping(raw, resource_id)
     assert mapping is not None, (
         f"默认 seed 资产缺少 {resource_id} Prompt 初始数据块"
@@ -270,13 +267,13 @@ def _require_memory_group_mapping(
     return mapping
 
 
-@pytest.mark.parametrize("resource_id", MEMORY_GROUP_RESOURCE_IDS)
-def test_default_seed_file_contains_complete_memory_and_group_prompt_sections(
+@pytest.mark.parametrize("resource_id", REQUIRED_RESOURCE_IDS)
+def test_default_seed_file_contains_complete_required_prompt_sections(
     resource_id: str,
 ) -> None:
-    """AC1(TSK-191)：memory/group Prompt 均有版本化初始数据，字段与 Schema 一致。"""
+    """AC1(TSK-191)：必需 Prompt 均有版本化初始数据，字段与 Schema 一致。"""
     raw = _load_default_seed()
-    mapping = _require_memory_group_mapping(raw, resource_id)
+    mapping = _require_required_mapping(raw, resource_id)
 
     assert str(raw.get("version") or "").strip(), "seed 文件必须携带 version 标记"
     expected_fields = prompt_resource_field_names(resource_id)
@@ -291,13 +288,13 @@ def test_default_seed_file_contains_complete_memory_and_group_prompt_sections(
         )
 
 
-@pytest.mark.parametrize("resource_id", MEMORY_GROUP_RESOURCE_IDS)
-def test_memory_and_group_prompt_seed_sections_pass_content_budget(
+@pytest.mark.parametrize("resource_id", REQUIRED_RESOURCE_IDS)
+def test_required_prompt_seed_sections_pass_content_budget(
     resource_id: str,
 ) -> None:
-    """AC9：memory/group Prompt 初始值通过项目共享内容预算校验。"""
+    """AC9：必需 Prompt 初始值通过项目共享内容预算校验。"""
     raw = _load_default_seed()
-    mapping = _require_memory_group_mapping(raw, resource_id)
+    mapping = _require_required_mapping(raw, resource_id)
 
     for field, value in mapping.items():
         validate_text_budget(
@@ -307,12 +304,12 @@ def test_memory_and_group_prompt_seed_sections_pass_content_budget(
         )
 
 
-@pytest.mark.parametrize("resource_id", MEMORY_GROUP_RESOURCE_IDS)
+@pytest.mark.parametrize("resource_id", REQUIRED_RESOURCE_IDS)
 def test_seed_cli_rejects_prompt_section_with_blank_field(
     resource_id: str,
     tmp_path: Path,
 ) -> None:
-    """TSK-188 决策 33：memory/group Prompt 字段空白时 CLI 在访问数据库前失败。
+    """TSK-188 决策 33：必需 Prompt 字段空白时 CLI 在访问数据库前失败。
 
     夹具 = 定位默认资产中对应的真实 Prompt 初始数据块（AC1 已要求存在），
     把其中一个 Schema 字段置为纯空白后写临时 seed：字段集仍与 Schema 一致、
@@ -320,7 +317,7 @@ def test_seed_cli_rejects_prompt_section_with_blank_field(
     资源与字段。
     """
     raw = _load_default_seed()
-    section = _require_memory_group_mapping(raw, resource_id)
+    section = _require_required_mapping(raw, resource_id)
     fields = sorted(prompt_resource_field_names(resource_id))
     blank_field = fields[0]
     section[blank_field] = "   "
@@ -343,8 +340,8 @@ def test_seed_cli_rejects_prompt_section_with_blank_field(
     )
 
 
-def test_find_prompt_mapping_distinguishes_all_three_resources() -> None:
-    """三资源判别键互斥：同一文档内能各自定位且不互相串块。"""
+def test_find_prompt_mapping_distinguishes_both_required_resources() -> None:
+    """两资源判别键互斥：同一文档内能各自定位且不互相串块。"""
     raw = _load_default_seed()
     mappings = {
         resource_id: find_prompt_mapping(raw, resource_id)
@@ -355,6 +352,6 @@ def test_find_prompt_mapping_distinguishes_all_three_resources() -> None:
     assert mappings["komari_chat"] is chat
     for resource_id, mapping in mappings.items():
         assert mapping is not None, f"{resource_id} Prompt 块必须可定位"
-    assert len({id(mapping) for mapping in mappings.values()}) == 3, (
-        "三个 Prompt 块的判定键必须定位到不同映射"
+    assert len({id(mapping) for mapping in mappings.values()}) == 2, (
+        "两个必需 Prompt 块的判定键必须定位到不同映射"
     )

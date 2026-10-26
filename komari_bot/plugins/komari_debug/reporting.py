@@ -88,8 +88,10 @@ def _format_call_line(call: LLMCallTrace, index: int) -> str:
     ]
     if call.request_api is not None:
         stream_text = (
-            "开" if call.stream_enabled else "关"
-        ) if call.stream_enabled is not None else "未报告"
+            ("开" if call.stream_enabled else "关")
+            if call.stream_enabled is not None
+            else "未报告"
+        )
         parts.append(f"  协议: {call.request_api} / 流式: {stream_text}")
     if call.parent_call_id:
         parts.append(f"  父调用: {call.parent_call_id}")
@@ -167,14 +169,6 @@ def _build_safe_tool_arguments(
                 content_chars = len(content) if isinstance(content, str) else None
             if content_chars is not None:
                 safe["content_chars"] = content_chars
-            has_history = arguments.get("has_interaction_history")
-            if isinstance(has_history, bool):
-                safe["has_interaction_history"] = has_history
-            elif "interaction_history" in arguments:
-                safe["has_interaction_history"] = isinstance(
-                    arguments["interaction_history"],
-                    dict,
-                )
         case "fetch_recent_group_messages":
             safe = _pick_safe_scalar_arguments(
                 arguments,
@@ -395,9 +389,7 @@ def _build_chapters(
     # 5. 阶段 token 小计
     if collector.calls:
         phases = sorted({c.phase for c in collector.calls})
-        subtotal_lines = [
-            _format_phase_subtotal(phase, collector) for phase in phases
-        ]
+        subtotal_lines = [_format_phase_subtotal(phase, collector) for phase in phases]
         chapters.append(("阶段 token 小计", "\n".join(subtotal_lines)))
     else:
         chapters.append(("阶段 token 小计", "无"))
@@ -408,9 +400,7 @@ def _build_chapters(
     # 7. 错误/降级
     if collector.errors:
         if public_redacted:
-            error_lines = [
-                f"共 {len(collector.errors)} 个错误或降级事件，详情已隐藏"
-            ]
+            error_lines = [f"共 {len(collector.errors)} 个错误或降级事件，详情已隐藏"]
         else:
             error_lines = [
                 f"阶段: {err['phase']} | "

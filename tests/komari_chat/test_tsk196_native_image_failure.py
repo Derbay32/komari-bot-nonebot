@@ -16,15 +16,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sys
-import types
 from importlib import import_module
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import pytest
-
-import komari_bot.plugins as plugins_package
 
 image_understanding_module = import_module(
     "komari_bot.plugins.komari_chat.services.image_understanding"
@@ -45,7 +41,9 @@ message_handler_module = import_module(
 if TYPE_CHECKING:
     from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
 
-ImageUnderstandingFailureError = image_reading_session_module.ImageUnderstandingFailureError
+ImageUnderstandingFailureError = (
+    image_reading_session_module.ImageUnderstandingFailureError
+)
 
 _RAW_URL = "https://example.com/secret/path/photo.png?token=abc123"
 _DATA_URI = "data:image/png;base64,SUMSECRETUX=="
@@ -68,6 +66,7 @@ def _collect_exception_chain(exc: BaseException) -> list[BaseException]:
             stack.append(current.__context__)
     return chain
 
+
 _CHAT_BUDGET_FIELDS: dict[str, object] = {
     "vision_image_download_max_count": 4,
     "vision_image_download_max_bytes": 8 * 1024 * 1024,
@@ -78,6 +77,8 @@ _CHAT_BUDGET_FIELDS: dict[str, object] = {
     "vision_image_download_read_timeout_seconds": 30.0,
     "vision_image_download_total_timeout_seconds": 45.0,
 }
+
+from tests.komari_chat.hindsight_recall_support import FakeHindsightMemory
 
 
 class _FakeRedis:
@@ -95,30 +96,9 @@ class _FakeRedis:
         return []
 
 
-class _FakeMemory:
-    async def search_conversations(self, **_kwargs: object) -> list[dict[str, object]]:
-        return []
-
-    async def search_interaction_events(
-        self, **_kwargs: object
-    ) -> list[dict[str, object]]:
-        return []
-
-    async def get_user_profile(
-        self, *, user_id: str, group_id: str
-    ) -> dict[str, object]:
-        del user_id, group_id
-        return {"display_name": "测试用户", "traits": {}}
-
-
 class _FakeQueryRewrite:
     async def rewrite_query(self, current_query: str, **_kwargs: object) -> str:
         return current_query
-
-
-class _FakeEmbeddingProvider:
-    async def embed(self, _text: str) -> list[float]:
-        return [0.1, 0.2]
 
 
 class _FakeUserData:
@@ -130,7 +110,7 @@ class _FakeUserData:
 
 
 def _chat_config_stub(**overrides: object) -> SimpleNamespace:
-    """合并 get_config / get_memory_config 字段的配置替身。"""
+    """合并 get_config / get_context_config 字段的配置替身。"""
     values: dict[str, object] = {
         "proactive_enabled": False,
         "context_messages_limit": 10,
@@ -158,7 +138,7 @@ def _chat_config_stub(**overrides: object) -> SimpleNamespace:
 
 
 def _make_message(message_id: str = "img-msg-1") -> Any:
-    from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
+    from komari_bot.context.redis_store import MessageSchema
 
     return MessageSchema(
         user_id="user-1",
@@ -207,11 +187,11 @@ def _wire_native_core(
         message_handler_module.MessageHandler
     )
     handler.redis = _FakeRedis()
-    handler.memory = _FakeMemory()
+    handler.hindsight_memory = FakeHindsightMemory()
     handler.query_rewrite = _FakeQueryRewrite()
 
     monkeypatch.setattr(message_handler_module, "get_config", lambda: config)
-    monkeypatch.setattr(message_handler_module, "get_memory_config", lambda: config)
+    monkeypatch.setattr(message_handler_module, "get_context_config", lambda: config)
     monkeypatch.setattr(message_handler_module, "user_data_plugin", _FakeUserData())
     monkeypatch.setattr(
         message_handler_module,
@@ -257,13 +237,9 @@ def _wire_native_core(
             if generate_result is not None
             else llm_service_module.ReplyResult(
                 content="回复内容",
-                interaction_history={
-                    "event": "看图",
-                    "result": "描述",
-                    "emotion": "好奇",
-                },
                 favorability_delta=0,
                 favorability_reason="无变化",
+                hindsight_target_fingerprint="a" * 64,
             )
         )
 
@@ -292,19 +268,10 @@ def _wire_native_core(
         _download_images,
     )
 
-    embedding_package_name = "komari_bot.plugins.embedding_provider"
-    embedding_fake = types.ModuleType(embedding_package_name)
-    embedding_fake.embed = _FakeEmbeddingProvider().embed  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, embedding_package_name, embedding_fake)
-    monkeypatch.setattr(
-        plugins_package, "embedding_provider", embedding_fake, raising=False
-    )
-
     async def _run() -> Any:
         return await handler._generate_reply_core(
             message=_make_message(),
             recent_messages=[],
-            interaction_records=[],
             image_urls=image_urls,
             reply_context=None,
             reply_context_requested=False,
@@ -338,7 +305,6 @@ def test_native_all_downloads_unavailable_terminates_before_llm(
             handler._generate_reply_core(
                 message=_make_message(),
                 recent_messages=[],
-                interaction_records=[],
                 image_urls=[
                     "https://example.com/a.png",
                     "https://example.com/b.png",
@@ -396,7 +362,6 @@ def test_native_multimodal_provider_failure_wraps_without_mode_switch(
             handler._generate_reply_core(
                 message=_make_message(),
                 recent_messages=[],
-                interaction_records=[],
                 image_urls=["https://example.com/a.png"],
                 reply_context=None,
                 reply_context_requested=False,
@@ -458,7 +423,6 @@ def test_native_generic_errors_with_images_are_not_wrapped(
             handler._generate_reply_core(
                 message=_make_message(),
                 recent_messages=[],
-                interaction_records=[],
                 image_urls=["https://example.com/a.png"],
                 reply_context=None,
                 reply_context_requested=False,
@@ -504,7 +468,6 @@ def test_native_provider_failure_counts_all_images(
             handler._generate_reply_core(
                 message=_make_message(),
                 recent_messages=[],
-                interaction_records=[],
                 image_urls=[
                     "https://example.com/a.png",
                     "https://example.com/b.png",
@@ -521,7 +484,9 @@ def test_native_provider_failure_counts_all_images(
     assert summary.mode == "native"
     assert summary.total_images == 3
     assert summary.attempted_images == 3
-    assert summary.failed_images == 3, "provider 整体失败时失败数量必须等于 total_images"
+    assert summary.failed_images == 3, (
+        "provider 整体失败时失败数量必须等于 total_images"
+    )
     assert summary.error_types == ("vision_failed",)
     assert summary.stages == ("vision",)
 
@@ -556,7 +521,6 @@ def test_native_partial_download_failure_plus_provider_failure_counts_total(
             handler._generate_reply_core(
                 message=_make_message(),
                 recent_messages=[],
-                interaction_records=[],
                 image_urls=[
                     "https://example.com/bad.png",
                     "https://example.com/ok.png",
@@ -572,7 +536,9 @@ def test_native_partial_download_failure_plus_provider_failure_counts_total(
     summary = excinfo.value.summary
     assert summary.mode == "native"
     assert summary.total_images == 3
-    assert summary.failed_images == 3, "部分下载失败 + provider 失败时失败数量仍等于 total_images"
+    assert summary.failed_images == 3, (
+        "部分下载失败 + provider 失败时失败数量仍等于 total_images"
+    )
     assert summary.error_types == ("image_unavailable", "vision_failed")
     assert summary.stages == ("download", "vision")
 
@@ -599,7 +565,6 @@ def test_native_partial_download_failure_success_attaches_diagnostic(
         handler._generate_reply_core(
             message=_make_message(),
             recent_messages=[],
-            interaction_records=[],
             image_urls=[
                 "https://example.com/bad.png",
                 "https://example.com/ok.png",
@@ -640,7 +605,6 @@ def test_native_no_images_plain_llm_error_propagates_unwrapped(
             handler._generate_reply_core(
                 message=_make_message(),
                 recent_messages=[],
-                interaction_records=[],
                 image_urls=None,
                 reply_context=None,
                 reply_context_requested=False,
@@ -689,7 +653,6 @@ def test_agent_run_native_multimodal_failure_redacts_exception_message(
             handler._generate_reply_core(
                 message=_make_message(),
                 recent_messages=[],
-                interaction_records=[],
                 image_urls=["https://example.com/a.png"],
                 reply_context=None,
                 reply_context_requested=False,
@@ -744,9 +707,7 @@ def test_execute_tool_loop_native_marker_has_no_exception_chain(
     collector: LLMDiagnosticCollector = LLMDiagnosticCollector(
         request_id="trace-native-marker-1"
     )
-    with pytest.raises(
-        llm_service_module.NativeMultimodalRequestError
-    ) as excinfo:
+    with pytest.raises(llm_service_module.NativeMultimodalRequestError) as excinfo:
         asyncio.run(
             llm_service_module.generate_reply_with_tools(
                 config=config,
@@ -815,7 +776,9 @@ def test_execute_tool_loop_non_image_provider_error_stays_unwrapped(
 
     # 原样传播：非 marker、非图片失败专用异常，cause/context 保持 None
     assert isinstance(excinfo.value, RuntimeError)
-    assert not isinstance(excinfo.value, llm_service_module.NativeMultimodalRequestError)
+    assert not isinstance(
+        excinfo.value, llm_service_module.NativeMultimodalRequestError
+    )
     assert not isinstance(
         excinfo.value, image_reading_session_module.ImageUnderstandingFailureError
     )
@@ -865,7 +828,6 @@ def test_native_provider_failure_exception_chain_is_fully_broken(
             handler._generate_reply_core(
                 message=_make_message(),
                 recent_messages=[],
-                interaction_records=[],
                 image_urls=["https://example.com/a.png"],
                 reply_context=None,
                 reply_context_requested=False,

@@ -14,6 +14,10 @@ from komari_bot.plugins.komari_chat.reply_fulfillment_domain import (
     COMMITMENT_TYPES,
     ReplyFulfillmentConflictError,
 )
+from tests.komari_chat.hindsight_commitment_support import (
+    HindsightServiceDouble,
+    memory_payload,
+)
 
 if TYPE_CHECKING:
     from nonebug import App
@@ -311,13 +315,9 @@ class _Redis:
     def __init__(self, events: list[str]) -> None:
         self.events = events
         self.assistant_error: BaseException | None = None
-        self.interaction_error: BaseException | None = None
         self.assistant_calls = 0
-        self.interaction_calls = 0
         self.assistant_ttls: list[int | None] = []
-        self.interaction_ttls: list[int | None] = []
         self._assistant_operations: set[str] = set()
-        self._interaction_operations: set[str] = set()
 
     async def push_message_once(
         self,
@@ -338,22 +338,11 @@ class _Redis:
 
     async def push_global_interaction_once(
         self,
-        *,
-        user_id: str,
-        record: dict[str, object],
-        trigger_size: int,
-        operation_id: str,
-        dedupe_ttl_seconds: int | None = None,
+        **_kwargs: object,
     ) -> bool:
-        del user_id, record, trigger_size
-        self.interaction_ttls.append(dedupe_ttl_seconds)
-        self.interaction_calls += 1
-        self.events.append("interaction_history")
-        if self.interaction_error is not None:
-            raise self.interaction_error
-        inserted = operation_id not in self._interaction_operations
-        self._interaction_operations.add(operation_id)
-        return inserted
+        """Retired protocol probe: must never be called."""
+        msg = "interaction_history 协议已退役"
+        raise AssertionError(msg)
 
 
 @pytest.fixture
@@ -382,18 +371,7 @@ def _payloads() -> dict[str, dict[str, Any]]:
             "reply_content": "回复正文",
             "reply_timestamp": 2.0,
         },
-        "interaction_history": {
-            "user_id": "user-1",
-            "display_name": "测试用户",
-            "trigger_size": 20,
-            "reply_timestamp": 2.0,
-            "trigger_message_id": "message-1",
-            "record": {
-                "event": "用户发言",
-                "result": "机器人回复",
-                "emotion": "平静",
-            },
-        },
+        "hindsight_memory": memory_payload(),
     }
 
 
@@ -419,12 +397,21 @@ def _workflow(
     redis = _Redis(events)
     proactive = _ProactiveReservation(events)
     user_data = _UserData(events)
+    memory = HindsightServiceDouble()
+    original_retain_hook = memory.retain_hook
+
+    async def _retain_hook(request: Any, submission_guard: Any) -> None:
+        events.append("hindsight_memory")
+        await original_retain_hook(request, submission_guard)
+
+    memory.retain_hook = _retain_hook  # type: ignore[method-assign]
     workflow = module.ReplyCommitmentWorkflow(
         repository=repository,
         redis=redis,
         proactive_reservation=proactive,
         user_data=user_data,
         config_getter=config_getter or (lambda: config),
+        hindsight_memory=memory,
     )
     return workflow, events, redis, proactive, user_data
 
@@ -514,7 +501,7 @@ async def test_transient_failure_does_not_block_siblings_and_retries_only_missin
     assert "内部细节" not in failed.last_error_code
     assert repository.has_lease("reply-retry") is False
     assert redis.assistant_calls == 1
-    assert redis.interaction_calls == 1
+    assert len(workflow.hindsight_memory.retain_calls) == 1
 
     user_data.error = None
     repository.make_retries_due("reply-retry")
@@ -557,7 +544,7 @@ async def test_multiple_failures_keep_independent_budgets_and_use_latest_policy(
     assert proactive_child.attempt_count == 1
     assert assistant_child.attempt_count == 1
     assert repository.snapshot("reply-multi-retry", "favorability_adjustment").completed
-    assert repository.snapshot("reply-multi-retry", "interaction_history").completed
+    assert repository.snapshot("reply-multi-retry", "hindsight_memory").completed
 
     config.reply_fulfillment_max_attempts = 1
     config.reply_fulfillment_retry_base_seconds = 10
@@ -652,11 +639,11 @@ async def test_invalid_payload_enters_disposition_without_blocking_later_commitm
     assert child.last_error_code == "invalid_payload"
     assert child.payload is not None
     assert redis.assistant_calls == 0
-    assert redis.interaction_calls == 1
+    assert len(workflow.hindsight_memory.retain_calls) == 1
     assert events == [
         "proactive_reply_confirmation",
         "favorability_adjustment",
-        "interaction_history",
+        "hindsight_memory",
     ]
     assert repository.parent_completed("reply-invalid") is False
 
@@ -772,7 +759,7 @@ async def test_lease_loss_stops_the_executor_and_idempotent_recovery_finishes(
     )
     assert repository.failure_policies == []
     assert redis.assistant_calls == 0
-    assert redis.interaction_calls == 0
+    assert len(workflow.hindsight_memory.retain_calls) == 0
 
     events.clear()
     assert await workflow.recover_pending() == 1
@@ -780,7 +767,7 @@ async def test_lease_loss_stops_the_executor_and_idempotent_recovery_finishes(
     assert events == [
         "favorability_adjustment",
         "assistant_reply_history",
-        "interaction_history",
+        "hindsight_memory",
     ]
     assert proactive.calls == 1
     assert user_data.calls == 2
@@ -812,9 +799,9 @@ async def test_completion_mark_unknown_backs_off_item_and_continues_batch(
     assert repository.snapshot(
         "reply-mark-unknown", "assistant_reply_history"
     ).completed
-    assert repository.snapshot("reply-mark-unknown", "interaction_history").completed
+    assert repository.snapshot("reply-mark-unknown", "hindsight_memory").completed
     assert redis.assistant_calls == 2
-    assert redis.interaction_calls == 2
+    assert len(workflow.hindsight_memory.retain_calls) == 2
     assert repository.parent_completed("reply-mark-unknown") is False
     assert repository.has_lease("reply-mark-unknown") is False
     assert repository.parent_completed("reply-after-unknown") is True
@@ -960,7 +947,7 @@ async def test_cancellation_propagates_without_failure_budget_and_can_recover(
     assert events == [
         "favorability_adjustment",
         "assistant_reply_history",
-        "interaction_history",
+        "hindsight_memory",
     ]
 
 
@@ -971,7 +958,7 @@ async def test_only_delivered_fulfillments_run_their_frozen_subset(
     repository = _CommitmentRepository()
     core_payloads = _payloads()
     core_payloads.pop("proactive_reply_confirmation")
-    core_payloads.pop("interaction_history")
+    core_payloads.pop("hindsight_memory")
     repository.seed(
         "reply-pending-confirmation",
         delivery_state="PENDING_CONFIRMATION",
@@ -979,7 +966,7 @@ async def test_only_delivered_fulfillments_run_their_frozen_subset(
     )
     repository.seed("reply-core-only", payloads=core_payloads)
     config = _config()
-    workflow, events, redis, proactive, _user_data = _workflow(
+    workflow, events, _redis, proactive, _user_data = _workflow(
         workflow_module,
         repository,
         config,
@@ -992,7 +979,7 @@ async def test_only_delivered_fulfillments_run_their_frozen_subset(
         "assistant_reply_history",
     ]
     assert proactive.calls == 0
-    assert redis.interaction_calls == 0
+    assert len(workflow.hindsight_memory.retain_calls) == 0
     assert repository.parent_completed("reply-core-only") is True
     assert repository.parent_completed("reply-pending-confirmation") is False
 
@@ -1014,5 +1001,4 @@ async def test_unresolved_fulfillment_uses_persistent_redis_idempotency_evidence
     assert await workflow.recover_pending() == 0
 
     assert redis.assistant_ttls == [None]
-    assert redis.interaction_ttls == [None]
     assert repository.parent_completed("reply-persistent-evidence") is False

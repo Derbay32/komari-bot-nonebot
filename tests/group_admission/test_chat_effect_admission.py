@@ -43,7 +43,7 @@ def _patch_chat_config(
     *,
     face_reaction: bool,
 ) -> None:
-    """patch message_handler 的 get_config / get_memory_config 为本地替身。"""
+    """patch message_handler 的 get_config / get_context_config 为本地替身。"""
     stub = SimpleNamespace(
         bot_nickname="小鞠",
         bot_aliases=["小鞠", "小鞠知花", "komari"],
@@ -52,7 +52,7 @@ def _patch_chat_config(
         error_notify_enabled=False,
     )
     monkeypatch.setattr(message_handler_module, "get_config", lambda: stub)
-    monkeypatch.setattr(message_handler_module, "get_memory_config", lambda: stub)
+    monkeypatch.setattr(message_handler_module, "get_context_config", lambda: stub)
 
 
 def _llm_config() -> SimpleNamespace:
@@ -81,9 +81,7 @@ def _final_response_completion() -> Any:
             SimpleNamespace(
                 id="call-final",
                 type="function",
-                function=SimpleNamespace(
-                    name="final_response", arguments="{}"
-                ),
+                function=SimpleNamespace(name="final_response", arguments="{}"),
                 raw_arguments="{}",
                 parsed_arguments={
                     "content": "回复内容",
@@ -224,10 +222,8 @@ async def test_tool_dispatch_restricted_blocks_tool_body(
         image_session=fake_image_session,
         phase_prefix="test",
         round_num=1,
-        memory_service=None,
+        recall_session=None,
         group_id=str(GROUP_ID),
-        allowed_profile_user_ids=frozenset(),
-        caller_user_id=None,
         caller_group_id=None,
         caller_is_superuser=False,
         request_trace_id="chat-1",
@@ -272,10 +268,8 @@ async def test_tool_search_restricted_blocks_search_web(
         image_session=None,
         phase_prefix="reader",
         round_num=1,
-        memory_service=None,
+        recall_session=None,
         group_id=str(GROUP_ID),
-        allowed_profile_user_ids=frozenset(),
-        caller_user_id=None,
         caller_group_id=None,
         caller_is_superuser=False,
         request_trace_id="chat-2",
@@ -283,9 +277,7 @@ async def test_tool_search_restricted_blocks_search_web(
     )
 
     assert scripted.calls != [], "chat.tool_search 搜索前未调用 adjudicate"
-    assert search_calls == [], (
-        "chat.tool_search 在受限准入下仍发起了 search_web"
-    )
+    assert search_calls == [], "chat.tool_search 在受限准入下仍发起了 search_web"
 
 
 # ---------------------------------------------------------------------------
@@ -317,9 +309,7 @@ async def test_group_read_restricted_blocks_get_msg(
     await handler._refetch_reply(bot=cast("Any", _FakeBot()), reply=reply)
 
     assert scripted.calls != [], "chat.group_read 读取前未调用 adjudicate"
-    assert get_msg_called == [], (
-        "chat.group_read 在受限下仍发生了 get_msg 平台读取"
-    )
+    assert get_msg_called == [], "chat.group_read 在受限下仍发生了 get_msg 平台读取"
 
 
 # ---------------------------------------------------------------------------
@@ -349,9 +339,7 @@ async def test_reaction_restricted_blocks_fire_and_forget(
     await asyncio.sleep(0)  # 允许任何已派发的 fire-and-forget 任务运行一次
 
     assert scripted.calls != [], "chat.reaction dispatch 前未调用 adjudicate"
-    assert scheduled is False, (
-        "chat.reaction 在受限准入下仍派发“生成中”表情"
-    )
+    assert scheduled is False, "chat.reaction 在受限准入下仍派发“生成中”表情"
     assert fired == [], "chat.reaction 在受限准入下回调仍启动"
 
 
@@ -412,3 +400,44 @@ async def test_fixed_failure_text_restricted_not_notified(
     assert notify_calls == [], (
         "chat.fixed_failure_text 在受限准入下仍触发群内固定错误文本/通知"
     )
+
+
+# ---------------------------------------------------------------------------
+# 记忆候选写入（chat.memory_candidate）
+# ---------------------------------------------------------------------------
+
+
+class _GuardOnlyRetainSession:
+    """只暴露 chat 编排传入的同步 BUSINESS guard，不触达 SDK。"""
+
+    target_fingerprint = "a" * 64
+
+    def __init__(self) -> None:
+        self.guard_results: list[bool] = []
+        self.source_ids: list[str] = []
+
+    async def retain(self, request: Any, *, submission_guard: Any) -> None:
+        self.source_ids.append(request.source_id)
+        self.guard_results.append(submission_guard())
+
+
+async def test_memory_candidate_restricted_blocks_retain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """chat.memory_candidate：受限时 retain 前只得到 False BUSINESS guard。"""
+    from tests.komari_decision.jev_test_support import make_request
+
+    scripted = ScriptedAdjudicate("restricted")
+    install_scripted_adjudicate(monkeypatch, scripted)
+    session = _GuardOnlyRetainSession()
+    handler = message_handler_module.MessageHandler.__new__(
+        message_handler_module.MessageHandler
+    )
+
+    await handler._retain_candidate(make_request(), cast("Any", session))
+
+    assert scripted.calls != [], "chat.memory_candidate 前未调用 adjudicate"
+    assert session.guard_results == [False], (
+        "chat.memory_candidate 在受限准入下仍提交了 retain"
+    )
+    assert session.source_ids and session.source_ids[0].startswith("candidate:")

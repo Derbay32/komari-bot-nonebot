@@ -6,7 +6,7 @@
 
 komari-bot 是基于 [NoneBot2](https://github.com/nonebot/nonebot2) 构建的 QQ 机器人，核心角色是《败犬女主太多了》中的 **小鞠知花**。
 
-**核心能力**：AI 聊天（LLM 驱动）、四层记忆系统、RAG 知识库、智能帮助、群聊总结、角色绑定、好感度系统、主动回复判定。
+**核心能力**：AI 聊天（LLM 驱动）、Hindsight 共享长期记忆、RAG 知识库、智能帮助、群聊总结、角色绑定、好感度系统、主动回复判定。
 
 ## 技术栈速览
 
@@ -38,19 +38,21 @@ komari-bot/
 ├── migrations/                           # ★ Schema 唯一权威（Alembic 版本链）
 │   ├── env.py                            #   合并 SQLModel.metadata + include_object 守卫
 │   └── versions/
-│       ├── 0001_baseline_full_schema.py  #   全量基线（26 张既有表，含保留的 2 张 legacy 配置表）
-│       ├── 0002_typed_plugin_config_tables.py  # 14 张强类型配置表（0004 补充 komari_chat）
-│       ├── 0003_typed_prompt_tables.py   #   3 张强类型 Prompt 表
-│       ├── 0004_komari_chat_config.py    #   komari_chat 配置表（承接 memory 迁出字段）
+│       ├── 0001_fresh_marker.py         #   全新库身份 marker
+│       ├── 0002_typed_schema.py          #   强类型配置表与 Prompt 表
+│       ├── 0003_komari_chat_config.py    #   komari_chat 配置表（承接 memory 迁出字段）
 │       ├── ...                         #   其余历史迁移
 │       ├── 0022_jev_request_config.py  #   Jev 请求配置
 │       ├── 0023_jev_decision_storage.py #  判定调度、去重、日志与 Prompt
 │       ├── 0024_jev_recent_settlement.py # 判定近期上下文结算
-│       └── 0025_scene_storage_retirement.py # 不可逆删除旧场景存储
+│       ├── 0025_scene_storage_retirement.py # 不可逆删除旧场景存储
+│       ├── 0030_hindsight_memory_retirement.py # 旧记忆配置/Prompt 退役（不可逆）
+│       └── 0031_unused_memory_search_limit.py # 删除无调用方的召回数量配置（不可逆）
 │
 ├── komari_bot/                           # ★ 核心代码
 │   ├── core/                             # 核心启动与平台基础件（依赖 NoneBot 运行时）
 │   │   ├── nonebot_compat.py             #   NoneBot ForwardRef 兼容补丁（显式安装点）
+│   │   ├── retry.py                      #   共享异步重试装饰器
 │   │   ├── project_paths.py              #   项目路径常量（DATA_DIR 等）
 │   │   └── sentry_support.py             #   Sentry 初始化 + 异常过滤
 │   ├── db/                               # PostgreSQL 边界共享件（经 nonebot-plugin-orm 托管连接）
@@ -60,7 +62,6 @@ komari-bot/
 │   │   ├── pgvector_schema.py            #   向量列维度校验等辅助
 │   │   ├── vector_storage_schema.py      #   pgvector DDL 离线渲染（运行时不执行 DDL）
 │   │   ├── sql_like_utils.py             #   LIKE 模式转义等 SQL 工具
-│   │   ├── memory_agent_locks.py         #   记忆 Agent 并发锁
 │   │   └── versioned_keyword_index.py    #   版本化关键词索引
 │   ├── decision/                         # 判定纯契约（无 NoneBot / SDK 依赖）
 │   │   ├── jev.py                        #   请求、结果与诊断数据结构
@@ -73,6 +74,9 @@ komari-bot/
 │   │   ├── token_counter.py              #   估算 token 计数
 │   │   ├── diagnostic_sanitizer.py       #   共享诊断脱敏（凭据与媒体载荷）
 │   │   └── dsv4_instruct.py              #   DSV4 指令注入
+│   ├── context/                          # 近期上下文 Redis 键与中性存储操作（不依赖插件）
+│   │   ├── redis_keys.py                 #   共享近期上下文/履约证据键
+│   │   └── redis_store.py                #   RecentContextStore + MessageSchema
 │   ├── config/                           # 强类型配置与 Prompt 存储共享件（加载器依赖 NoneBot 运行时）
 │   │   ├── typed_config.py               #   强类型配置/Prompt 表基类、注册表、安全加载器
 │   │   ├── prompt_storage.py             #   Prompt 强类型表与运行时加载
@@ -80,9 +84,6 @@ komari-bot/
 │   ├── management/                       # 管理 API 与审计共享件（依赖 FastAPI）
 │   │   ├── management_api.py             #   Bearer Token 鉴权 + CORS
 │   │   └── management_audit.py           #   管理操作审计
-│   ├── memory/                           # 记忆画像共享件（无 NoneBot 依赖）
-│   │   ├── profile_compaction.py         #   用户画像 LLM 压缩
-│   │   └── profile_operations.py         #   画像 trait 操作
 │   ├── onebot/                           # OneBot 消息与规则共享件（依赖 OneBot V11 适配器）
 │   │   ├── onebot_messages.py            #   消息工具（plain_text_message 等）
 │   │   └── onebot_rules.py               #   group_message_rule() 等
@@ -105,11 +106,12 @@ komari-bot/
 
 插件的 `require()` 声明就是硬依赖，修改前必须理解依赖链。
 
-跨插件 import 边界（ADR-0006）：`require()` 仅作依赖加载声明，实际引用一律走普通 import；import 只允许指向依赖插件的顶层包暴露面（`__all__`），禁止指向其内部子模块（`services` / `repositories` / `handlers` 等）。唯一豁免：管理插件 import 各插件配置 Schema 以注册管理资源。komari_memory 遵循同一规则并采用顶层暴露面方案：其顶层 `__all__` 暴露配置 Schema 与共享工具符号（`KomariMemoryConfigSchema` / `retry_async` / `MemoryService` / `MessageSchema` / `RedisManager`），komari_chat 经自有 `config_interface` 与上述顶层暴露面读取 memory 配置与共享工具，不属于管理插件豁免。详见 `docs/adr/0006-cross-plugin-top-level-imports-decision-contracts.md`。
+跨插件 import 边界（ADR-0006）：`require()` 仅作依赖加载声明，实际引用一律走普通 import；import 只允许指向依赖插件的顶层包暴露面（`__all__`），禁止指向其内部子模块（`services` / `repositories` / `handlers` 等）。唯一豁免：管理插件 import 各插件配置 Schema 以注册管理资源。`komari_context` 是近期上下文与聊天履约证据 Redis 客户端以及共享会话身份/通知策略的唯一所有者，顶层暴露 `KomariContextConfigSchema` / `RecentContextStore` / `MessageSchema` / `get_context_config` / `get_context_store`；`komari_memory` 顶层只暴露 `KomariMemoryConfigSchema` / `HindsightMemoryService` / `HindsightRecallSession` / `HindsightRetainRequest` / `HindsightUnavailableError` / `get_hindsight_memory`；旧 `MemoryService` / `get_memory_service` / `get_plugin_manager` / `get_redis_manager` 已移除；共享 `retry_async` 位于 `komari_bot.core.retry`。komari_chat 经自有 `config_interface`、chat/context 配置与上述顶层暴露面读取配置和共享资源，不再读取 memory 配置，不属于管理插件豁免。详见 `docs/adr/0006-cross-plugin-top-level-imports-decision-contracts.md`。
 
 ```
 基础服务层（被依赖，不应依赖业务插件）
   config_manager ───────────── 动态配置存储（PostgreSQL 强类型表 + .env 初始化）
+  komari_context ───────────── 近期上下文 Redis 客户端唯一所有者
   permission_manager ───────── 权限检查（白名单、插件开关、SUPERUSER）
   user_ban ─────────────────── 全局 QQ 用户封禁（chat / command；ORM 表 + revision 缓存）
   embedding_provider ───────── 向量化 + Rerank 服务
@@ -119,7 +121,7 @@ komari-bot/
   user_data ────────────────── 当前好感度 PostgreSQL 服务（ORM 表）
 
 核心功能层
-  komari_memory ────────────── 四层记忆系统
+  komari_memory ────────────── Hindsight 共享长期记忆调用侧
   komari_decision ──────────── Jev 回应资格、保留用途与群总结判定
   komari_chat ──────────────── AI 聊天处理器（编排者）
   komari_knowledge ─────────── RAG 知识库
@@ -172,20 +174,33 @@ SUPERUSER 消息 → komari_debug（命令处理器）
          ├─ favor — 调用 user_data.get/set_user_favorability
          ├─ bind — 通过 character_binding.get_binding_manager() 操作；list 明细默认私聊
          ├─ reply — 调用 komari_chat.generate_debug_reply，走纯读取/生成核心，
-         │         跳过决策引擎、Redis push、好感度 adjust、互动写入、冷却/频控，
+         │         跳过决策引擎、Redis push、好感度 adjust、Hindsight 写入、冷却/频控，
          │         读取真实群上下文与附图/引用消息；完整诊断报告仅私聊 SUPERUSER，
          │         群内默认只发 request ID/状态，`--public` 仅追加二次脱敏摘要
          └─ summary — 调用 group_history_summary.execute_group_summary 共享服务，
                       总结图片与完整诊断报告按顺序私聊 SUPERUSER；群内遵循相同回执/脱敏规则
-         └─ notify — on|off 切换 komari_memory.error_notify_enabled（回复失败 SUPERUSER 通知）
+         └─ notify — on|off 切换 komari_context.error_notify_enabled（回复失败 SUPERUSER 通知）
 ```
 
 ## 核心机制详解
 
 ### 1. 配置管理 (`config_manager`)
 
-- **存储源**：业务插件动态配置统一存储在 PostgreSQL 强类型单行表 `komari_<插件>_config`（15 张，迁移 0002 建表、0004 为 komari_chat 补充）；每张表固定主键 `id=1`、CAS 修订号 `revision`（写操作原子自增）、写入时间 `updated_at`（存储层显式赋值）；可扩展字段（列表/字典/嵌套配置）保留 JSONB 列
-- **komari_chat 专属配置**：主动回复频控与回复送达副作用 outbox 的 10 个字段位于 `komari_chat_config`（迁移 0004 建表，从 `komari_memory_config` 单行迁入，死字段 `proactive_score_threshold` 随批删除）；TSK-192/TSK-193 起回复 Agent 预算（`agent_max_rounds` / `agent_max_tool_calls_per_round` / `agent_max_total_tool_calls`）与工具调用约束模式（`agent_tool_call_mode`）也落在此表；TSK-194/ADR-0010 起图片理解模式（`image_understanding_mode`）与 8 项下载预算（`vision_image_download_*`，迁移 0015）同样归 `komari_chat`，从 `komari_memory_config` 迁出后不保留 alias / 双读 / fallback；运行时经 `komari_chat/services/config_interface.py` 读取，该接口同时提供 `get_memory_config()` 承接聊天流程仍依赖的 memory 侧字段，komari_chat 不得 import `komari_memory.services.config_interface`
+- **存储源**：业务插件动态配置统一存储在 PostgreSQL 强类型单行表 `komari_<插件>_config`（迁移 0002 建表、0004 为 komari_chat 补充、0026 新增 komari_context、0027 完成 chat/context 字段所有权迁移）；每张表固定主键 `id=1`、CAS 修订号 `revision`（写操作原子自增）、写入时间 `updated_at`（存储层显式赋值）；可扩展字段（列表/字典/嵌套配置）保留 JSONB 列
+- **聊天配置**：`komari_chat_config` 保存主动回复频控与回复履约策略。
+- 回复履约策略包括租约、批次、重试、新鲜度和墓碑保留。
+- `komari_chat_config` 保存回复 Agent 预算（`agent_max_rounds` / `agent_max_tool_calls_per_round` / `agent_max_total_tool_calls`）与 `agent_tool_call_mode`。
+- `komari_chat_config` 保存图片理解模式与 8 项下载预算。
+- 迁移 `0027` 将聊天生成槽位、常识库与上下文预算迁入聊天配置。
+- 迁移 `0027` 将表情反应、聊天检索开关与聊天启用开关迁入聊天配置。
+- 查询重写使用独立的 `query_rewrite_*` 槽位。
+- **上下文配置**：`komari_context_config` 保存 `redis_db`、`bot_nickname` 与 `error_notify_enabled`。
+- TSK-195 的回复履约不再读取全局互动开关。
+- TSK-197 已删除 `global_interaction_enabled` 与 `global_interaction_trigger_size`。
+- 聊天配置通过 `komari_chat/services/config_interface.py` 读取。
+- 上下文配置通过 `komari_context.get_context_config()` 读取。
+- 配置迁移不保留旧别名、双读或故障回退。
+- 聊天插件禁止导入 `komari_memory.services.config_interface`。
 - **结构真源**：各插件 `config_schema.py` 中的 SQLModel 元数据（`TypedConfigModel` 基类，见 `config/typed_config.py`）；Alembic 迁移环境只按源文件加载 schema（`load_all_typed_config_models()`），不执行插件包 `__init__`、不访问数据库
 - **旧 JSONB 表**：迁移 `0013` 已显式删除 `komari_plugin_configs`。运行时只使用强类型配置表。删除表必须使用手写迁移。
 - **Prompt 配置**：字符串 prompt 不存入配置表，统一使用独立强类型表（见 1.1 节）
@@ -210,7 +225,8 @@ SUPERUSER 消息 → komari_debug（命令处理器）
 
 运行时从 PostgreSQL 强类型单行表读取 Prompt。
 各插件 `prompt_schema.py` 是字段结构的真源。
-聊天、记忆总结、群总结的必需 Prompt 缺失会阻止冷启动。
+聊天、群总结的必需 Prompt 缺失会阻止冷启动。
+记忆总结 Prompt 已随 TSK-197 退役。
 判定 Prompt 使用独立的可选初始化步骤。
 判定 Prompt 不可用时，新判定报告 `failed`。
 已加载的 Prompt 在暂时读取失败时保留进程内有效快照。
@@ -218,7 +234,7 @@ SUPERUSER 消息 → komari_debug（命令处理器）
 
 `seed_bootstrap` 只插入缺失行或补齐空字段。
 初始化器保留非空管理员文案。
-`initial_data/scenes.yaml` 保留历史文件名，但只承载 3 组必需 Prompt。
+`initial_data/scenes.yaml` 保留历史文件名，但只承载 2 组必需 Prompt。
 `initial_data/decision_prompt.yaml` 承载独立的判定 Prompt。
 场景播种与场景冷启动校验已退役。
 修改初始化行为前，读取 ADR-0011。
@@ -354,17 +370,67 @@ ok, reason = await check_runtime_permission(bot, event, config)
 - **控制面**：`/api/v2/komari-roulette/status` 与 `/leaderboards/{inspect,rebuild}`；read/manage 分权。仅按 completed 真源校验/重建，不提供任意加分、重置、恢复发送或强制终局。`latest_scan/latest_cleanup` 是结果计数，不是时间戳。
 - **交付边界**：Huly `komari-bot` 团队空间的[升级运维手册](https://huly.derbaynas.top:2096/workbench/derbaysworkspace/document/6aaa95dd649daed23e114cfa)记录升级、旧名主动迁移、运维与最终 QQ 样本；自动化及旧原型不代替当前部署版本的真实 QQ 展示/通知验收。
 
-### 4. 四层记忆系统 (`komari_memory`)
+### 4. Hindsight 共享长期记忆 (`komari_memory`)
 
-| 层 | 存储 | 表 | 说明 |
-|----|------|-----|------|
-| 1. 对话摘要 | PG | `komari_memory_conversations` | 向量搜索 + 遗忘模糊化 |
-| 2. 用户画像 | PG | `komari_memory_user_profile` | JSONB traits，LLM 压缩 |
-| 3. 互动历史 | PG | `komari_memory_interaction_history` | JSONB records，增量更新 |
-| 4. 实体知识 | PG | 通过 EntityRepository | 关键词 + 向量检索 |
+TSK-193 起运行时只接入 Hindsight 共享长期记忆。
+TSK-197 已物理删除旧四层运行代码、专用配置列与记忆总结 Prompt。
+正式来源数据表仍保留；运行时不读取它们。
 
-关键类：`PluginManager` → `MemoryService` → `ConversationRepository` / `EntityRepository` + `ForgettingService`
-注意：四层表（含独立 embedding 表、记忆 job 表）与 HNSW 索引的 DDL 由 Alembic 基线 0001 统一管理，运行时不建表；`EntityRepository` 操作的是记忆层自身的画像/互动表，与 `komari_knowledge` 的知识表相互独立。连接统一经 `komari_bot/db/orm_connection.py` 共享引擎 raw 适配层（asyncpg 兼容，`$n` 占位符 SQL 原样保留）。
+| 旧层 | 存储 | 表 | 当前状态 |
+|------|------|-----|----------|
+| 1. 对话摘要 | PG | `komari_memory_conversations` | 正式来源存储，运行时不读取 |
+| 2. 用户画像 | PG | `komari_memory_user_profile` | 正式来源存储，运行时不读取 |
+| 3. 互动历史 | PG | `komari_memory_interaction_history` | 正式来源存储，运行时不读取 |
+| 4. 实体知识 | PG | 历史 EntityRepository 数据 | 运行时不读取 |
+
+来源数据的导出与处置是运维边界。
+代码退役不表示生产数据已迁移或删除。
+导出完成前不得删除正式来源存储。
+
+- 顶层暴露面只有 `KomariMemoryConfigSchema` / `HindsightMemoryService` / `HindsightRecallSession` / `HindsightRetainRequest` / `HindsightUnavailableError` / `get_hindsight_memory`。
+- 配置只保留 `plugin_enable` 与 5 个 `hindsight_*` 字段。
+- `plugin_enable` 保留 opt-out；`startup_required=False` 保留。
+- 启动创建一个稳定 caller，并尝试一次有界探测；配置读取失败不中止其他插件。
+- 每个回复任务打开一个会话；会话冻结一份设置快照，并复用一个官方客户端。
+- 就绪要求读取目标 bank 配置成功，并完成一次真实 `arecall` 探测。
+- 失败按配置的恢复间隔做单飞重试；设置指纹变化允许立即重新探测。
+- 新任务仍会重新读取 bank；旧会话的迟到失败不能覆盖新指纹就绪状态。
+- TSK-195 通过 `hindsight_memory` 承诺保存已确认送达的角色回复。
+- 回复准备阶段冻结 Hindsight 请求。
+- 冻结内容包括正文、群、Bot、适配器、触发消息、引用目标与生成时间。
+- 请求的 `source_id` 为 `reply:<fulfillment_id>`。
+- 请求时间戳使用回复生成时间，不代表平台送达时间。
+- 只有 `DELIVERED` 父履约的执行器可以提交请求。
+- 执行器按冻结的目标指纹打开会话。
+- 同一目标允许凭据轮换。
+- 地址或 bank 变化时拒绝改投。
+- 最终提交准入检查拒绝时，执行器保留义务。
+- 准入拒绝不消费重试预算。
+- `document_conflict` 记为永久幂等冲突。
+- 其他错误只记录调用侧归一化的安全码。
+- 记忆失败不撤销已确认送达事实。
+- 好感度与角色回复历史保持独立执行。
+- 角色回复历史继续向判定引擎报告已送达事实。
+- 记忆承诺恢复不重发平台内容。
+- 迁移 `0029` 拒绝存在未完成旧父履约的数据库。
+- 切换前必须完成旧已送达义务。
+- 未知送达必须通过既有授权运维流程对账。
+- 关闭只关闭自有客户端与在途会话；不关闭 Redis 或共享 ORM。
+- 聊天只执行一次自动召回；模型工具 `recall_memory` 复用同一会话。
+- 召回失败停止本次回复；空召回是成功。
+- 召回内容经 `UntrustedContext(source_type="memory")` 进入非 system 上下文。
+- 当前群准入在打开会话前和自动召回前各检查一次。
+- 近期上下文写入前重新检查当前群准入。
+- 聊天知识检索通过 `embedding_guard` 在实际向量化前检查当前群准入。
+- 不按记忆来源群过滤；工具参数不能选择 bank、地址或凭据。
+- TSK-197 已删除旧总结、画像、互动与忘却 worker，插件启动不加载它们。
+- 旧四层表、向量表与 HNSW 索引仍由历史 Alembic 迁移链保留。
+- `0030` 只删除旧配置列、上下文互动列、聊天死 Prompt 列与记忆总结 Prompt 表。
+- `0030` 不删除正式来源记忆表、向量、来源索引或旧任务表。
+- `0031` 只删除无调用方的 `komari_chat_config.memory_search_limit`。
+- `0031` 拒绝降级。
+- 配置故障在新版本上向前修复。
+- 运行时仍不执行任何 DDL。
 
 ### 4.1 知识与帮助关键词索引
 
@@ -514,16 +580,31 @@ Jev 请求截止覆盖连接、发送、接收与响应校验。
 
 ### 6. 聊天处理器拆解 (`komari_chat`)
 
-`message_handler.py` 的 `_attempt_reply()` 已拆分为三个边界：
+`message_handler.py` 分离上下文读取与回复生成。
+`reply_fulfillment_workflow.py` 管理平台发送与送达后承诺。
 
-1. **`_read_buffers()`** — 读取 Redis 现有的 recent/global interaction buffer，可选 `store_current`
-2. **`_generate_reply_core()`** — 纯读取/生成核心：查询重写、记忆/画像/好感度读取、prompt 构建、LLM 回复生成；不执行任何副作用；接受可选 `AgentRunCollector`
-3. **送达后副作用唯一路径 = outbox** — `commit_delivered_reply()` 只做 `mark_delivered()` 登记 → `claim_operation()` 领取（失败/None 由后台 worker 轮询）→ 四步幂等提交（proactive confirm / 好感度 adjust / AI 历史存储 / 互动历史写入）→ `complete()`；`_attempt_reply()` 自身不提交任何聊天副作用
+- `_read_buffers()` 读取同群近期消息缓冲。
+- 同群缓冲包含已确认送达的角色回复。
+- `store_current` 控制当前消息入缓冲。
+- `_generate_reply_core()` 执行读取与生成，不执行记忆写入。
+- 生成包装层从实际 Hindsight 会话标注目标指纹。
+- 生成核心接受可选的 `AgentRunCollector`。
+- `fulfill()` 在发送前冻结父身份与适用承诺。
+- 发送前登记 `mark_send_started()`。
+- 平台发送结果落为 `DELIVERED`、`PENDING_CONFIRMATION` 或 `NOT_DELIVERED`。
+- 仅 `DELIVERED` 父履约允许执行送达后承诺。
+- 好感度调整、角色回复历史与 Hindsight 记忆始终适用。
+- 存在主动回复预占时，追加主动回复确认承诺。
+- 每项承诺维护独立的尝试、退避与完成状态。
+- 全部适用承诺完成后，父履约才能完成。
+- 发送开始后结果未知时，父履约保持待确认。
+- 承诺重试与运维续跑不重发平台内容。
+- `_attempt_reply()` 不执行送达后承诺。
 
 表情反应与失败通知契约：
 - 表情反应在 `_attempt_reply()` 内、调用 `_generate_reply_core()` 之前以 `asyncio.create_task` fire-and-forget 派发（任务引用挂 `self._reaction_tasks` 防 GC），提示“正在生成”；`commit_delivered_reply()` 不再触发表情，送达后不撤下。
 - `_attempt_reply()` 返回 `(PendingReply | None, stored, ReplyFailureInfo | None)`；生成失败（异常、空回复、delta 缺失、预占租约丢失）转为 `ReplyFailureInfo` 而非上抛（CancelledError 除外）；频控冷却/超限/重复等正常控制流返回 `(None, False, None)` 不通知。
-- 失败分流边界是“是否贴过表情”：`report_reply_failure()` 在 `reaction_sent=True` 时以 reply 段引用原消息补发群内固定错误文本，并向 SUPERUSERS 私聊极简诊断卡（trace/群号/触发原因/阶段/异常类型+一行摘要）；Redis key `komari_chat:error_notify:{group_id}:{error_type}` SET NX EX 300 去重，Redis 异常降级照常通知；`error_notify_enabled=false` 仅静默通知，不影响群内错误文本；实现位于 `services/error_notify.py`，善后方法自身绝不抛出。
+- 失败分流边界是“是否贴过表情”：`report_reply_failure()` 在 `reaction_sent=True` 时以 reply 段引用原消息补发群内固定错误文本，并向 SUPERUSERS 私聊极简诊断卡（trace/群号/触发原因/阶段/异常类型+一行摘要）；Redis key `komari_chat:error_notify:{group_id}:{error_type}` SET NX EX 300 去重，Redis 异常降级照常通知；`komari_context.error_notify_enabled=false` 仅静默通知，不影响群内错误文本；实现位于 `services/error_notify.py`，善后方法自身绝不抛出。
 
 主动回复频控契约：
 - 非强制回复在生成前调用 Redis Lua 原子预占，同时检查冷却、最近一小时已确认名额与生成中名额；预占 ID 使用平台消息 ID，重复投递不会重复生成。
@@ -533,12 +614,12 @@ Jev 请求截止覆盖连接、发送、接收与响应校验。
 `process_message(..., reply_allowed=False)` 用于 chat 封禁：保留原消息的判定和缓冲写入，但在 `_attempt_reply()` 前返回，并记录 `blocked_by_user_ban`。
 
 公开 debug 入口：
-- `komari_chat.generate_debug_reply()` — 以命令发起者身份、当前群上下文执行纯读取/生成，完全跳过决策引擎、表情反应、Redis push、好感度 adjust、互动历史、冷却/频控；使用 `debug-reply-*` trace ID；返回 `DebugReplyResult`（含 collector）
+- `komari_chat.generate_debug_reply()` — 以命令发起者身份、当前群上下文执行纯读取/生成，完全跳过决策引擎、表情反应、Redis push、好感度 adjust、Hindsight 写入、冷却/频控；使用 `debug-reply-*` trace ID；返回 `DebugReplyResult`（含 collector）
 - 底层依赖未初始化时抛出 `RuntimeError`（可展示的错误信息）
 
 视觉服务与图片理解（`vision_service.py` / `image_understanding.py`，TSK-194/ADR-0010）：
 - 已移除绕过网关的独立 `AsyncOpenAI` 调用，改用 `llm_provider.generate_messages_completion()`；视觉调用作为 `read_image` 工具的子调用，通过 collector 记录同一 trace，最终请求携带任务起点快照冻结的 `thinking_mode` / `reasoning_effort`，任务内不重读
-- 图片理解模式（`image_understanding_mode`：`native` / `delegated`）与 8 项下载预算（`vision_image_download_*`）归 `komari_chat` 配置（迁移 0015 从 `komari_memory` 一次性迁入，不保留 alias / 双读 / 运行时 fallback）；模式与预算在任务起点从 chat 配置读取一次并冻结，任务执行期间配置变更只影响下一个任务
+- 图片理解模式（`image_understanding_mode`：`native` / `delegated`）与 8 项下载预算（`vision_image_download_*`）归 `komari_chat` 配置（迁移 0015 从 `komari_memory` 一次性迁入，TSK-192 phase B 后由 chat 配置拥有，不保留 alias / 双读 / 运行时 fallback）；模式与预算在任务起点从 chat 配置读取一次并冻结，任务执行期间配置变更只影响下一个任务
 - `native`：图片经安全下载与校验后作为多模态输入直接交给聊天主模型（chat 槽位），不声明 / 不调用 `read_image` 工具；聊天模型对带图请求报错或拒图时本任务明确失败，不自动降级、不切 delegated、不调用视觉服务
 - `delegated`：只向主回复 Agent 暴露稳定图片索引与 `read_image` 工具，主工具循环恒使用聊天模型与 chat 槽位；视觉子调用（`vision_service`）才使用独立视觉模型与 vision 槽位（含 `vision_thinking_mode` / `vision_reasoning_effort`）
 - TSK-195：delegated 任务起点零预下载，`ImageReadingSession`（任务级图片会话）持有稳定引用（引用消息在前、当前消息在后）、按索引成功/失败缓存与并发单飞（取消任意 waiter 不取消共享下载/视觉任务，任务完成结果仍缓存）、字节账本/并发信号量/累计总时限（跨多轮不重建；总时限为下载活动区间的并集耗时，并发重叠只计一次、空闲不消耗不重置，`download()` 与 `download_many()` 共用同一账本）、全失败安全摘要（`all_images_unavailable` + 归一化错误类型，TSK-196 消费）；只有首次 `read_image(image_index)` 才经安全下载器懒下载；原始 URL 只存在于会话内部私有映射→安全下载器边界（公开引用只含稳定 index/origin/source_label），不进主模型消息、工具结果、普通日志与 Agent Run/debug 投影；任务结束 `close()` 阻止新读取、取消并等待在途读取后再释放下载连接；视觉描述经既有 `UntrustedContext`（`source_type=vision`）回流；主 prompt 只含稳定索引/来源/范围（无 URL/base64）
@@ -632,8 +713,8 @@ poetry run python -m komari_bot.db.orm_bootstrap revision -m "描述"
 
 规则：
 
-- 新增/修改表结构一律走迁移：改 `config_schema.py` / `prompt_schema.py` / `orm_models.py` 等 SQLModel 元数据后 autogenerate，`check` 必须零 diff 通过；CI（`.github/workflows/migration-check.yml`）执行 `upgrade head` + `check` 守门。
-- 含向量、触发器、`UNLOGGED`、advisory lock 等特殊 DDL 的表（记忆四层、知识库、帮助、`komari_agent_run_log_index`、`komari_search_index_versions`）以 `op.execute` 手写 revision，不依赖 autogenerate。
+- 新增/修改表结构一律走迁移：改 `config_schema.py` / `prompt_schema.py` / `orm_models.py` 等 SQLModel 元数据后 autogenerate，`check` 必须零 diff 通过；CI（`.github/workflows/pr-acceptance.yml`）执行 `upgrade head` + `check` 守门。
+- 含向量、触发器、`UNLOGGED`、advisory lock 等特殊 DDL 的表（知识库、帮助、`komari_agent_run_log_index`、`komari_search_index_versions`）以 `op.execute` 手写 revision，不依赖 autogenerate。
 - `migrations/env.py` 合并 SQLModel.metadata，`include_object` 统一禁止 autogenerate 为 metadata 之外的表生成 drop；删除表必须手写迁移，绝不依赖 autogenerate。
 - 容器 `docker/prestart.sh` 在启动 Gunicorn 前自动 `upgrade head`，失败 fail fast；本地升级新代码前先跑一次 `upgrade head`。
 
@@ -676,7 +757,7 @@ KOMARI_TEST_POSTGRES_URL=postgresql+asyncpg://user:pass@host:5432/komari_bot_tes
 6. **Python 3.13 特有**：本项目不兼容 Python 3.12 及以下
 7. **Sentry 过滤**：NoneBot 控制流异常（StopPropagation 等）已在 `sentry_support.py` 中过滤；脱敏采用黑名单式：诊断数据（异常正文、breadcrumb、Sentry Logs 正文、事务/span、堆栈局部变量、请求数据）默认全量保留，仅通过三层机制（字段名黑名单、值模式正则、已配置秘密精确替换）隐藏凭据类字段。`send_default_pii` 仅控制 user 上下文（用户标识）是否上报
 8. **debug 插件权限**：`komari_debug` 所有子命令在处理器第一行调用 `await SUPERUSER(bot, event)`，绝对不放进 matcher 的 `permission=` 或 `rule=`
-9. **debug 无副作用**：`.debug reply` 走 `generate_debug_reply()`，完全不触发 Redis push、好感度 adjust、互动历史写入或冷却/频控
+9. **debug 无副作用**：`.debug reply` 走 `generate_debug_reply()`，完全不触发 Redis push、好感度 adjust、Hindsight 写入或冷却/频控
 10. **诊断结构与投递**：完整报告绝不包含完整 prompt、reasoning content、base64、历史或画像正文，且只私聊已鉴权 SUPERUSER；群内默认仅返回 request ID/状态，`--public` 仍必须隐藏输入、输出、用户标识、异常正文与工具参数
 11. **用户封禁边界**：`chat` 只压制 `komari_chat` 的实际回复；其他用户 matcher 统一属于 `command`，封禁时必须静默且保留原 matcher 的传播阻断语义
 12. **内容预算**：用户/管理入口可写文本必须复用 `komari_bot.llm.content_budget`；同时检查字符、UTF-8 字节、估算 token 与关键词组合，不得在各插件复制限额或静默截断
@@ -686,4 +767,4 @@ KOMARI_TEST_POSTGRES_URL=postgresql+asyncpg://user:pass@host:5432/komari_bot_tes
 
 ---
 
-*本文件由 AI 生成于 2026-04-26，最后更新于 2026-10-24。发现不一致请以实际代码为准并更新本文档。*
+*本文件由 AI 生成于 2026-04-26，最后更新于 2026-10-25（TSK-197）。发现不一致请以实际代码为准并更新本文档。*

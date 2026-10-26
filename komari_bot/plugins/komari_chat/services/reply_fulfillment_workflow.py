@@ -16,17 +16,21 @@ TSK-87 contract 后，送达后承诺推进、待处置续跑、终态清理与�
 from __future__ import annotations
 
 import asyncio
+import json
 import time as _system_time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from nonebot import logger
 
+from komari_bot.plugins.komari_memory import HindsightRetainRequest
+
 from ..reply_fulfillment_domain import (
     AssistantReplyHistoryPayload,
     FavorabilityAdjustmentPayload,
-    InteractionHistoryPayload,
+    HindsightMemoryPayload,
     ProactiveReplyConfirmationPayload,
     ReplyCommitmentInput,
     ReplyFulfillmentDraft,
@@ -48,7 +52,7 @@ from .reply_fulfillment_alert import (
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
 
-    from komari_bot.plugins.komari_memory import MessageSchema
+    from komari_bot.context.redis_store import MessageSchema
 
 ReplySender = Callable[[object], Awaitable[object]]
 BotIdentity = tuple[str, str]
@@ -68,6 +72,17 @@ class _MonotonicClock:
 
 
 time = _MonotonicClock()
+
+
+def _canonical_json_text(value: object) -> str:
+    """Serialize a frozen value with the shared canonical JSON rules."""
+    return json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
 
 
 @dataclass(frozen=True)
@@ -116,6 +131,9 @@ class _PendingReply(Protocol):
 
     @property
     def reply_timestamp(self) -> float: ...
+
+    @property
+    def hindsight_target_fingerprint(self) -> str: ...
 
     @property
     def proactive_reservation_id(self) -> str | None: ...
@@ -186,20 +204,16 @@ def build_reply_fulfillment_commitments(
     bot_nickname: str,
     reply_content: str,
     reply_timestamp: float,
-    trigger_message_id: str,
-    display_name: str,
     favorability_delta: int,
     favorability_reason: str,
-    interaction_history: dict[str, str],
+    hindsight_request: HindsightRetainRequest,
     proactive_reservation_id: str | None,
     proactive_cooldown_seconds: int,
-    global_interaction_enabled: bool,
-    global_interaction_trigger_size: int,
 ) -> tuple[ReplyCommitmentInput, ...]:
     """按固定顺序冻结本次适用的承诺子集。
 
-    主动回复确认只在存在生成期预占时适用；互动历史只在动态功能开启时
-    适用；好感度调整与角色回复历史始终适用。不开放动态承诺注册。
+    主动回复确认只在存在生成期预占时适用；好感度调整、角色回复历史
+    与 Hindsight 送达记忆始终适用。不开放动态承诺注册。
     """
     commitments: list[ReplyCommitmentInput] = []
     if proactive_reservation_id is not None:
@@ -234,20 +248,14 @@ def build_reply_fulfillment_commitments(
             ),
         )
     )
-    if global_interaction_enabled:
-        commitments.append(
-            ReplyCommitmentInput(
-                commitment_type="interaction_history",
-                payload=InteractionHistoryPayload(
-                    user_id=user_id,
-                    display_name=display_name,
-                    trigger_size=global_interaction_trigger_size,
-                    reply_timestamp=reply_timestamp,
-                    trigger_message_id=trigger_message_id,
-                    record=dict(interaction_history),
-                ),
-            )
+    commitments.append(
+        ReplyCommitmentInput(
+            commitment_type="hindsight_memory",
+            payload=HindsightMemoryPayload(
+                request=_canonical_json_text(hindsight_request.to_json()),
+            ),
         )
+    )
     return tuple(commitments)
 
 
@@ -286,12 +294,13 @@ class ReplyFulfillmentWorkflow:
         """判断平台事件是否已有不可再次发送的履约记录。"""
         return await self.repository.has_fulfillment(fulfillment_id)
 
-    @staticmethod
-    def _resolve_display_name(message: MessageSchema) -> str:
-        return str(message.user_nickname or message.user_id).strip() or message.user_id
-
     async def _prepare(self, pending_reply: _PendingReply) -> bool:
-        """注入履约工作流配置后准备一条不可变履约 Draft。"""
+        """注入履约工作流配置后准备一条不可变履约 Draft。
+
+        Hindsight 送达记忆请求在此一次性冻结：正文取自生成结果，身份与
+        引用目标取自冻结的待发送回复，时间戳沿用回复生成时间；此后不再
+        从父正文（送达后立即清空）或当前配置重建。
+        """
         config = self.config_getter()
         favorability_delta = pending_reply.reply_result.favorability_delta
         if favorability_delta is None:
@@ -301,16 +310,29 @@ class ReplyFulfillmentWorkflow:
         if not favorability_reason:
             msg = "favorability_reason missing"
             raise ValueError(msg)
-        interaction_history = pending_reply.reply_result.interaction_history
-        if interaction_history is None:
-            msg = "interaction_history missing"
+        target_fingerprint = pending_reply.hindsight_target_fingerprint
+        if not target_fingerprint:
+            msg = "hindsight_target_fingerprint missing"
             raise ValueError(msg)
-        interaction_record = {
-            "event": str(interaction_history["event"]),
-            "result": str(interaction_history["result"]),
-            "emotion": str(interaction_history["emotion"]),
-        }
-        display_name = self._resolve_display_name(pending_reply.message)
+        generated_at = datetime.fromtimestamp(pending_reply.reply_timestamp, UTC)
+        hindsight_request = HindsightRetainRequest.create(
+            target_fingerprint=target_fingerprint,
+            source_id=f"reply:{pending_reply.fulfillment_id}",
+            content=_canonical_json_text(
+                {
+                    "adapter_name": pending_reply.adapter_name,
+                    "bot_self_id": pending_reply.bot_self_id,
+                    "generated_at": generated_at.isoformat().replace("+00:00", "Z"),
+                    "group_id": pending_reply.message.group_id,
+                    "reply_content": pending_reply.reply,
+                    "reply_target_message_id": pending_reply.reply_to_message_id,
+                    "trigger_message_id": pending_reply.message.message_id,
+                    "trigger_user_id": pending_reply.message.user_id,
+                }
+            ),
+            timestamp=generated_at,
+            metadata={"bot_nickname": pending_reply.bot_nickname},
+        )
         handoff = pending_reply.proactive_handoff
         commitments = build_reply_fulfillment_commitments(
             group_id=pending_reply.message.group_id,
@@ -318,11 +340,9 @@ class ReplyFulfillmentWorkflow:
             bot_nickname=pending_reply.bot_nickname,
             reply_content=pending_reply.reply,
             reply_timestamp=pending_reply.reply_timestamp,
-            trigger_message_id=pending_reply.message.message_id,
-            display_name=display_name,
             favorability_delta=favorability_delta,
             favorability_reason=favorability_reason,
-            interaction_history=interaction_record,
+            hindsight_request=hindsight_request,
             proactive_reservation_id=pending_reply.proactive_reservation_id,
             # 冷却时长取移交凭据的 reserve 冻结快照，不现读配置；无凭据
             # （强制回复）路径维持现读配置语义。
@@ -330,10 +350,6 @@ class ReplyFulfillmentWorkflow:
                 int(handoff.cooldown_seconds)
                 if handoff is not None
                 else int(config.proactive_cooldown)
-            ),
-            global_interaction_enabled=bool(config.global_interaction_enabled),
-            global_interaction_trigger_size=int(
-                config.global_interaction_trigger_size
             ),
         )
         draft = ReplyFulfillmentDraft(
@@ -496,9 +512,7 @@ class ReplyFulfillmentWorkflow:
                 pending_reply.fulfillment_id,
             )
             return False
-        reply_fulfillment_finalization_granted(
-            group_id=pending_reply.message.group_id
-        )
+        reply_fulfillment_finalization_granted(group_id=pending_reply.message.group_id)
         logger.info(
             "[KomariChat] 发送结果未知，回复进入待确认对账: fulfillment={}",
             pending_reply.fulfillment_id,
@@ -513,9 +527,7 @@ class ReplyFulfillmentWorkflow:
         platform_message_id: str | None,
     ) -> bool:
         """已送达回复：持久化送达事实，立即推进承诺并恢复告警。"""
-        reply_fulfillment_finalization_granted(
-            group_id=pending_reply.message.group_id
-        )
+        reply_fulfillment_finalization_granted(group_id=pending_reply.message.group_id)
         delivered = await self.repository.mark_delivered(
             pending_reply.fulfillment_id,
             platform_message_id=platform_message_id,
@@ -564,9 +576,10 @@ class ReplyFulfillmentWorkflow:
         completed = 0
         claimed_records: list[tuple[dict[str, Any], ReplySender]] = []
         async with self._send_start_lock:
-            for (bot_self_id, adapter_name), sender in (
-                self.recovery_senders_getter().items()
-            ):
+            for (
+                bot_self_id,
+                adapter_name,
+            ), sender in self.recovery_senders_getter().items():
                 records = await self.repository.claim_fresh_not_started(
                     bot_self_id=bot_self_id,
                     adapter_name=adapter_name,
@@ -597,16 +610,13 @@ class ReplyFulfillmentWorkflow:
         待确认。
         """
         fulfillment_id = str(record["fulfillment_id"])
-        if not reply_fulfillment_business_admitted(
-            group_id=record.get("group_id")
-        ):
+        if not reply_fulfillment_business_admitted(group_id=record.get("group_id")):
             # NOT_STARTED 受限后终止为持久终态（未送达），不进入休眠、
             # 不补发；恢复准入后也不复活。
             await self.repository.mark_not_delivered(fulfillment_id)
             await self._release_recovered_reservation(record)
             logger.info(
-                "[KomariChat] 恢复发送受限，NOT_STARTED 终止为未送达: "
-                "fulfillment={}",
+                "[KomariChat] 恢复发送受限，NOT_STARTED 终止为未送达: fulfillment={}",
                 fulfillment_id,
             )
             return False
@@ -718,6 +728,7 @@ def build_reply_fulfillment_workflow(
     recovery_senders_getter: Callable[[], Mapping[BotIdentity, ReplySender]],
     bots_provider: Callable[[], Iterable[object] | Mapping[object, object]],
     superusers_provider: Callable[[], Iterable[object]],
+    hindsight_memory: Any | None = None,
 ) -> ReplyFulfillmentWorkflow:
     """在 composition root 组装统一履约工作流。
 
@@ -731,6 +742,7 @@ def build_reply_fulfillment_workflow(
         proactive_reservation=proactive_reservation,
         user_data=user_data,
         config_getter=config_getter,
+        hindsight_memory=hindsight_memory,
     )
     alert_service = ReplyFulfillmentAlertService(
         repository=repository,

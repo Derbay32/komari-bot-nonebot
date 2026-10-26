@@ -17,9 +17,9 @@ from __future__ import annotations
 import dataclasses
 import inspect
 
+from komari_bot.context.redis_store import MessageSchema
 from komari_bot.plugins.komari_chat.handlers import message_handler
 from komari_bot.plugins.komari_chat.services import reply_fulfillment_workflow
-from komari_bot.plugins.komari_memory.services.redis_manager import MessageSchema
 
 
 def _pending_reply_field_names() -> set[str]:
@@ -91,9 +91,9 @@ def test_pending_reply_round_trips_fulfillment_id_value() -> None:
         ),
         reply_result=message_handler.ReplyResult(
             content="回复正文",
-            interaction_history={"event": "发言", "result": "回复", "emotion": "平静"},
             favorability_delta=1,
             favorability_reason="正常互动",
+            hindsight_target_fingerprint="a" * 64,
         ),
         force_reply=False,
         bot_nickname="小鞠",
@@ -104,5 +104,6 @@ def test_pending_reply_round_trips_fulfillment_id_value() -> None:
         request_trace_id="chat-message-1",
         reply_timestamp=2.0,
         proactive_reservation_id="reservation-1",
+        hindsight_target_fingerprint="a" * 64,
     )
     assert pending_reply.fulfillment_id == fulfillment_id

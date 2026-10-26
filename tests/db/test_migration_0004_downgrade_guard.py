@@ -54,6 +54,31 @@ _DEAD_FIELD_DEFAULT = 0.0
 #: 0015 迁入 komari_chat_config）已移除的 9 个视觉字段，均为 NOT NULL
 #: 且无默认值。历史 fixture 在 0004 时代表结构插入单行时必须显式补齐，
 #: 否则 INSERT 即 NOT NULL 违约。
+_HISTORICAL_MEMORY_OWNERSHIP_DEFAULTS: dict[str, object] = {
+    "redis_db": 1,
+    "llm_model_chat": "gemini-3-flash-preview",
+    "llm_temperature_chat": 1.0,
+    "llm_max_tokens_chat": 4000,
+    "llm_request_api_chat": "chat_completions",
+    "llm_stream_enabled_chat": False,
+    "llm_thinking_mode_chat": False,
+    "llm_reasoning_effort_chat": "",
+    "assistant_prefill_enabled": False,
+    "dsv4_roleplay_instruct_mode": "auto",
+    "knowledge_enabled": True,
+    "knowledge_limit": 3,
+    "memory_search_limit": 3,
+    "context_messages_limit": 10,
+    "context_max_utf8_bytes": 24_000,
+    "context_max_estimated_tokens": 6_000,
+    "global_interaction_enabled": True,
+    "global_interaction_trigger_size": 20,
+    "bot_nickname": "小鞠知花",
+    "face_reaction_enabled": False,
+    "face_reaction_id": "76",
+    "error_notify_enabled": True,
+}
+
 _HISTORICAL_MEMORY_VISION_DEFAULTS: dict[str, object] = {
     "vision_tool_enabled": True,
     "vision_image_download_max_count": 4,
@@ -334,10 +359,44 @@ async def _ensure_memory_config_row(conn: asyncpg.Connection) -> bool:
     values = [getattr(defaults, column) for column in value_columns]
     # TSK-194：0015 迁走前 memory 表仍持有 9 个视觉列（NOT NULL 无默认），
     # head schema 已无对应字段；历史 fixture 须显式补齐，避免 NOT NULL 违约。
-    for column, value in _HISTORICAL_MEMORY_VISION_DEFAULTS.items():
-        if column in table_columns and column not in value_columns:
-            value_columns.append(column)
-            values.append(value)
+    for historical_defaults in (
+        _HISTORICAL_MEMORY_OWNERSHIP_DEFAULTS,
+        _HISTORICAL_MEMORY_VISION_DEFAULTS,
+    ):
+        for column, value in historical_defaults.items():
+            if column in table_columns and column not in value_columns:
+                value_columns.append(column)
+                values.append(value)
+    # TSK-197：历史 0003 结构仍持有已退役的 33 个旧算法列，head schema
+    # 不再声明它们。按真实列类型补齐合法占位值，保留 0004 downgrade
+    # 的值回填断言不被新 head 删除面破坏。
+    metadata_rows = await conn.fetch(
+        "SELECT column_name, data_type, is_nullable "
+        "FROM information_schema.columns WHERE table_name = 'komari_memory_config'"
+    )
+    metadata = {str(row["column_name"]): row for row in metadata_rows}
+    for column in table_columns:
+        if column in ("id", "revision", "updated_at") or column in value_columns:
+            continue
+        row = metadata[column]
+        data_type = str(row["data_type"])
+        nullable = str(row["is_nullable"]) == "YES"
+        if nullable:
+            value: object = None
+        elif data_type == "boolean":
+            value = False
+        elif data_type == "jsonb":
+            value = []
+        elif data_type in {"integer", "bigint"}:
+            value = 1
+        elif data_type in {"real", "double precision"}:
+            value = 1.0
+        elif data_type.startswith("timestamp"):
+            value = datetime.now(UTC)
+        else:
+            value = ""
+        value_columns.append(column)
+        values.append(value)
     # JSONB 列（白名单等列表/字典字段）必须序列化并显式 ::jsonb 转型，
     # 否则 asyncpg 把 list 当数组绑定而报 DataError
     serialized = [

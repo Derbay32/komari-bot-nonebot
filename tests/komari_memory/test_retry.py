@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from komari_bot.plugins.komari_memory.core import retry as retry_module
+from komari_bot.core import retry as retry_module
 
 
 class _ExcludedError(RuntimeError):
