@@ -355,6 +355,17 @@ class AgentHost:
         except Exception:
             await self._protocol_failed("reader_failed")
             return
+        await self._on_stdout_eof()
+
+    async def _on_stdout_eof(self) -> None:
+        """A closed stdout pipe is broken-host evidence, not process exit.
+
+        Retire the live child with the existing bounded terminate/kill policy
+        before any parent-owned temporary root is removed.
+        """
+        process = self._process
+        if process is not None and process.returncode is None:
+            await self._terminate_process(process)
         await self._on_process_exit("process_exited")
 
     async def _stderr_loop(self) -> None:

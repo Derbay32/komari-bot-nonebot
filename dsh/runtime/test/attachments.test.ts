@@ -176,3 +176,80 @@ test('closed decoder shape rejects duplicate and misordered descriptors', async 
     await session.release()
   })
 })
+
+
+test('cancelled chunk transfer releases the owner without leaving a late cache', async () => {
+  await withStore(async (store) => {
+    const session = store.createSession()
+    const controller = new AbortController()
+    let markStarted: (() => void) | undefined
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve
+    })
+    const preparation = session.prepare(
+      [descriptor(PNG_1X1)],
+      async (_imageIndex, _offset, signal) => {
+        markStarted?.()
+        await new Promise<never>((_resolve, reject) => {
+          signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+        })
+        throw new Error('unreachable')
+      },
+      controller.signal,
+    )
+    await started
+    controller.abort(new Error('deterministic transfer cancel'))
+    await assert.rejects(preparation)
+    await session.release()
+    assert.equal(existsSync(join(storeRoot(store), session.ownerId)), false)
+  })
+})
+
+function storeRoot(store: TaskAttachmentStore): string {
+  // The test helper passes the attachment root as a sibling of the profile;
+  // recover it from the prepared owner entries through a live session dir.
+  const runtimeRoot = (store as unknown as { root: string }).root
+  return runtimeRoot
+}
+
+
+test('owner release waits for an in-flight projection before deleting its cache', async () => {
+  await withStore(async (store, root) => {
+    const session = store.createSession()
+    const blocks = await session.prepare(
+      [descriptor(PNG_1X1)],
+      chunksFor(PNG_1X1),
+      new AbortController().signal,
+    )
+    const ref = blocks[0]?.attachment
+    assert.ok(ref !== undefined)
+    const projection = store.readImageRequest(ref, { width: 64, height: 64, maxBytes: 1024 * 1024 })
+    const release = session.release()
+    const [version] = await Promise.all([projection, release])
+    assert.ok(version.bytes > 0)
+    assert.equal(existsSync(join(root, 'attachments', session.ownerId)), false)
+  })
+})
+
+test('aborted projection cannot write a cache after successful owner cleanup', async () => {
+  await withStore(async (store, root) => {
+    const session = store.createSession()
+    const blocks = await session.prepare(
+      [descriptor(PNG_1X1)],
+      chunksFor(PNG_1X1),
+      new AbortController().signal,
+    )
+    const ref = blocks[0]?.attachment
+    assert.ok(ref !== undefined)
+    const controller = new AbortController()
+    const projection = store.readImageRequest(
+      ref,
+      { width: 64, height: 64, maxBytes: 1024 * 1024 },
+      controller.signal,
+    )
+    controller.abort(new Error('deterministic projection cancel'))
+    await assert.rejects(projection)
+    await session.release()
+    assert.equal(existsSync(join(root, 'attachments', session.ownerId)), false)
+  })
+})

@@ -73,3 +73,37 @@ async def test_startup_failure_removes_the_parent_owned_root(tmp_path: Path) -> 
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+
+async def test_stdout_eof_retires_live_child_before_root_removal(tmp_path: Path) -> None:
+    """stdout-only EOF is not proof of process exit; retire the child first."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True)
+    script = tmp_path / "stdout-only.mjs"
+    script.write_text(
+        "import { closeSync, mkdirSync, writeFileSync } from 'node:fs';\n"
+        "const rootIndex = process.argv.indexOf('--attachment-root');\n"
+        "const root = process.argv[rootIndex + 1];\n"
+        "process.on('SIGTERM', () => {});\n"
+        "process.stdout.write(JSON.stringify({v:1,kind:'ready',id:'ready',payload:{state:'ready',protocol_version:1,host_version:'probe',bindings:{chat:false,summary:false}}})+'\\n');\n"
+        "setTimeout(() => { closeSync(1); setTimeout(() => { mkdirSync(root, { recursive: true }); writeFileSync(root + '/orphan', 'late'); }, 100); }, 100);\n"
+        "setInterval(() => {}, 1000);\n",
+        encoding="utf-8",
+    )
+    host = AgentHost(
+        runtime_root=tmp_path,
+        data_dir=data_dir,
+        entry_script=script,
+        close_timeout=0.2,
+    )
+    try:
+        await host.start()
+        root = host.attachment_root
+        assert root is not None and root.is_dir()
+        reader_task = host._reader_task
+        assert reader_task is not None
+        await asyncio.wait_for(asyncio.shield(reader_task), timeout=5)
+        assert host.process_id is None, "stdout EOF must retire the live child"
+        assert not root.exists()
+    finally:
+        await host.close()

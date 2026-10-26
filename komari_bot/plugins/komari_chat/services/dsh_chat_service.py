@@ -31,7 +31,7 @@ from .chat_candidate import (
 )
 from .chat_recall_query import RecallQueryBudgetError, build_automatic_recall_query
 from .chat_result import ReplyResult
-from .chat_task_data import build_chat_task_data
+from .chat_task_data import ChatTaskData, build_chat_task_data
 from .image_downloader import ImageDownloadPolicy
 from .image_failure import (
     IMAGE_INPUT_FAILED_CODE,
@@ -228,6 +228,7 @@ class DshChatService:
         )
         failure_summary: ImageFailureSummary | None = None
         transport_error_code: str | None = None
+        task_data: ChatTaskData | None = None
         try:
             try:
                 descriptors = await image_input.prepare()
@@ -375,6 +376,9 @@ class DshChatService:
             quoted_sources = []
             current_sources = []
             descriptors = ()
+            recall_query = ""
+            task_data = None
+            task = None
 
         if failure_summary is not None:
             raise ImageUnderstandingFailureError(failure_summary) from None

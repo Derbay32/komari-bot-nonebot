@@ -25,6 +25,10 @@ from tests.komari_chat.hindsight_recall_support import (
     fake_recall_session,
     recall_response,
 )
+from tests.komari_chat.test_native_traceback_safety import (
+    _iter_komari_chat_frames,
+    _render_frame_locals,
+)
 
 service_module = import_module(
     "komari_bot.plugins.komari_chat.services.dsh_chat_service"
@@ -459,6 +463,14 @@ async def test_terminal_image_model_failure_maps_to_safe_summary(
     assert _CURRENT_URL not in rendered
     assert "QUJD" not in rendered
     assert "provider refused" not in rendered
+    source_base64 = base64.b64encode(source).decode("ascii")
+    source_data_uri = _data_uri(source, "PNG")
+    for frame in _iter_komari_chat_frames(excinfo.value):
+        frame_locals = _render_frame_locals(frame)
+        assert _CURRENT_URL not in frame_locals
+        assert source_base64 not in frame_locals
+        assert source_data_uri not in frame_locals
+        assert "provider refused" not in frame_locals
 
 
 async def test_transient_image_provider_retry_success_does_not_emit_summary(
@@ -579,3 +591,63 @@ async def test_cancellation_during_image_model_request_releases_owned_cache(
         hang.release.set()
 
     assert not root.exists()
+
+
+async def test_text_only_placeholder_route_http_failure_stays_generic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A text-only placeholder call must not inherit native image failure codes."""
+    from komari_bot.agent import AgentTaskError
+    from tests.komari_agent.dsh_test_support import HttpErrorResponse
+
+    source = _source_image("PNG", size=(16, 16), color=(3, 4, 5))
+    downloader = _StaticDownloader({_CURRENT_URL: _data_uri(source, "PNG")})
+    monkeypatch.setattr(
+        native_module,
+        "ImageDownloadSession",
+        lambda _policy: downloader,
+    )
+    monkeypatch.setattr(
+        service_module,
+        "_user_data_config",
+        lambda: SimpleNamespace(max_favorability_delta_per_reply=3),
+    )
+
+    async with running_dsh(
+        tmp_path,
+        responses=(
+            HttpErrorResponse(
+                400,
+                "placeholder route rejected",
+                "invalid_request_error",
+                "invalid_request",
+            ),
+        ),
+        entry_script=MAIN_HOST_SCRIPT,
+        prompt="冻结的聊天角色提示词。",
+        input_modalities=("text",),
+    ) as (host, _server):
+        service = service_module.DshChatService(
+            host_getter=lambda: host,
+            knowledge_search=_empty_search,
+            uid_search=_empty_uid,
+            favorability_getter=_favorability,
+            group_bindings_getter=_group_bindings,
+        )
+        with pytest.raises(AgentTaskError) as excinfo:
+            await service.generate(
+                message=_message(0, "文字模型 HTTP 失败"),
+                recent_messages=[],
+                reply_context=None,
+                recall_session=fake_recall_session(
+                    FakeHindsightMemory(response=recall_response())
+                ),
+                request_trace_id="chat-native-real-text-only-fail",
+                config=_config(),
+                image_urls=[_CURRENT_URL],
+            )
+
+    assert excinfo.value.code == "agent_error"
+    assert not isinstance(excinfo.value, failure_module.ImageUnderstandingFailureError)
+    assert "IMAGE_MODEL" not in str(excinfo.value)
