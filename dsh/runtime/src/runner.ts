@@ -280,7 +280,11 @@ export async function runAgentProcess(argv: readonly string[], options: RunOptio
       case 'cancel':
         // A result and a caller cancellation can cross on the wire. A cancel
         // for an already-terminal request is late and has no effect.
-        if (!activeRuntime.service.cancelTask(frame.id) && !recentlyCompletedSet.has(frame.id)) {
+        if (
+          !activeRuntime.service.cancelTask(frame.id)
+          && !taskPromises.has(frame.id)
+          && !recentlyCompletedSet.has(frame.id)
+        ) {
           throw new ProtocolError('unknown_cancel_id')
         }
         return true
