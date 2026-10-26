@@ -12,6 +12,8 @@ import { installFailLoud } from '@deepseek-ai/dsh-app-boot'
 import { HostBootError, startHost, type HostRuntime } from './host.js'
 import { logTo, sanitizeLogText } from './logging.js'
 import {
+  controlResultErrorFrame,
+  controlResultSuccessFrame,
   encodeFrame,
   parseClientFrame,
   ProtocolError,
@@ -22,6 +24,7 @@ import {
   type ClientFrame,
   type ServerFrame,
 } from './protocol.js'
+import { ManagementError } from './management.js'
 import { TaskFailure } from './business.js'
 
 const HOST_VERSION = '0.1.0'
@@ -170,6 +173,9 @@ export async function runAgentProcess(argv: readonly string[], options: RunOptio
   const writer = new FrameWriter(stdout)
   let runtime: HostRuntime | undefined
   const taskPromises = new Map<string, Promise<void>>()
+  const controlPromises = new Set<Promise<void>>()
+  const seenControlIds = new Set<string>()
+  const recentControlIds: string[] = []
   const seenTaskIds = new Set<string>()
   const recentlyCompleted: string[] = []
   const recentlyCompletedSet = new Set<string>()
@@ -237,6 +243,32 @@ export async function runAgentProcess(argv: readonly string[], options: RunOptio
     bindings: activeRuntime.bindings,
   }))
 
+  const dispatchControl = (frame: ClientFrame & { kind: 'control' }): void => {
+    if (seenControlIds.has(frame.id)) throw new ProtocolError('duplicate_control_id')
+    seenControlIds.add(frame.id)
+    const promise = (async () => {
+      try {
+        const result = await activeRuntime.management.handle(frame.payload.op, frame.payload.args)
+        await send(controlResultSuccessFrame(frame.id, result))
+      } catch (error) {
+        const failure = error instanceof ManagementError
+          ? { code: error.code, message: error.message }
+          : { code: 'unavailable', message: 'DSH management is unavailable.' }
+        try {
+          await send(controlResultErrorFrame(frame.id, failure.code, failure.message))
+        } catch {
+          // The parent is gone; the reader loop will fail on the next frame.
+        }
+      } finally {
+        seenControlIds.delete(frame.id)
+        recentControlIds.push(frame.id)
+        while (recentControlIds.length > 128) recentControlIds.shift()
+      }
+    })()
+    controlPromises.add(promise)
+    void promise.finally(() => controlPromises.delete(promise))
+  }
+
   const dispatchRequest = (frame: ClientFrame & { kind: 'request' }): void => {
     if (seenTaskIds.has(frame.payload.task_id)) {
       throw new ProtocolError('duplicate_task_id')
@@ -285,6 +317,9 @@ export async function runAgentProcess(argv: readonly string[], options: RunOptio
           throw new ProtocolError('unknown_callback_id')
         }
         return true
+      case 'control':
+        dispatchControl(frame)
+        return true
       case 'cancel':
         // A result and a caller cancellation can cross on the wire. A cancel
         // for an already-terminal request is late and has no effect.
@@ -309,7 +344,7 @@ export async function runAgentProcess(argv: readonly string[], options: RunOptio
     activeRuntime.service.cancelAll()
     activeRuntime.callbacks.cancelAll()
     const drained = await Promise.race([
-      Promise.allSettled([...taskPromises.values()]),
+      Promise.allSettled([...taskPromises.values(), ...controlPromises]),
       new Promise<null>((resolve) => {
         const timer = setTimeout(() => resolve(null), SHUTDOWN_DRAIN_MS)
         timer.unref()

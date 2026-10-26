@@ -111,6 +111,9 @@ def _load_management_components() -> ManagementApiComponents:
     require("komari_decision")
     from komari_bot.plugins import komari_decision as decision_plugin
 
+    require("komari_agent")
+    from komari_bot.plugins import komari_agent as agent_plugin
+
     return ManagementApiComponents(
         register_knowledge_api=knowledge_plugin.register_knowledge_api,
         knowledge_engine_getter=knowledge_plugin.get_engine,
@@ -126,6 +129,7 @@ def _load_management_components() -> ManagementApiComponents:
         register_roulette_management_api=roulette_plugin.register_roulette_management_api,
         roulette_observation_getter=roulette_plugin.get_roulette_observation,
         register_decision_api=decision_plugin.register_decision_api,
+        dsh_management_client_getter=agent_plugin.get_management_client,
         config_resources=(
             ManagedConfigResource(
                 resource_id="komari_management",

@@ -2,5 +2,7 @@ export { default as KomariAgentRuntime, Config, FIXED_RETRY_POLICY, TaskFailure 
 export type { AgentBinding, CallbackTransport } from './business.js'
 export * from './protocol.js'
 export { bootstrapProfile, CallbackDispatcher, HostBootError, PROFILE_BUNDLE, startHost } from './host.js'
+export { DshManagementService, ManagementError, AGENT_SETTINGS_NS, LLM_SETTINGS_NS } from './management.js'
+export type { ManagementErrorCode } from './management.js'
 export { TaskMutationConflict } from './gate.js'
 export type { HostRuntime, StartHostOptions } from './host.js'

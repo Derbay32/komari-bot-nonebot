@@ -15,6 +15,8 @@ MAX_CALLBACK_NAME_LENGTH: Final = 64
 MAX_TASK_DATA_BYTES: Final = 512 * 1024
 MAX_CALLBACK_DATA_BYTES: Final = 256 * 1024
 MAX_RESULT_BYTES: Final = 512 * 1024
+MAX_CONTROL_ARGS_BYTES: Final = 64 * 1024
+MAX_CONTROL_RESULT_BYTES: Final = 512 * 1024
 MAX_BUDGET_VALUE: Final = 1000
 
 _TASK_ID_PATTERN: Final = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
@@ -29,6 +31,23 @@ class TaskKind(StrEnum):
 
     CHAT = "chat"
     SUMMARY = "summary"
+
+
+class ControlOperation(StrEnum):
+    """Closed management operations accepted by the private DSH pipe."""
+
+    PROVIDERS_LIST = "providers.list"
+    PROVIDERS_GET = "providers.get"
+    PROVIDERS_PUT = "providers.put"
+    PROVIDERS_DELETE = "providers.delete"
+    CREDENTIAL_GET = "credential.get"
+    CREDENTIAL_PUT = "credential.put"
+    CREDENTIAL_DELETE = "credential.delete"
+    BINDING_GET = "binding.get"
+    BINDING_PUT = "binding.put"
+    BINDING_DELETE = "binding.delete"
+    PROMPT_GET = "prompt.get"
+    PROMPT_PUT = "prompt.put"
 
 
 class HostState(StrEnum):
@@ -79,6 +98,15 @@ class AgentTaskError(AgentHostError):
         super().__init__(message or code)
         self.code = code
         self.safe_message = message or "The task failed."
+
+
+class AgentControlError(AgentHostError):
+    """One management operation failed with a stable, already-sanitized code."""
+
+    def __init__(self, code: str, message: str = "") -> None:
+        super().__init__(message or code)
+        self.code = code
+        self.safe_message = message or "The management operation failed."
 
 
 def validate_error_code(code: str) -> bool:
@@ -221,6 +249,39 @@ type AgentCallbackHandler = Callable[[AgentCallbackRequest], Awaitable[JsonValue
 
 
 @dataclass(frozen=True, slots=True)
+class AgentControlRequest:
+    """One trusted control operation and its restricted JSON arguments."""
+
+    operation: ControlOperation
+    args: Mapping[str, JsonValue]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.operation, ControlOperation):
+            msg = "operation must be a trusted ControlOperation"
+            raise TypeError(msg)
+        copied = copy_json_object(self.args, max_bytes=MAX_CONTROL_ARGS_BYTES)
+        object.__setattr__(self, "args", copied)
+
+    def to_protocol(self) -> dict[str, JsonValue]:
+        """Return the closed payload accepted by the Node host."""
+        return {"op": self.operation.value, "args": dict(self.args)}
+
+
+@dataclass(frozen=True, slots=True)
+class AgentControlResult:
+    """Successful management result, already detached from the child process."""
+
+    value: Mapping[str, JsonValue]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.value, Mapping):
+            msg = "control result must be a JSON object"
+            raise TypeError(msg)
+        copied = copy_json_object(self.value, max_bytes=MAX_CONTROL_RESULT_BYTES)
+        object.__setattr__(self, "value", copied)
+
+
+@dataclass(frozen=True, slots=True)
 class HostReadiness:
     """Public display of the child's model-readiness distinction."""
 
@@ -241,11 +302,16 @@ class HostReadiness:
 __all__ = [
     "MAX_CALLBACK_DATA_BYTES",
     "MAX_CALLBACK_NAME_LENGTH",
+    "MAX_CONTROL_ARGS_BYTES",
+    "MAX_CONTROL_RESULT_BYTES",
     "MAX_RESULT_BYTES",
     "MAX_TASK_DATA_BYTES",
     "MAX_TASK_ID_LENGTH",
     "AgentCallbackHandler",
     "AgentCallbackRequest",
+    "AgentControlError",
+    "AgentControlRequest",
+    "AgentControlResult",
     "AgentHostError",
     "AgentHostUnavailableError",
     "AgentProtocolError",
@@ -253,6 +319,7 @@ __all__ = [
     "AgentTaskError",
     "AgentTaskRequest",
     "AgentTaskResult",
+    "ControlOperation",
     "HostReadiness",
     "HostState",
     "JsonValue",

@@ -89,3 +89,33 @@ test('unknown callback names and mismatched IDs are not resolvable', () => {
     (error: unknown) => error instanceof ProtocolError && error.code === 'invalid_error_code',
   )
 })
+
+test('parses closed control frames separately from task frames', () => {
+  const frame = parseClientFrame(JSON.stringify({
+    v: 1,
+    kind: 'control',
+    id: 'ctl-1',
+    payload: {
+      op: 'providers.list',
+      args: { nested: ['value', { count: 1 }] },
+    },
+  }))
+  assert.equal(frame.kind, 'control')
+  if (frame.kind === 'control') {
+    assert.equal(frame.payload.op, 'providers.list')
+    assert.deepEqual(frame.payload.args, { nested: ['value', { count: 1 }] })
+  }
+  assert.throws(
+    () => parseClientFrame(JSON.stringify({
+      v: 1,
+      kind: 'control',
+      id: 'ctl-2',
+      payload: { op: 'providers.list', args: {}, extra: true },
+    })),
+    (error: unknown) => error instanceof ProtocolError && error.code === 'invalid_control_payload',
+  )
+  assert.throws(
+    () => parseClientFrame('{"v":1,"kind":"control","id":"ctl-3","payload":{"op":"providers.list","args":{"value":1e999}}}'),
+    (error: unknown) => error instanceof ProtocolError && error.code === 'json_non_finite',
+  )
+})
