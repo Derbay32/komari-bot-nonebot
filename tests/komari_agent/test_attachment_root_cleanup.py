@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from komari_bot.agent import AgentHost, AgentHostUnavailableError, HostState
+from komari_bot.agent import host as host_module
 from tests.komari_agent.dsh_test_support import (
     TEST_HOST_SCRIPT,
     ToolCallResponse,
@@ -107,3 +108,47 @@ async def test_stdout_eof_retires_live_child_before_root_removal(tmp_path: Path)
         assert not root.exists()
     finally:
         await host.close()
+
+
+class _ExhaustedProcess:
+    """A child whose bounded terminate/kill attempts all time out."""
+
+    returncode: int | None = None
+
+    def terminate(self) -> None:
+        return None
+
+    def kill(self) -> None:
+        return None
+
+    async def wait(self) -> int:
+        await asyncio.sleep(60)
+        return 1
+
+
+async def test_exhausted_termination_withholds_root_until_observed_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "attachments"
+    root.mkdir()
+    process = _ExhaustedProcess()
+    host = AgentHost(
+        runtime_root=tmp_path,
+        data_dir=tmp_path / "data",
+        entry_script=tmp_path / "unused.mjs",
+        close_timeout=0.01,
+    )
+    host.attachment_root = root
+    host._attachment_root_cleaned = False
+    host._process = process  # type: ignore[assignment]
+    monkeypatch.setattr(host_module, "TERMINATE_TIMEOUT", 0.01)
+
+    await host._on_stdout_eof()
+
+    assert root.exists()
+    assert host._attachment_root_cleaned is False
+    process.returncode = 0
+    host._cleanup_attachment_root()
+    assert not root.exists()
+    assert host._attachment_root_cleaned is True

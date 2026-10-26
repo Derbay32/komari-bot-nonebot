@@ -280,3 +280,12 @@ def test_terminal_provider_failure_and_projection_failure_frames_are_safe(
     assert excinfo.value.__cause__ is None
     assert excinfo.value.__context__ is None
     _assert_frames_safe(excinfo.value)
+
+    projection_host = _ImageHost(
+        error=AgentTaskError("image_input_failed", f"unsafe projection body {_VISION}")
+    )
+    with pytest.raises(failure_module.ImageUnderstandingFailureError) as projection:
+        asyncio.run(_debug_call(_debug_handler(projection_host)))
+    assert projection.value.__cause__ is None
+    assert projection.value.__context__ is None
+    _assert_frames_safe(projection.value)

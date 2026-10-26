@@ -616,6 +616,12 @@ class AgentHost:
         root = self.attachment_root
         if root is None or self._attachment_root_cleaned:
             return
+        process = self._process
+        if process is not None and process.returncode is None:
+            self._log.warning(
+                "[komari_agent] attachment root cleanup withheld: child_still_running"
+            )
+            return
         try:
             shutil.rmtree(root)
         except FileNotFoundError:
