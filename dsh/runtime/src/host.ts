@@ -24,6 +24,7 @@ import {
   type TaskKind,
 } from './protocol.js'
 import KomariAgentRuntime, { TaskFailure, type CallbackTransport } from './business.js'
+import TaskAttachmentStore from './attachments.js'
 import { DshManagementService } from './management.js'
 import { installSanitizedStderr } from './logging.js'
 
@@ -53,6 +54,11 @@ export interface StartHostOptions {
   readonly baseConfig: string
   /** Private harness home. Never the operator's ~/.dsh. */
   readonly dshHome: string
+  /**
+   * Parent-owned private temporary root for this child lifetime. Task image
+   * caches live below it and the parent removes the whole root after exit.
+   */
+  readonly attachmentRoot: string
   /**
    * Directory holding the home-level patch and harness-home files. It defaults
    * to a child of dshHome so the writable profile patch is never also read as
@@ -242,6 +248,8 @@ export async function startHost(options: StartHostOptions): Promise<HostRuntime>
     restoreStderr()
   }
   try {
+    await ctx.plugin(TaskAttachmentStore, { root: options.attachmentRoot })
+    if (ctx.get('attachments') === undefined) throw new HostBootError('composition_incomplete')
     assertComposition(ctx)
     const service = ctx.get('komariAgent')
     if (service === undefined) throw new HostBootError('composition_incomplete')

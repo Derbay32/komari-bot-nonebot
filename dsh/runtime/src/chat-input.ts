@@ -31,6 +31,16 @@ export interface QuotedData extends UntrustedData {
   readonly has_visible_image: boolean
 }
 
+export type ChatImageMediaType = 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp'
+
+export interface ChatImageDescriptor {
+  readonly index: number
+  readonly origin: 'quoted' | 'current'
+  readonly media_type: ChatImageMediaType
+  readonly byte_count: number
+  readonly sha256: string
+}
+
 export interface ChatTaskData {
   readonly schema: 1
   readonly current: MessageData
@@ -39,6 +49,7 @@ export interface ChatTaskData {
   readonly memory: readonly UntrustedData[]
   readonly knowledge: readonly UntrustedData[]
   readonly uid_knowledge: readonly UntrustedData[]
+  readonly images: readonly ChatImageDescriptor[]
   readonly facts: {
     readonly bot_nickname: string
     readonly current_favorability: {
@@ -79,6 +90,7 @@ const CHAT_TASK_KEYS = [
   'knowledge',
   'uid_knowledge',
   'facts',
+  'images',
 ] as const
 const MESSAGE_KEYS = [
   'source_type',
@@ -105,9 +117,25 @@ const QUOTE_KEYS = [
 const FACTS_KEYS = ['bot_nickname', 'current_favorability', 'visible_users', 'max_favorability_delta'] as const
 const FAVORABILITY_KEYS = ['value', 'stage_index', 'stage_name', 'stage_prompt'] as const
 const VISIBLE_USER_KEYS = ['user_id', 'nickname', 'character_name'] as const
+const IMAGE_KEYS = ['index', 'origin', 'media_type', 'byte_count', 'sha256'] as const
+const IMAGE_MEDIA_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'] as const
+export const MAX_CHAT_IMAGES = 8
+export const MAX_CHAT_IMAGE_BYTES = 16 * 1024 * 1024
+export const MAX_CHAT_IMAGE_TOTAL_BYTES = 32 * 1024 * 1024
+
+export class InvalidChatImageDescriptor extends Error {
+  constructor() {
+    super('invalid_chat_image_descriptor')
+    this.name = 'InvalidChatImageDescriptor'
+  }
+}
 
 function invalid(): never {
   throw new Error('invalid_chat_task_data')
+}
+
+function invalidImage(): never {
+  throw new InvalidChatImageDescriptor()
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -246,6 +274,51 @@ function decodeFacts(value: unknown): ChatTaskData['facts'] {
   }
 }
 
+
+function decodeImagesInner(value: unknown): readonly ChatImageDescriptor[] {
+  if (!Array.isArray(value) || value.length > MAX_CHAT_IMAGES) invalidImage()
+  const images: ChatImageDescriptor[] = []
+  let previousIndex = -1
+  let previousOrigin: ChatImageDescriptor['origin'] | undefined
+  let aggregate = 0
+  for (const item of value) {
+    if (!isPlainObject(item)) invalidImage()
+    exactKeys(item, IMAGE_KEYS)
+    const index = integerValue(item.index)
+    if (index < 0 || index <= previousIndex) invalidImage()
+    const origin = stringValue(item.origin)
+    if (origin !== 'quoted' && origin !== 'current') invalidImage()
+    if (previousOrigin === 'current' && origin === 'quoted') invalidImage()
+    const mediaType = stringValue(item.media_type)
+    if (!(IMAGE_MEDIA_TYPES as readonly string[]).includes(mediaType)) invalidImage()
+    const byteCount = integerValue(item.byte_count)
+    if (byteCount <= 0 || byteCount > MAX_CHAT_IMAGE_BYTES) invalidImage()
+    const sha256 = stringValue(item.sha256)
+    if (!/^[0-9a-f]{64}$/.test(sha256)) invalidImage()
+    aggregate += byteCount
+    if (aggregate > MAX_CHAT_IMAGE_TOTAL_BYTES) invalidImage()
+    images.push({
+      index,
+      origin,
+      media_type: mediaType as ChatImageMediaType,
+      byte_count: byteCount,
+      sha256,
+    })
+    previousIndex = index
+    previousOrigin = origin
+  }
+  return images
+}
+
+function decodeImages(value: unknown): readonly ChatImageDescriptor[] {
+  try {
+    return decodeImagesInner(value)
+  } catch (error) {
+    if (error instanceof InvalidChatImageDescriptor) throw error
+    throw new InvalidChatImageDescriptor()
+  }
+}
+
 export function decodeChatTaskData(value: unknown): ChatTaskData {
   if (!isPlainObject(value)) invalid()
   exactKeys(value, CHAT_TASK_KEYS)
@@ -262,6 +335,7 @@ export function decodeChatTaskData(value: unknown): ChatTaskData {
     memory: decodeUntrustedList(value.memory, 'memory'),
     knowledge: decodeUntrustedList(value.knowledge, 'knowledge'),
     uid_knowledge: decodeUntrustedList(value.uid_knowledge, 'knowledge'),
+    images: decodeImages(value.images),
     facts: decodeFacts(value.facts),
   }
 }

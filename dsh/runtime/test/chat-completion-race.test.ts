@@ -61,6 +61,7 @@ test('queued steering drains after same-batch completion without another request
       installAnchor: DSH_PACKAGE,
       baseConfig: DSH_BASE_CONFIG,
       dshHome: join(root, 'home'),
+      attachmentRoot: join(root, 'attachments'),
       extraPatches: racePatches(),
       sendFrame: async (frame) => {
         if (frame.kind !== 'callback') return

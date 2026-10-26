@@ -288,6 +288,7 @@ export function minimalChatTaskData(overrides: { readonly text?: string; readonl
     memory: [],
     knowledge: [],
     uid_knowledge: [],
+    images: [],
     facts: {
       bot_nickname: 'Fixture',
       current_favorability: {

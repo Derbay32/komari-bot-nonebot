@@ -25,6 +25,7 @@ for (const mode of ['reject', 'hang'] as const) {
         installAnchor: DSH_PACKAGE,
         baseConfig: DSH_BASE_CONFIG,
         dshHome: join(root, 'home'),
+        attachmentRoot: join(root, 'attachments'),
         sendFrame: async (frame) => {
           if (frame.kind !== 'callback') return
           runtime?.callbacks.handleResult(frame.id, {

@@ -43,6 +43,7 @@ test('binding and prompt edits during a task do not affect its frozen snapshot',
       installAnchor: DSH_PACKAGE,
       baseConfig: DSH_BASE_CONFIG,
       dshHome: join(root, 'home'),
+      attachmentRoot: join(root, 'attachments'),
       sendFrame,
     })
     const budget = { max_rounds: 3, max_tool_calls_per_round: 4, max_total_tool_calls: 8 }

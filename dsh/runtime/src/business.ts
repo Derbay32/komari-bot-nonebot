@@ -9,13 +9,15 @@
 import { randomUUID } from 'node:crypto'
 import { Context, Service, type Volatile } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-agent-preset-registry'
+import { isAttachmentError } from '@deepseek-ai/dsh-attachment'
 import z from '@deepseek-ai/schemastery'
 import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
 import type { GenerateOptions, LlmResolvedModelInfo, RetryPolicyConfig, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { createUserMessage, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import { PERSONA_PREFIX_SECTION } from '@deepseek-ai/dsh-system-prompt'
-import { decodeChatTaskData, renderChatTaskInput } from './chat-input.js'
+import { AttachmentPreparationError, type TaskAttachmentSession, type TaskAttachmentStore } from './attachments.js'
+import { decodeChatTaskData, InvalidChatImageDescriptor, renderChatTaskInput, type ChatTaskData } from './chat-input.js'
 import { TaskMutationGate, TaskMutationConflict } from './gate.js'
 import {
   assertCallbackName,
@@ -98,6 +100,9 @@ interface LiveTask {
   readonly reasoningEffort: ReasoningEffortId | undefined
   readonly prompt: string
   readonly controller: AbortController
+  imageSession: TaskAttachmentSession | undefined
+  imageModelFailure: boolean
+  imageInputFailure: boolean
   readonly admissionAttempts: Map<AdmissionPurpose, number>
   cancelled: boolean
   result: { readonly [key: string]: JsonValue } | undefined
@@ -118,6 +123,16 @@ function timeoutSentinel<T>(promise: Promise<T>, ms: number): Promise<T | typeof
 }
 
 const TIMEOUT = Symbol('timeout')
+
+function hasAttachmentCause(error: unknown): boolean {
+  let current: unknown = error
+  for (let depth = 0; depth < 8; depth += 1) {
+    if (isAttachmentError(current)) return true
+    if (!(current instanceof Error)) return false
+    current = current.cause
+  }
+  return false
+}
 
 function hasFixedRetryPolicy(policy: { mode: string; maxRetries?: number; retryableCodes?: readonly string[] }): boolean {
   if (policy.mode !== 'normal' || policy.maxRetries !== 2) return false
@@ -148,7 +163,37 @@ export default class KomariAgentRuntime extends Service {
     ctx.on('agent/error', (payload) => {
       const task = this.liveBySession.get(payload.agent.id)
       if (task === undefined || task.cancelled) return
-      task.failureCode = payload.error instanceof LlmError ? payload.error.code : 'UNKNOWN'
+      if (!(payload.error instanceof LlmError)) {
+        task.failureCode = 'UNKNOWN'
+        if (task.imageSession !== undefined && isAttachmentError(payload.error)) {
+          task.imageInputFailure = true
+        }
+        return
+      }
+      task.failureCode = payload.error.code
+      if (
+        task.imageSession !== undefined
+        && (
+          hasAttachmentCause(payload.error)
+          || payload.error.code === 'IMAGE_INPUT_FAILED'
+          || payload.error.code.startsWith('ATTACHMENT_')
+        )
+      ) {
+        task.imageInputFailure = true
+        return
+      }
+      // Provider admission/cancellation are owned by the task boundary, not
+      // by model-image processing. Only a terminal model request failure on an
+      // image-bearing task is classified as image_model_failed.
+      if (
+        task.imageSession !== undefined
+        && payload.error.code !== 'ADMISSION_DENIED'
+        && payload.error.code !== 'ABORTED'
+        && payload.error.code !== 'IMAGE_OFFLOAD_REQUIRED'
+        && payload.error.code !== 'CONTEXT_WINDOW_EXCEEDED'
+      ) {
+        task.imageModelFailure = true
+      }
     })
     ctx.on('session/event', (session, event) => {
       const task = this.liveBySession.get(session.id)
@@ -269,6 +314,12 @@ export default class KomariAgentRuntime extends Service {
     const lease = await this.gate.enterTask()
     let task: LiveTask | undefined
     try {
+      const chatData: ChatTaskData | undefined = request.kind === 'chat'
+        ? this.decodeChatTask(request)
+        : undefined
+      const renderedTaskInput = chatData === undefined
+        ? this.renderTaskInput(request)
+        : renderChatTaskInput(chatData)
       const live: LiveTask = await this.createLiveTask(requestId, request)
       task = live
       this.liveBySession.set(live.sessionId, live)
@@ -305,8 +356,30 @@ export default class KomariAgentRuntime extends Service {
         handle.agent.cancel({ kind: 'user' })
         throw new TaskFailure('cancelled')
       }
+
+      // Trusted preparation at the existing initial-input boundary. The
+      // text-only path above still creates exactly one partitioned message.
+      let imageBlocks: readonly import('@deepseek-ai/dsh-llm').ImageBlock[] = []
+      if (chatData !== undefined && chatData.images.length > 0) {
+        const attachments = this.ctx.get('attachments') as TaskAttachmentStore
+        const imageSession = attachments.createSession()
+        live.imageSession = imageSession
+        try {
+          imageBlocks = await imageSession.prepare(
+            chatData.images,
+            (imageIndex: number, offset: number, signal: AbortSignal) => this.readImageChunk(live, imageIndex, offset, signal),
+            live.controller.signal,
+          )
+        } catch (error) {
+          if (error instanceof AttachmentPreparationError) {
+            throw new TaskFailure(error.code)
+          }
+          throw error
+        }
+      }
+      if (live.cancelled) throw new TaskFailure('cancelled')
       handle.agent.followup(createUserMessage({
-        content: [{ type: 'text', text: this.renderTaskInput(request) }],
+        content: [{ type: 'text', text: renderedTaskInput }, ...imageBlocks],
         source: { kind: 'user' },
       }))
       // A live task is bounded by its model/tool budgets, not the shutdown
@@ -315,7 +388,11 @@ export default class KomariAgentRuntime extends Service {
       if (live.cancelled) throw new TaskFailure('cancelled')
       // An already-recorded terminal failure always wins over a late result.
       if (live.terminalFailure !== undefined) throw new TaskFailure(live.terminalFailure)
-      if (live.failureCode !== undefined) throw new TaskFailure('agent_error', live.failureCode)
+      if (live.failureCode !== undefined) {
+        if (live.imageInputFailure) throw new TaskFailure('image_input_failed')
+        if (live.imageModelFailure) throw new TaskFailure('image_model_failed')
+        throw new TaskFailure('agent_error', live.failureCode)
+      }
       if (live.result !== undefined) return live.result
       throw new TaskFailure('incomplete_result')
     } catch (error) {
@@ -384,6 +461,9 @@ export default class KomariAgentRuntime extends Service {
       reasoningEffort,
       prompt,
       controller: new AbortController(),
+      imageSession: undefined,
+      imageModelFailure: false,
+      imageInputFailure: false,
       admissionAttempts: new Map(),
       cancelled: false,
       result: undefined,
@@ -403,6 +483,41 @@ export default class KomariAgentRuntime extends Service {
     return (binding.provider?.trim().length ?? 0) > 0
       && (binding.model?.trim().length ?? 0) > 0
       && (binding.prompt?.trim().length ?? 0) > 0
+  }
+
+  private decodeChatTask(request: TaskRequestPayload): ChatTaskData {
+    try {
+      return decodeChatTaskData(request.task_data)
+    } catch (error) {
+      if (error instanceof InvalidChatImageDescriptor) throw new TaskFailure('invalid_image_input')
+      throw new TaskFailure('invalid_task_data')
+    }
+  }
+
+  private async readImageChunk(
+    task: LiveTask,
+    imageIndex: number,
+    offset: number,
+    signal: AbortSignal,
+  ): Promise<JsonValue> {
+    if (task.cancelled || signal.aborted) throw new TaskFailure('cancelled')
+    try {
+      const result = await this.invokeCallback(task, 'chat.read_image_chunk', {
+        image_index: imageIndex,
+        offset,
+      })
+      if (task.cancelled || signal.aborted) throw new TaskFailure('cancelled')
+      return result
+    } catch (error) {
+      if (task.cancelled || signal.aborted) throw new TaskFailure('cancelled')
+      if (error instanceof TaskFailure && error.failureCode === 'admission_denied') {
+        throw new AttachmentPreparationError('admission_denied')
+      }
+      if (error instanceof TaskFailure && error.failureCode === 'invalid_image_input') {
+        throw new AttachmentPreparationError('invalid_image_input')
+      }
+      throw error
+    }
   }
 
   private renderTaskInput(request: TaskRequestPayload): string {
@@ -543,8 +658,17 @@ export default class KomariAgentRuntime extends Service {
     } catch {
       failure = new TaskFailure('release_failed')
     } finally {
-      this.liveBySession.delete(task.sessionId)
-      this.liveByRequest.delete(task.requestId)
+      try {
+        if (task.imageSession !== undefined) {
+          const released = await timeoutSentinel(task.imageSession.release(), HANDLE_DISPOSE_TIMEOUT_MS)
+          if (released === TIMEOUT) failure = new TaskFailure('release_failed')
+        }
+      } catch {
+        failure = new TaskFailure('release_failed')
+      } finally {
+        this.liveBySession.delete(task.sessionId)
+        this.liveByRequest.delete(task.requestId)
+      }
     }
     return failure
   }

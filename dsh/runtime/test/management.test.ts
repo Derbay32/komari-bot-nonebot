@@ -43,6 +43,7 @@ test('an empty profile is configurable through the management surface', async ()
       installAnchor: DSH_PACKAGE,
       baseConfig: DSH_BASE_CONFIG,
       dshHome: join(profile.root, 'home'),
+      attachmentRoot: join(profile.root, 'attachments'),
       sendFrame: async () => undefined,
     })
 
@@ -114,6 +115,7 @@ test('provider, credential, binding and prompt operations preserve unrelated sta
       installAnchor: DSH_PACKAGE,
       baseConfig: DSH_BASE_CONFIG,
       dshHome: join(profile.root, 'home'),
+      attachmentRoot: join(profile.root, 'attachments'),
       sendFrame: async () => undefined,
     })
 
@@ -251,6 +253,7 @@ test('saved management state survives restart and old ETags never match', async 
     installAnchor: DSH_PACKAGE,
     baseConfig: DSH_BASE_CONFIG,
     dshHome: home,
+    attachmentRoot: join(profile.root, 'attachments'),
     sendFrame: async () => undefined,
   })
   let firstEtag: string
@@ -290,6 +293,7 @@ test('saved management state survives restart and old ETags never match', async 
     installAnchor: DSH_PACKAGE,
     baseConfig: DSH_BASE_CONFIG,
     dshHome: home,
+    attachmentRoot: join(profile.root, 'attachments'),
     sendFrame: async () => undefined,
   })
   try {
@@ -325,6 +329,7 @@ test('live tasks block connection writes while binding and prompt edits remain l
       installAnchor: DSH_PACKAGE,
       baseConfig: DSH_BASE_CONFIG,
       dshHome: join(profile.root, 'home'),
+      attachmentRoot: join(profile.root, 'attachments'),
       sendFrame: async () => undefined,
     })
     const empty = asObject(await runtime.management.handle('providers.list', {}))
@@ -392,6 +397,7 @@ test('an official write failure is reported as unavailable without leaking its t
       installAnchor: DSH_PACKAGE,
       baseConfig: DSH_BASE_CONFIG,
       dshHome: join(profile.root, 'home'),
+      attachmentRoot: join(profile.root, 'attachments'),
       sendFrame: async () => undefined,
     })
     const empty = asObject(await runtime.management.handle('providers.list', {}))
@@ -435,6 +441,7 @@ test('task admission waits for an idle connection mutation to settle', async () 
       installAnchor: DSH_PACKAGE,
       baseConfig: DSH_BASE_CONFIG,
       dshHome: join(profile.root, 'home'),
+      attachmentRoot: join(profile.root, 'attachments'),
       extraPatches: fixturePatches(),
       sendFrame: async (frame) => {
         if (frame.kind !== 'callback') return
