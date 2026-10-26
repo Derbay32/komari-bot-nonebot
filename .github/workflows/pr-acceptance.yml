@@ -53,6 +53,29 @@ jobs:
         if: ${{ !cancelled() }}
         run: poetry sync --with dev --no-root --no-ansi
 
+      - name: 安装 Node 24
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24.9.0"
+          cache: npm
+          cache-dependency-path: dsh/package-lock.json
+
+      - name: 安装 DSH 依赖
+        if: ${{ !cancelled() }}
+        run: npm ci --prefix dsh --no-audit --no-fund
+
+      - name: 检查 DSH TypeScript
+        if: ${{ !cancelled() }}
+        run: npm run check --prefix dsh
+
+      - name: 构建 DSH TypeScript
+        if: ${{ !cancelled() }}
+        run: npm run build --prefix dsh
+
+      - name: DSH Node 测试
+        if: ${{ !cancelled() }}
+        run: npm test --prefix dsh
+
       - name: Ruff 检查
         if: ${{ !cancelled() && steps.dependency-sync.outcome == 'success' }}
         run: poetry run ruff check .
@@ -130,6 +153,29 @@ jobs:
         id: dependency-sync
         if: ${{ !cancelled() }}
         run: poetry sync --with dev --no-root --no-ansi
+
+      - name: 安装 Node 24
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24.9.0"
+          cache: npm
+          cache-dependency-path: dsh/package-lock.json
+
+      - name: 安装 DSH 依赖
+        if: ${{ !cancelled() }}
+        run: npm ci --prefix dsh --no-audit --no-fund
+
+      - name: 检查 DSH TypeScript
+        if: ${{ !cancelled() }}
+        run: npm run check --prefix dsh
+
+      - name: 构建 DSH TypeScript
+        if: ${{ !cancelled() }}
+        run: npm run build --prefix dsh
+
+      - name: DSH Node 测试
+        if: ${{ !cancelled() }}
+        run: npm test --prefix dsh
 
       - name: 应用迁移 upgrade head
         id: migration-upgrade
