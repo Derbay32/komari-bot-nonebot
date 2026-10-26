@@ -140,6 +140,22 @@ class VisibleUserFact:
 
 
 @dataclass(frozen=True, slots=True)
+class ChatQueryCapabilities:
+    """Frozen model-visible query capabilities for one DSH chat task."""
+
+    knowledge: bool
+    search: bool
+    fetch: bool
+
+    def to_dict(self) -> dict[str, bool]:
+        return {
+            "knowledge": self.knowledge,
+            "search": self.search,
+            "fetch": self.fetch,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class ChatFacts:
     bot_nickname: str
     current_favorability: CurrentFavorabilityFact
@@ -167,6 +183,7 @@ class ChatTaskData:
     knowledge: tuple[UntrustedData, ...]
     uid_knowledge: tuple[UntrustedData, ...]
     facts: ChatFacts
+    capabilities: ChatQueryCapabilities
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -178,6 +195,7 @@ class ChatTaskData:
             "knowledge": [item.to_dict() for item in self.knowledge],
             "uid_knowledge": [item.to_dict() for item in self.uid_knowledge],
             "facts": self.facts.to_dict(),
+            "capabilities": self.capabilities.to_dict(),
         }
 
 
@@ -206,6 +224,7 @@ def build_chat_task_data(
     bot_nickname: str,
     max_favorability_delta: int,
     group_bindings: Mapping[str, str],
+    capabilities: ChatQueryCapabilities,
 ) -> ChatTaskData:
     """Build the exact task data from actual source fields without guessing IDs."""
     same_group_recent = [
@@ -241,6 +260,7 @@ def build_chat_task_data(
             max_favorability_delta=max_favorability_delta,
             group_bindings=group_bindings,
         ),
+        capabilities=capabilities,
     )
 
 
@@ -370,6 +390,7 @@ def _facts(
 __all__ = [
     "MAX_RECENT_MESSAGES",
     "ChatFacts",
+    "ChatQueryCapabilities",
     "ChatTaskData",
     "CurrentFavorabilityFact",
     "FavorabilityProfile",

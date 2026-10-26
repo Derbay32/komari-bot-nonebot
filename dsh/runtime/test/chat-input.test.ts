@@ -33,6 +33,7 @@ test('chat input decoder renders sections as one unambiguous user-message partit
 
   const text = renderChatTaskInput(decodeChatTaskData(data))
 
+  assert.ok(!text.includes('<capabilities>'))
   for (const section of [
     '<current_message>',
     '<recent_messages>',
@@ -77,6 +78,18 @@ test('closed decoder rejects extra, missing, wrong-source, and oversized fields'
   const fifty = minimalChatTaskData({ recent: Array.from({ length: 50 }, (_, index) => `m${index}`) })
   assert.equal(decodeChatTaskData(fifty).recent.length, 50)
 
+  const missingCapabilities = minimalChatTaskData()
+  delete (missingCapabilities as Record<string, unknown>).capabilities
+  assert.throws(() => decodeChatTaskData(missingCapabilities), /invalid_chat_task_data/)
+
+  const extraCapability = minimalChatTaskData()
+  ;(extraCapability.capabilities as Record<string, unknown>).bank = true
+  assert.throws(() => decodeChatTaskData(extraCapability), /invalid_chat_task_data/)
+
+  const nonBooleanCapability = minimalChatTaskData()
+  ;(nonBooleanCapability.capabilities as Record<string, unknown>).search = 'yes'
+  assert.throws(() => decodeChatTaskData(nonBooleanCapability), /invalid_chat_task_data/)
+
   const imageUrl = minimalChatTaskData()
   ;(imageUrl.quote as unknown) = {
     source_type: 'quoted_message',
@@ -92,4 +105,14 @@ test('closed decoder rejects extra, missing, wrong-source, and oversized fields'
     image_sources: ['https://example.invalid/a.png'],
   }
   assert.throws(() => decodeChatTaskData(imageUrl), /invalid_chat_task_data/)
+})
+
+test('capabilities are decoded as a closed control section but never rendered', () => {
+  const data = minimalChatTaskData({
+    capabilities: { knowledge: false, search: true, fetch: false },
+  })
+  const decoded = decodeChatTaskData(data)
+  assert.deepEqual(decoded.capabilities, { knowledge: false, search: true, fetch: false })
+  const text = renderChatTaskInput(decoded)
+  assert.ok(!text.includes('capabilities'))
 })

@@ -256,7 +256,11 @@ export function fixturePatches(): readonly PatchOptions[] {
   return fixturePresetPatches()
 }
 
-export function minimalChatTaskData(overrides: { readonly text?: string; readonly recent?: readonly string[] } = {}): { [key: string]: JsonValue } {
+export function minimalChatTaskData(overrides: {
+  readonly text?: string
+  readonly recent?: readonly string[]
+  readonly capabilities?: { readonly knowledge: boolean; readonly search: boolean; readonly fetch: boolean }
+} = {}): { [key: string]: JsonValue } {
   const text = overrides.text ?? 'fixture message'
   return {
     schema: 1,
@@ -288,6 +292,7 @@ export function minimalChatTaskData(overrides: { readonly text?: string; readonl
     memory: [],
     knowledge: [],
     uid_knowledge: [],
+    capabilities: overrides.capabilities ?? { knowledge: true, search: true, fetch: true },
     facts: {
       bot_nickname: 'Fixture',
       current_favorability: {

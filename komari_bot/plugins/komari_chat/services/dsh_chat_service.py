@@ -28,12 +28,13 @@ from .chat_candidate import (
     ChatResultMismatchError,
     ChatSubmissionReceipt,
 )
+from .chat_query_tools import ChatQueryTools
 from .chat_recall_query import RecallQueryBudgetError, build_automatic_recall_query
 from .chat_result import ReplyResult
-from .chat_task_data import build_chat_task_data
+from .chat_task_data import ChatQueryCapabilities, build_chat_task_data
 
 if TYPE_CHECKING:
-    from komari_bot.agent import AgentCallbackRequest, JsonValue
+    from komari_bot.agent import AgentCallbackHandler, AgentCallbackRequest, JsonValue
     from komari_bot.context.redis_store import MessageSchema
     from komari_bot.plugins.komari_memory import HindsightRecallSession
 
@@ -61,6 +62,9 @@ UidSearch = Callable[[str], Awaitable[Sequence[object]]]
 FavorabilityGetter = Callable[[str], Awaitable[object]]
 GroupBindingsGetter = Callable[[str], Mapping[str, str]]
 HostGetter = Callable[[], AgentHost]
+AvailabilityGetter = Callable[[], bool]
+SearchWebCall = Callable[..., Awaitable[str]]
+FetchPageCall = Callable[..., Awaitable[str]]
 
 MAX_DSH_BUDGET_VALUE = 1_000
 
@@ -148,6 +152,7 @@ class FrozenChatTaskConfig:
     knowledge_enabled: bool
     knowledge_limit: int
     max_favorability_delta: int
+    capabilities: ChatQueryCapabilities
 
 
 class DshChatService:
@@ -161,12 +166,24 @@ class DshChatService:
         uid_search: UidSearch | None = None,
         favorability_getter: FavorabilityGetter | None = None,
         group_bindings_getter: GroupBindingsGetter | None = None,
+        search_available_getter: AvailabilityGetter | None = None,
+        fetch_available_getter: AvailabilityGetter | None = None,
+        search_web: SearchWebCall | None = None,
+        fetch_page: FetchPageCall | None = None,
     ) -> None:
         self._host_getter = host_getter or _default_host_getter
         self._knowledge_search = knowledge_search or _default_knowledge_search
         self._uid_search = uid_search or _default_uid_search
         self._favorability_getter = favorability_getter or _default_favorability
         self._group_bindings_getter = group_bindings_getter or _default_group_bindings
+        self._search_available_getter = (
+            search_available_getter or _default_search_available
+        )
+        self._fetch_available_getter = (
+            fetch_available_getter or _default_fetch_available
+        )
+        self._search_web = search_web or _default_search_web
+        self._fetch_page = fetch_page or _default_fetch_page
 
     async def generate(
         self,
@@ -187,7 +204,11 @@ class DshChatService:
         if not effect_business_admitted(group_id=message.group_id):
             return ReplyResult(content="")
 
-        frozen = _freeze_chat_task_config(config)
+        frozen = _freeze_chat_task_config(
+            config,
+            search_available=self._search_available_getter,
+            fetch_available=self._fetch_available_getter,
+        )
         recall_query = build_automatic_recall_query(
             current=message,
             recent=recent_messages,
@@ -226,9 +247,46 @@ class DshChatService:
             bot_nickname=frozen.bot_nickname,
             max_favorability_delta=frozen.max_favorability_delta,
             group_bindings=group_bindings,
+            capabilities=frozen.capabilities,
         )
 
         candidate = ChatCandidate(max_favorability_delta=frozen.max_favorability_delta)
+
+        trusted_trace_id = request_trace_id
+
+        async def query_search_web(
+            query: str,
+            *,
+            request_trace_id: str | None = None,
+        ) -> str:
+            del request_trace_id
+            return await self._search_web(
+                query,
+                request_trace_id=trusted_trace_id,
+            )
+
+        async def query_fetch_page(
+            urls: list[str],
+            *,
+            request_trace_id: str | None = None,
+        ) -> str:
+            del request_trace_id
+            return await self._fetch_page(
+                urls,
+                request_trace_id=trusted_trace_id,
+            )
+
+        query_tools = ChatQueryTools(
+            group_id=message.group_id,
+            request_trace_id=request_trace_id,
+            knowledge_limit=frozen.knowledge_limit,
+            capabilities=frozen.capabilities,
+            recall_session=recall_session,
+            admission=lambda: effect_business_admitted(group_id=message.group_id),
+            knowledge_search=self._knowledge_search,
+            search_web=query_search_web,
+            fetch_page=query_fetch_page,
+        )
 
         async def admission(_request: AgentCallbackRequest) -> JsonValue:
             try:
@@ -258,14 +316,13 @@ class DshChatService:
             task_data=cast("dict[str, JsonValue]", task_data.to_dict()),
             budget=frozen.budget.to_agent_budget(),
         )
-        result = await host.execute(
-            task,
-            {
-                "admission": admission,
-                "chat.submit_final_response": submit_final_response,
-                "chat.submit_favorability": submit_favorability,
-            },
-        )
+        callbacks: dict[str, AgentCallbackHandler] = {
+            "admission": admission,
+            "chat.submit_final_response": submit_final_response,
+            "chat.submit_favorability": submit_favorability,
+        }
+        callbacks.update(query_tools.callbacks())
+        result = await host.execute(task, callbacks)
         content, delta, reason = candidate.verify_host_result(result.result)
         logger.info(
             "[KomariChat] DSH chat generated: trace_id={} recent={} memory={} knowledge={} uid_knowledge={} content_chars={}",
@@ -347,7 +404,12 @@ class DshChatService:
             return {}
 
 
-def _freeze_chat_task_config(config: object) -> FrozenChatTaskConfig:
+def _freeze_chat_task_config(
+    config: object,
+    *,
+    search_available: AvailabilityGetter,
+    fetch_available: AvailabilityGetter,
+) -> FrozenChatTaskConfig:
     chat_config = cast("ChatConfigLike", config)
     try:
         budget = ChatTaskBudget.from_config(config)
@@ -376,7 +438,19 @@ def _freeze_chat_task_config(config: object) -> FrozenChatTaskConfig:
         knowledge_enabled=knowledge_enabled,
         knowledge_limit=knowledge_limit,
         max_favorability_delta=raw_cap,
+        capabilities=ChatQueryCapabilities(
+            knowledge=knowledge_enabled,
+            search=_safe_availability(search_available),
+            fetch=_safe_availability(fetch_available),
+        ),
     )
+
+
+def _safe_availability(getter: AvailabilityGetter) -> bool:
+    try:
+        return bool(getter())
+    except Exception:
+        return False
 
 
 def _receipt_payload(receipt: ChatSubmissionReceipt) -> JsonValue:
@@ -466,6 +540,36 @@ def _user_data_config() -> object:
     from komari_bot.plugins import user_data
 
     return user_data.get_config()
+
+
+def _default_search_available() -> bool:
+    from komari_bot.plugins import komari_search
+
+    return komari_search.is_search_available()
+
+
+def _default_fetch_available() -> bool:
+    from komari_bot.plugins import komari_search
+
+    return komari_search.is_fetch_available()
+
+
+async def _default_search_web(query: str, *, request_trace_id: str) -> str:
+    from komari_bot.plugins import komari_search
+
+    return await komari_search.search_web(
+        query,
+        request_trace_id=request_trace_id,
+    )
+
+
+async def _default_fetch_page(urls: list[str], *, request_trace_id: str) -> str:
+    from komari_bot.plugins import komari_search
+
+    return await komari_search.fetch_page(
+        urls,
+        request_trace_id=request_trace_id,
+    )
 
 
 __all__ = [

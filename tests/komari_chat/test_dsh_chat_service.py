@@ -120,6 +120,10 @@ def _service(
     knowledge_search: Any = None,
     uid_search: Any = None,
     group_bindings: dict[str, str] | None = None,
+    search_available: bool = False,
+    fetch_available: bool = True,
+    search_web: Any = None,
+    fetch_page: Any = None,
 ) -> tuple[DshChatService, FakeHindsightMemory, FakeRecallSession]:
     memory = FakeHindsightMemory(
         response=recall_response_value or recall_response(),
@@ -138,6 +142,10 @@ def _service(
         uid_search=uid_search or _default_uid,
         favorability_getter=lambda _uid: _as_awaitable(_favorability()),
         group_bindings_getter=lambda _group: group_bindings or {},
+        search_available_getter=lambda: search_available,
+        fetch_available_getter=lambda: fetch_available,
+        search_web=search_web,
+        fetch_page=fetch_page,
     )
     return service, memory, session
 
@@ -217,13 +225,23 @@ def test_generates_only_through_host_after_exactly_one_recall_and_verifies_resul
         "knowledge",
         "uid_knowledge",
         "facts",
+        "capabilities",
     }
     assert request.task_data["current"]["content"] == "当前消息"
+    assert request.task_data["capabilities"] == {
+        "knowledge": True,
+        "search": False,
+        "fetch": True,
+    }
     assert "image_sources" not in str(request.task_data)
     assert set(host.callbacks[0]) == {
         "admission",
         "chat.submit_final_response",
         "chat.submit_favorability",
+        "chat.recall_memory",
+        "chat.search_knowledge",
+        "chat.search_web",
+        "chat.fetch_page",
     }
 
 

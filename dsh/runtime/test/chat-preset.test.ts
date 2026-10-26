@@ -86,8 +86,12 @@ test('chat preset exposes only final_response and record_favorability_delta and 
   const first = result.requests[0]
   assert.ok(first !== undefined)
   assert.deepEqual(first.body.tools?.map((tool) => tool.function?.name).sort(), [
+    'fetch_page',
     'final_response',
+    'recall_memory',
     'record_favorability_delta',
+    'search_knowledge',
+    'search_web',
   ])
   const users = (first.body.messages ?? []).filter((message) => message.role === 'user')
   assert.equal(users.length, 1)
@@ -97,6 +101,102 @@ test('chat preset exposes only final_response and record_favorability_delta and 
   assert.ok(system.includes('<komari_chat_security_boundary>'))
   assert.ok(system.includes('Frozen chat role.'))
   assert.ok(String(users[0]?.content).includes('history row'))
+})
+
+test('frozen capability booleans determine the model-visible query whitelist', async () => {
+  const result = await runChat([
+    { kind: 'tool', name: 'final_response', args: { content: 'reply' } },
+    { kind: 'tool', name: 'record_favorability_delta', args: { delta: 0, reason: 'ok' } },
+  ], {
+    data: minimalChatTaskData({
+      text: 'capability subset',
+      capabilities: { knowledge: false, search: true, fetch: false },
+    }),
+  })
+
+  const first = result.requests[0]
+  assert.ok(first !== undefined)
+  assert.deepEqual(first.body.tools?.map((tool) => tool.function?.name).sort(), [
+    'final_response',
+    'recall_memory',
+    'record_favorability_delta',
+    'search_web',
+  ])
+})
+
+test('query tool schemas are closed and the recall tool never exposes target fields', async () => {
+  const result = await runChat([
+    { kind: 'tool', name: 'final_response', args: { content: 'reply' } },
+    { kind: 'tool', name: 'record_favorability_delta', args: { delta: 0, reason: 'ok' } },
+  ], {
+    data: minimalChatTaskData({
+      text: 'closed schemas',
+      capabilities: { knowledge: true, search: true, fetch: true },
+    }),
+  })
+
+  const tools = result.requests[0]?.body.tools ?? []
+  for (const name of ['recall_memory', 'search_knowledge', 'search_web', 'fetch_page']) {
+    const tool = tools.find((candidate) => candidate.function?.name === name)
+    assert.ok(tool, `${name} missing`)
+    const parameters = (tool as { function?: { parameters?: Record<string, unknown> } }).function?.parameters
+    assert.equal(parameters?.additionalProperties, false)
+    if (name === 'fetch_page') {
+      assert.deepEqual(Object.keys((parameters?.properties as Record<string, unknown>) ?? {}), ['urls'])
+    } else {
+      assert.deepEqual(Object.keys((parameters?.properties as Record<string, unknown>) ?? {}), ['query'])
+    }
+  }
+})
+
+
+test('a correctable query argument error preserves a staged final response', async () => {
+  const result = await runChat([
+    { kind: 'tool', name: 'final_response', args: { content: 'kept across query repair' } },
+    {
+      kind: 'tool',
+      name: 'recall_memory',
+      args: { query: 'must not reach backend', bank_id: 'forged' },
+    },
+    { kind: 'tool', name: 'record_favorability_delta', args: { delta: 0, reason: 'repaired' } },
+  ], {
+    budget: { max_rounds: 4, max_tool_calls_per_round: 3, max_total_tool_calls: 6 },
+  })
+
+  assert.equal(result.result.content, 'kept across query repair')
+  assert.equal(result.requests.length, 3)
+  assert.ok(!result.callbackNames.includes('chat.recall_memory'))
+})
+
+test('an invalid query proposal consumes the total budget before completion', async () => {
+  await assert.rejects(runChat([
+    {
+      kind: 'tool',
+      name: 'recall_memory',
+      args: { query: 'invalid but counted', bank_id: 'forged' },
+    },
+    { kind: 'tool', name: 'final_response', args: { content: 'completion must fail' } },
+    { kind: 'tool', name: 'record_favorability_delta', args: { delta: 0, reason: 'overflow' } },
+  ], {
+    budget: { max_rounds: 4, max_tool_calls_per_round: 3, max_total_tool_calls: 2 },
+  }), /budget_exhausted/)
+})
+
+test('a query tool in the same batch after completion has no effect', async () => {
+  const result = await runChat([{
+    kind: 'tools',
+    calls: [
+      { name: 'record_favorability_delta', args: { delta: 1, reason: 'complete' }, id: 'call-favor' },
+      { name: 'final_response', args: { content: 'complete reply' }, id: 'call-final' },
+      { name: 'recall_memory', args: { query: 'must not run' }, id: 'call-query' },
+    ],
+  }], {
+    budget: { max_rounds: 3, max_tool_calls_per_round: 4, max_total_tool_calls: 6 },
+  })
+
+  assert.equal(result.result.content, 'complete reply')
+  assert.equal(result.requests.length, 1)
+  assert.ok(!result.callbackNames.includes('chat.recall_memory'))
 })
 
 test('final submission first and favorability second complete through the same session', async () => {
