@@ -17,6 +17,7 @@
     "./package.json": "./package.json",
     "./race-fixture": "./dist/race-fixture.js",
     "./protocol": "./dist/protocol.js",
+    "./summary": "./dist/summary.js",
     "./test-main": "./dist/test-main.js"
   },
   "scripts": {

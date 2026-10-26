@@ -16,6 +16,7 @@ import { createUserMessage, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh
 import { SessionId } from '@deepseek-ai/dsh-session'
 import { PERSONA_PREFIX_SECTION } from '@deepseek-ai/dsh-system-prompt'
 import { decodeChatTaskData, renderChatTaskInput } from './chat-input.js'
+import { decodeSummaryTaskData, renderSummaryTaskInput } from './summary.js'
 import { TaskMutationGate, TaskMutationConflict } from './gate.js'
 import {
   assertCallbackName,
@@ -413,10 +414,11 @@ export default class KomariAgentRuntime extends Service {
         throw new TaskFailure('invalid_task_data')
       }
     }
-    return JSON.stringify({
-      task_kind: request.kind,
-      task_data: request.task_data,
-    })
+    try {
+      return renderSummaryTaskInput(decodeSummaryTaskData(request.task_data))
+    } catch {
+      throw new TaskFailure('invalid_task_data')
+    }
   }
 
   private taskIsTerminal(task: LiveTask): boolean {

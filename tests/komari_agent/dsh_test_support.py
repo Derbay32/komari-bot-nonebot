@@ -7,6 +7,7 @@ import json
 import os
 import socketserver
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -179,8 +180,13 @@ class _Handler(BaseHTTPRequestHandler):
         server = self.server
         assert isinstance(server, _ModelHTTPServer)
         owner = server.owner
-        response = owner._next_response()
-        owner._record(ModelRequest(path=self.path, headers=dict(self.headers.items()), body=body))
+        request = ModelRequest(
+            path=self.path,
+            headers=dict(self.headers.items()),
+            body=body,
+        )
+        owner._record(request)
+        response = owner._next_response(request)
         if isinstance(response, HttpErrorResponse):
             payload = {
                 "error": {
@@ -277,16 +283,20 @@ def _response_chunks(response: ToolCallResponse | TextResponse | EmptyResponse) 
     return [final]
 
 
+type ModelResponder = Callable[[ModelRequest], ScriptedResponse]
+
+
 class ScriptedModelServer:
     """Threaded local OpenAI-compatible endpoint with a scripted response queue."""
 
-    def __init__(self) -> None:
+    def __init__(self, responder: ModelResponder | None = None) -> None:
         self._server = _ModelHTTPServer(("127.0.0.1", 0), self)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._lock = threading.Lock()
         self._condition = threading.Condition(self._lock)
         self._responses: list[ScriptedResponse] = []
         self._requests: list[ModelRequest] = []
+        self._responder = responder
 
     def start(self) -> None:
         self._thread.start()
@@ -311,8 +321,10 @@ class ScriptedModelServer:
         if not reached:
             pytest.fail(f"timed out waiting for {count} model requests")
 
-    def _next_response(self) -> ScriptedResponse:
+    def _next_response(self, request: ModelRequest) -> ScriptedResponse:
         with self._lock:
+            if self._responder is not None:
+                return self._responder(request)
             if not self._responses:
                 return HttpErrorResponse(500, "no scripted response", "server_error", "server_error")
             return self._responses.pop(0)
@@ -450,16 +462,18 @@ async def running_dsh(
     tmp_path: Path,
     *,
     responses: tuple[ScriptedResponse, ...],
+    responder: ModelResponder | None = None,
     configured: bool = True,
     entry_script: Path = TEST_HOST_SCRIPT,
     retry_max_retries: int = 2,
     compaction: bool = False,
     prompt: str = "You are a fixture.",
+    summary_prompt: str = "You summarize fixtures.",
     context_window: int = 8192,
     max_tokens: int = 128,
 ) -> AsyncIterator[tuple[AgentHost, ScriptedModelServer]]:
     """Start the controlled endpoint and a real DSH host, then close both."""
-    server = ScriptedModelServer()
+    server = ScriptedModelServer(responder=responder)
     server.start()
     server.enqueue(*responses)
     data_dir = tmp_path / "data"
@@ -470,6 +484,7 @@ async def running_dsh(
         retry_max_retries=retry_max_retries,
         compaction=compaction,
         prompt=prompt,
+        summary_prompt=summary_prompt,
         context_window=context_window,
         max_tokens=max_tokens,
     )
@@ -508,6 +523,7 @@ __all__: list[str] = [
     "HangResponse",
     "HttpErrorResponse",
     "ModelRequest",
+    "ModelResponder",
     "ScriptedModelServer",
     "TextResponse",
     "ToolCallResponse",

@@ -47,6 +47,7 @@ from komari_bot.plugins import config_manager as config_manager_plugin
 require("group_admission")
 
 require("character_binding")
+require("komari_agent")
 require("komari_decision")
 
 require("komari_context")

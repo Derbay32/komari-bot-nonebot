@@ -1,12 +1,9 @@
-"""TSK-229 群历史总结与调试总结逐效果准入红基线 (AC-1..AC-8).
+"""TSK-229/TSK-206 群历史总结逐效果准入红/绿基线。
 
-每个用例都通过真实业务 seam ``execute_group_summary`` (规划/总结阶段、群历
-史平台读取、图片处理) 或 ``komari_debug.reporting`` 的群公开结果 seam 驱动,
-把 ``group_admission`` 顶层 ``adjudicate`` 换成三态脚本, 断言受限后下游 Fake
-不再执行. 生产尚未接入逐效果准入, 因此相关用例以红态失败.
-
-阶段准入顺序约定: 群历史平台读取 -> planning LLM -> summary LLM -> 图片渲染
--> 群输出; 规划轮数固定为 1, 使每阶段对应一个准入序列下标.
+每个用例通过真实业务 seam 驱动：``history_tools.fetch_history_window`` 的
+平台读取、``DshSummaryService`` 的模型请求准入回调、``execute_group_summary``
+的图片渲染，以及 handler 的逐条群输出。受限时下游 Fake 不得执行，且准入
+拒绝保持正常静默控制流。
 """
 
 from __future__ import annotations
@@ -16,13 +13,23 @@ from typing import Any, cast
 
 import pytest
 
+from komari_bot.agent import AgentTaskError
+from komari_bot.plugins.group_history_summary.admission_gate import (
+    SummaryAdmissionDeniedError,
+)
 from komari_bot.plugins.group_history_summary.config_schema import (
     DynamicConfigSchema,
     LayoutParamsSchema,
 )
+from komari_bot.plugins.group_history_summary.dsh_summary_service import (
+    DshSummaryService,
+)
 from komari_bot.plugins.group_history_summary.execution_service import (
     execute_group_summary,
 )
+from komari_bot.plugins.group_history_summary.history_service import HistoryMessage
+from komari_bot.plugins.group_history_summary.history_tools import fetch_history_window
+from komari_bot.plugins.group_history_summary.summary_candidate import SummarySelection
 from tests.group_admission.chat_admission_support import (
     ScriptedAdjudicate,
     install_scripted_adjudicate,
@@ -30,31 +37,11 @@ from tests.group_admission.chat_admission_support import (
 
 pytestmark = pytest.mark.group_admission_acceptance
 
-PLANNING_MODEL = "deepseek-chat"
-SUMMARY_MODEL = "deepseek-chat"
 GROUP_ID = "100"
 
 
-@pytest.fixture(autouse=True)
-def _inject_marker_prompt_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
-    """注入 group_history_summary 完整 marker Prompt 快照 (避免 DB 依赖)."""
-    import komari_bot.plugins.group_history_summary.planner_service as planner_module
-    import komari_bot.plugins.group_history_summary.prompt_template as seam_module
-    import komari_bot.plugins.group_history_summary.summarize_service as summarize_module
-    from tests.config.prompt_field_contract import prompt_marker_values
-
-    template = prompt_marker_values("group_history_summary")
-
-    async def _marker_template() -> dict[str, str]:
-        return dict(template)
-
-    monkeypatch.setattr(seam_module, "get_template", _marker_template)
-    monkeypatch.setattr(planner_module, "get_template", _marker_template)
-    monkeypatch.setattr(summarize_module, "get_template", _marker_template)
-
-
 class _FakeLease:
-    """假群租约: ``run`` 直接执行操作, ``close`` 记录释放."""
+    """假群租约：``run`` 直接执行操作, ``close`` 记录释放。"""
 
     def __init__(self, manager: _FakeSummaryLockManager, group_id: str) -> None:
         self._manager = manager
@@ -69,7 +56,7 @@ class _FakeLease:
 
 
 class _FakeSummaryLockManager:
-    """内存假群锁: 复用既有 running/释放语义, 断言不泄漏."""
+    """内存假群锁：复用既有 running/释放语义, 断言不泄漏。"""
 
     def __init__(self) -> None:
         self.running: set[str] = set()
@@ -102,7 +89,7 @@ def _use_in_memory_group_lock(
 
 
 class _FakeBot:
-    """OneBot Fake: 仅实现 ``get_group_msg_history`` 平台读取."""
+    """OneBot Fake：仅实现 ``get_group_msg_history`` 平台读取。"""
 
     self_id = "999"
 
@@ -131,7 +118,7 @@ class _FakeBot:
 
 
 class _RecordingBot:
-    """debug 报告投递用的记录型 OneBot Fake."""
+    """debug 报告投递用的记录型 OneBot Fake。"""
 
     self_id = "12345"
 
@@ -143,115 +130,62 @@ class _RecordingBot:
         return True
 
 
-def _fake_completion(
-    content: str = "",
-    tool_calls: list[object] | None = None,
-    finish_reason: str = "stop",
-) -> object:
-    return SimpleNamespace(
-        content=content,
-        tool_calls=tool_calls or [],
-        finish_reason=finish_reason,
-        usage=None,
-        duration_ms=10.0,
-        reasoning_content=None,
-    )
+class _FakeDshSummaryService:
+    """可信 DSH 总结服务 Fake：直接返回给定选择，记录是否被调用。"""
 
-
-def _fetch_tool_call() -> object:
-    class _Func:
-        name = "fetch_recent_group_messages"
-        arguments = '{"count": 10, "include_bot_replies": false}'
-
-    return SimpleNamespace(
-        id="call-fetch",
-        type="function",
-        function=_Func(),
-        raw_arguments='{"count": 10}',
-        parsed_arguments={"count": 10, "include_bot_replies": False},
-    )
-
-
-class _ScriptedLlmProvider:
-    """脚本化 LLM provider: 按 phase 区分 planning / summary 调用."""
-
-    def __init__(self) -> None:
+    def __init__(self, selection: SummarySelection | None) -> None:
+        self.selection = selection
         self.calls: list[dict[str, Any]] = []
-        self.planning_queue: list[Any] = []
-        self.summary_queue: list[Any] = []
 
-    def plan_final(self) -> None:
-        self.planning_queue.append(_fake_completion(content="sao", finish_reason="stop"))
-
-    def summary_result(self, text: str = "今天的总结文字") -> None:
-        self.summary_queue.append(
-            _fake_completion(content=f"<content>{text}</content>", finish_reason="stop")
-        )
-
-    async def generate_messages_completion(self, **kwargs: Any) -> object:
-        self.calls.append(kwargs)
-        phase = str(kwargs.get("request_phase", ""))
-        if phase.startswith("group_history_summary_plan_round_"):
-            if not self.planning_queue:
-                raise AssertionError("planning LLM 被调用: 受限时应不进入规划")  # noqa: TRY003
-            return self.planning_queue.pop(0)
-        raise AssertionError(f"unexpected provider phase: {phase}")  # noqa: TRY003
-
-    async def generate_text_with_messages(self, **kwargs: Any) -> str:
-        self.calls.append(kwargs)
-        phase = str(kwargs.get("request_phase", ""))
-        if phase != "group_history_summary":
-            raise AssertionError(f"unexpected provider phase: {phase}")  # noqa: TRY003
-        if not self.summary_queue:
-            raise AssertionError("summary LLM 被调用: 受限时应不进入总结")  # noqa: TRY003
-        completion = self.summary_queue.pop(0)
-        return str(completion.content)
-
-
-def _count_planning(provider: _ScriptedLlmProvider) -> list[dict[str, Any]]:
-    return [
-        k for k in provider.calls
-        if str(k.get("request_phase", "")).startswith("group_history_summary_plan_round_")
-    ]
-
-
-def _count_summary(provider: _ScriptedLlmProvider) -> list[dict[str, Any]]:
-    return [
-        k for k in provider.calls
-        if str(k.get("request_phase", "")) == "group_history_summary"
-    ]
-
-
-def _install_stage_fakes(
-    monkeypatch: pytest.MonkeyPatch,
-    provider: _ScriptedLlmProvider,
-    render_calls: list[int],
-) -> None:
-    """脚本 provider + 图片渲染 Fake 挂到真实 seam 上 (AC-7)."""
-    import komari_bot.plugins.group_history_summary.execution_service as exec_mod
-    from komari_bot.plugins import llm_provider
-
-    provider_obj = cast("Any", provider)
-    monkeypatch.setattr(
-        llm_provider, "generate_messages_completion", provider_obj.generate_messages_completion
-    )
-    monkeypatch.setattr(
-        llm_provider,
-        "generate_text_with_messages",
-        provider_obj.generate_text_with_messages,
-    )
-
-    def _fake_render(**kwargs: Any) -> SimpleNamespace:
-        del kwargs
-        render_calls.append(1)
+    async def generate(self, **kwargs: Any) -> Any:
+        self.calls.append(dict(kwargs))
         return SimpleNamespace(
-            images_base64=("page-a",),
-            truncated=False,
-            total_line_count=1,
-            rendered_line_count=1,
+            summary_text="今天的总结文字",
+            selection=self.selection,
         )
 
-    monkeypatch.setattr(exec_mod, "render_summary_image_pages_base64", _fake_render)
+
+class _AdmissionDenyingHost:
+    """Fake host：仅驱动模型请求准入回调并模拟准入终止。"""
+
+    def __init__(self, calls: list[dict[str, Any]]) -> None:
+        self.calls = calls
+
+    async def execute(self, request: Any, callbacks: dict[str, Any]) -> Any:
+        self.calls.append({"request": request, "callbacks": callbacks})
+        decision = await callbacks["admission"](
+            SimpleNamespace(
+                name="admission",
+                data={"purpose": "conversation", "attempt": 1},
+            )
+        )
+        assert decision == {"allow": False}
+        raise AgentTaskError("agent_error")
+
+
+def _selection(
+    messages: list[HistoryMessage] | None = None,
+) -> SummarySelection:
+    return SummarySelection(
+        generation=1,
+        source="recent_group_messages",
+        matched_count=len(messages or []),
+        messages=tuple(messages or []),
+        filters={"count": 10},
+        history_fetch=None,
+    )
+
+
+def _message(seq: int = 1) -> HistoryMessage:
+    return HistoryMessage(
+        user_id="1001",
+        nickname="moe",
+        content="hello",
+        timestamp=seq,
+        message_seq=seq,
+        message_id=f"m{seq}",
+        reply_to_message_id=None,
+    )
 
 
 def _build_config(**overrides: Any) -> DynamicConfigSchema:
@@ -262,19 +196,8 @@ def _build_config(**overrides: Any) -> DynamicConfigSchema:
         "max_summary_count": 200,
         "fetch_batch_size": 50,
         "summary_default_count": 50,
-        "summary_planning_model": PLANNING_MODEL,
-        "summary_planning_max_tokens": 800,
         "summary_planning_round_limit": 1,
-        "summary_planning_thinking_mode": False,
-        "summary_planning_reasoning_effort": "",
         "summary_tool_scan_limit": 300,
-        "summary_model": SUMMARY_MODEL,
-        "summary_temperature": 0.4,
-        "summary_max_tokens": 1200,
-        "summary_thinking_mode": False,
-        "summary_reasoning_effort": "",
-        "assistant_prefill_enabled": False,
-        "dsv4_roleplay_instruct_mode": "auto",
         "history_min_coverage_ratio": 0.8,
         "layout_params": LayoutParamsSchema(),
     }
@@ -282,30 +205,10 @@ def _build_config(**overrides: Any) -> DynamicConfigSchema:
     return DynamicConfigSchema(**defaults)  # type: ignore[call-arg]
 
 
-def _setup_harness(
-    monkeypatch: pytest.MonkeyPatch,
-    scripted: ScriptedAdjudicate,
-) -> SimpleNamespace:
-    install_scripted_adjudicate(monkeypatch, scripted)
-    bot = _FakeBot()
-    provider = _ScriptedLlmProvider()
-    # planning 轮 0 返回带 fetch 工具调用的 completion，触发真实群历史平台读取。
-    provider.planning_queue.append(
-        _fake_completion(tool_calls=[_fetch_tool_call()], finish_reason="tool_calls")
-    )
-    provider.plan_final()
-    provider.summary_result()
-    render_calls: list[int] = []
-    _install_stage_fakes(monkeypatch, provider, render_calls)
-    return SimpleNamespace(
-        bot=bot,
-        provider=provider,
-        render=render_calls,
-        config=_build_config(),
-    )
-
-
-async def _execute(bot: _FakeBot, config: DynamicConfigSchema) -> tuple[Any, Any]:
+async def _execute(
+    bot: _FakeBot,
+    config: DynamicConfigSchema,
+) -> tuple[Any, Any]:
     try:
         result = await execute_group_summary(
             bot=cast("Any", bot),
@@ -323,7 +226,7 @@ async def _execute(bot: _FakeBot, config: DynamicConfigSchema) -> tuple[Any, Any
 
 
 # ---------------------------------------------------------------------------
-# AC-1/AC-4: 获准全链路 + 群锁/连接清理
+# AC-1/AC-4: 获准全链路 + 群锁释放
 # ---------------------------------------------------------------------------
 
 
@@ -331,105 +234,160 @@ async def test_summary_admitted_pipeline_and_cleanup(
     monkeypatch: pytest.MonkeyPatch,
     _use_in_memory_group_lock: Any,
 ) -> None:
-    """获准后各阶段 Fake 均执行一次, 租约释放 (绿意图锁定)."""
+    """获准后渲染执行一次, 租约释放 (绿意图锁定)。"""
+    import komari_bot.plugins.group_history_summary.execution_service as exec_module
+
     scripted = ScriptedAdjudicate("admitted")
-    ns = _setup_harness(monkeypatch, scripted)
-    lock = cast("Any", _use_in_memory_group_lock)
+    install_scripted_adjudicate(monkeypatch, scripted)
+    service = _FakeDshSummaryService(_selection([_message()]))
+    monkeypatch.setattr(exec_module, "_dsh_summary_service", service)
+    render_calls: list[int] = []
 
-    result, exc = await _execute(ns.bot, ns.config)
+    def _fake_render(**_kwargs: Any) -> SimpleNamespace:
+        render_calls.append(1)
+        return SimpleNamespace(images_base64=("page-a",), truncated=False)
+
+    monkeypatch.setattr(exec_module, "render_summary_image_pages_base64", _fake_render)
+    lock = cast("_FakeSummaryLockManager", _use_in_memory_group_lock)
+
+    result, exc = await _execute(_FakeBot(), _build_config())
+
     assert exc is None
-    assert result is not None and result.image_base64 == "page-a", "获准后应产出图片"
-    assert ns.bot.history_reads, "获准后群历史平台读取应发生"
-    assert len(_count_planning(ns.provider)) >= 1
-    assert len(_count_summary(ns.provider)) >= 1
-    assert len(ns.render) == 1
+    assert result is not None and result.image_base64 == "page-a"
+    assert render_calls == [1]
     assert GROUP_ID in lock.released_groups
-    assert lock.running == set(), "群锁不得泄漏"
-    assert scripted.calls != [], "获准路径效果前未调用 adjudicate"
+    assert lock.running == set()
+    assert scripted.calls != []
+    assert service.calls != []
 
 
 # ---------------------------------------------------------------------------
-# AC-2/AC-5: 入口受限则全部阶段不执行, 且不落失败
+# AC-1 anchor: 平台历史读取受限
 # ---------------------------------------------------------------------------
-
-
-async def test_summary_restricted_blocks_all_stages(
-    monkeypatch: pytest.MonkeyPatch,
-    _use_in_memory_group_lock: Any,
-) -> None:
-    """永久受限 (入口): 全部下游 Fake 不得执行, 异常不记录为失败 (AC-2/AC-5)."""
-    scripted = ScriptedAdjudicate("restricted")
-    ns = _setup_harness(monkeypatch, scripted)
-
-    result, ns_exc = await _execute(ns.bot, ns.config)
-    assert ns.provider.calls == [], "planning/summary LLM 不得被调用"
-    assert ns.bot.history_reads == [], "群历史平台读取不得发生"
-    assert ns.render == [], "图片渲染不得发生"
-    assert ns_exc is None, "准入拒绝不得以异常收口"
-    assert result is not None and result.summary_text == ""
-
-
-
-# ---------------------------------------------------------------------------
-# AC-1 anchor: planning LLM 受限
-# ---------------------------------------------------------------------------
-
-
-async def test_planning_llm_restricted_blocks_provider(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """summary.planning_llm: 规划 LLM 前裁决, 受限时 provider 不调用."""
-    scripted = ScriptedAdjudicate("restricted")
-    ns = _setup_harness(monkeypatch, scripted)
-    await _execute(ns.bot, ns.config)
-    assert ns.provider.calls == [], "planning LLM 受限时不得调用 provider"
-    assert scripted.calls != [], "planning LLM 效果前未调用 adjudicate"
 
 
 async def test_history_read_restricted_blocks_platform_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """summary.history_read: 规划获选但平台读取受限时, get_group_msg_history 不发生."""
-    scripted = ScriptedAdjudicate("admitted")
-    scripted.set_sequence("admitted", "restricted", "restricted", "restricted")
-    ns = _setup_harness(monkeypatch, scripted)
-    await _execute(ns.bot, ns.config)
-    assert len(_count_planning(ns.provider)) >= 1, "规划已获选则应发生 planning"
-    assert ns.bot.history_reads == [], "history 平台读取受限时不得发生 get_group_msg_history"
-    assert scripted.calls != [], "history_read 效果前未调用裁决"
+    """summary.history_read: 平台读取前裁决, 受限时不得 get_group_msg_history。"""
+    scripted = ScriptedAdjudicate("restricted")
+    install_scripted_adjudicate(monkeypatch, scripted)
+    bot = _FakeBot()
+
+    with pytest.raises(SummaryAdmissionDeniedError):
+        await fetch_history_window(
+            bot=cast("Any", bot),
+            group_id=GROUP_ID,
+            count=10,
+            batch_size=50,
+        )
+
+    assert bot.history_reads == []
+    assert scripted.calls != []
 
 
 # ---------------------------------------------------------------------------
-# AC-1/AC-3: summary LLM 受限 & 图片渲染受限（已开始阶段可完成）
+# AC-1 anchor: DSH 模型请求受限 = 正常静默控制流
 # ---------------------------------------------------------------------------
 
 
-async def test_summary_llm_restricted_blocks_provider(
+async def test_model_request_admission_denied_is_normal_control_flow(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """summary.summary_llm: 规划+读取获选后, summary LLM 受限则不得调用."""
-    scripted = ScriptedAdjudicate("admitted")
-    scripted.set_sequence("admitted", "admitted", "restricted", "restricted")
-    ns = _setup_harness(monkeypatch, scripted)
-    await _execute(ns.bot, ns.config)
-    assert ns.bot.history_reads, "规划+读取获选则历史应被读取(已开始阶段可完成)"
-    assert _count_summary(ns.provider) == [], "summary LLM 受限时不得调用 provider"
-    assert ns.render == [], "summary 受限时更后的图片渲染不得发生"
-    assert scripted.calls != [], "summary LLM 效果前未调用裁决"
+    """summary.dsh_model_request: 模型请求准入受限时终止且不渲染/不通知。"""
+    import komari_bot.plugins.group_history_summary.execution_service as exec_module
+
+    scripted = ScriptedAdjudicate("restricted")
+    install_scripted_adjudicate(monkeypatch, scripted)
+    service_calls: list[dict[str, Any]] = []
+    real_service = DshSummaryService(
+        host_getter=lambda: cast("Any", _AdmissionDenyingHost(service_calls)),
+    )
+    monkeypatch.setattr(exec_module, "_dsh_summary_service", real_service)
+    render_calls: list[int] = []
+
+    def _fake_render(**_kwargs: Any) -> SimpleNamespace:
+        render_calls.append(1)
+        return SimpleNamespace(images_base64=("page-a",), truncated=False)
+
+    monkeypatch.setattr(exec_module, "render_summary_image_pages_base64", _fake_render)
+
+    result, exc = await _execute(_FakeBot(), _build_config())
+
+    assert exc is None
+    assert result is not None and result.summary_text == ""
+    assert result.image_base64 == ""
+    assert render_calls == []
+    assert service_calls != []
+    assert scripted.calls != []
+
+
+# ---------------------------------------------------------------------------
+# AC-1 anchor: 图片渲染受限
+# ---------------------------------------------------------------------------
 
 
 async def test_image_render_restricted_blocks_render(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """summary.image_render: 规划+读取+总结获选后, 图片渲染受限则不渲染."""
-    scripted = ScriptedAdjudicate("admitted")
-    scripted.set_sequence("admitted", "admitted", "admitted", "restricted")
-    ns = _setup_harness(monkeypatch, scripted)
-    await _execute(ns.bot, ns.config)
-    assert len(_count_planning(ns.provider)) >= 1
-    assert len(_count_summary(ns.provider)) >= 1, "总结获选则 summary LLM 已完成"
-    assert ns.render == [], "图片渲染受限时不得渲染"
-    assert scripted.calls != [], "image_render 效果前未调用裁决"
+    """summary.image_render: DSH 成功后图片渲染受限则不渲染。"""
+    import komari_bot.plugins.group_history_summary.execution_service as exec_module
+
+    scripted = ScriptedAdjudicate("restricted")
+    install_scripted_adjudicate(monkeypatch, scripted)
+    monkeypatch.setattr(
+        exec_module,
+        "_dsh_summary_service",
+        _FakeDshSummaryService(_selection([_message()])),
+    )
+    render_calls: list[int] = []
+
+    def _fake_render(**_kwargs: Any) -> SimpleNamespace:
+        render_calls.append(1)
+        return SimpleNamespace(images_base64=("page-a",), truncated=False)
+
+    monkeypatch.setattr(exec_module, "render_summary_image_pages_base64", _fake_render)
+
+    result, exc = await _execute(_FakeBot(), _build_config())
+
+    assert exc is None
+    assert result is not None and result.summary_text == ""
+    assert render_calls == []
+    assert scripted.calls != []
+
+
+# ---------------------------------------------------------------------------
+# AC-5: 准入拒绝不进入失败通知
+# ---------------------------------------------------------------------------
+
+
+async def test_summary_denial_does_not_trigger_failure_notification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC5: 准入拒绝不进入 GroupTaskFailureNotifier/总结失败通知与 retry。"""
+    import komari_bot.plugins.group_history_summary.execution_service as exec_module
+    from komari_bot.onebot.group_failure_notify import GroupTaskFailureNotifier
+
+    scripted = ScriptedAdjudicate("restricted")
+    install_scripted_adjudicate(monkeypatch, scripted)
+    monkeypatch.setattr(
+        exec_module,
+        "_dsh_summary_service",
+        _FakeDshSummaryService(_selection([_message()])),
+    )
+
+    async def _fail_notify(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise AssertionError(  # noqa: TRY003
+            "准入拒绝不得进入 GroupTaskFailureNotifier/总结失败通知"
+        )
+
+    monkeypatch.setattr(GroupTaskFailureNotifier, "notify", _fail_notify)
+    result, ns_exc = await _execute(_FakeBot(), _build_config())
+
+    assert ns_exc is None, "准入拒绝是正常控制流: 不得以异常/失败通知收口"
+    assert result is not None and not result.image_base64
+    assert scripted.calls != []
 
 
 # ---------------------------------------------------------------------------
@@ -490,19 +448,11 @@ def _build_output_result(
     from komari_bot.plugins.group_history_summary.execution_service import (
         SummaryExecutionResult,
     )
-    from komari_bot.plugins.group_history_summary.planner_service import (
-        SummaryPlanResult,
-    )
 
     return SummaryExecutionResult(
         summary_text="今天的总结文字",
         filtered_message_count=5,
-        plan_result=SummaryPlanResult(
-            messages=[],
-            tool_result=None,
-            planner_note="",
-            rounds_used=1,
-        ),
+        selection=_selection([_message()]),
         image_base64=image_base64,
         image_pages_base64=image_pages,
         image_truncated=False,
@@ -532,7 +482,9 @@ async def test_handler_group_output_restricted_blocks_per_send(
         image_pages=("page-a", "page-b"),
     )
 
-    await _send_group_summary_outputs(bot=cast("Any", bot), event=cast("Any", event), result=result)
+    await _send_group_summary_outputs(
+        bot=cast("Any", bot), event=cast("Any", event), result=result
+    )
 
     assert len(bot.sent) == 1, "per-send 门控应只放行获准的那一条分段"
     assert "page-a" in str(bot.sent[0]), "获准分段应被发送"
@@ -542,33 +494,3 @@ async def test_handler_group_output_restricted_blocks_per_send(
     assert len(scripted.calls) == 2, "per-send 门控应在每条分段前各裁决一次"
     _, intent_a = scripted.calls[0]
     assert getattr(intent_a, "value", "business") == "business"
-
-
-async def test_summary_denial_does_not_trigger_failure_notification(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """AC5: 准入拒绝不进入 GroupTaskFailureNotifier/总结失败通知与 retry。"""
-    from komari_bot.onebot.group_failure_notify import GroupTaskFailureNotifier
-
-    scripted = ScriptedAdjudicate("restricted")
-    ns = _setup_harness(monkeypatch, scripted)
-
-    async def _fail_notify(*args: Any, **kwargs: Any) -> None:
-        del args, kwargs
-        raise AssertionError(  # noqa: TRY003
-            "准入拒绝不得进入 GroupTaskFailureNotifier/总结失败通知"
-        )
-
-    monkeypatch.setattr(
-        GroupTaskFailureNotifier,
-        "notify",
-        _fail_notify,
-    )
-    # 若失败通知/异常进入 handler 的失败收口，会以 retry 重发；denial 是
-    # 正常控制流，不得抛出、不得通知、不得记录失败。
-    result, ns_exc = await _execute(ns.bot, ns.config)
-    assert ns_exc is None, "准入拒绝是正常控制流: 不得以异常/失败通知收口"
-    assert result is not None and not result.image_base64, "受限时不得产出图片"
-    assert ns_exc is None, "准入拒绝不得记录为失败"
-    assert ns.provider.calls == [], "受限时 provider 不得被调用"
-    _ = ns_exc

@@ -1,16 +1,25 @@
-"""execution_service 与诊断追踪测试。"""
+"""TSK-206 总结执行入口：能力、租约、DSH 结果与渲染投影。"""
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import threading
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 
+from komari_bot.plugins.group_history_summary.admission_gate import (
+    SummaryAdmissionDeniedError,
+)
 from komari_bot.plugins.group_history_summary.config_schema import (
     DynamicConfigSchema,
     LayoutParamsSchema,
+)
+from komari_bot.plugins.group_history_summary.dsh_summary_service import (
+    SummaryGeneration,
+    SummaryGenerationError,
 )
 from komari_bot.plugins.group_history_summary.execution_service import (
     CapabilityNotSupportedError,
@@ -18,13 +27,14 @@ from komari_bot.plugins.group_history_summary.execution_service import (
     SummaryServiceUnavailableError,
     execute_group_summary,
 )
+from komari_bot.plugins.group_history_summary.group_lock import (
+    GroupSummaryLockLostError,
+)
 from komari_bot.plugins.group_history_summary.history_service import (
     HistoryFetchMetadata,
     HistoryMessage,
 )
-
-PLANNING_MODEL = "deepseek-chat"
-SUMMARY_MODEL = "deepseek-chat"
+from komari_bot.plugins.group_history_summary.summary_candidate import SummarySelection
 
 
 class _FakeSummaryLease:
@@ -58,19 +68,58 @@ class _FakeSummaryLockManager:
         return _FakeSummaryLease(self, group_id)
 
 
+class _FakeDshSummaryService:
+    def __init__(
+        self,
+        *,
+        selection: SummarySelection | None = None,
+        summary_text: str = "今天讨论了测试。",
+        error: Exception | None = None,
+        wait: asyncio.Event | None = None,
+        started: asyncio.Event | None = None,
+    ) -> None:
+        self.selection = selection
+        self.summary_text = summary_text
+        self.error = error
+        self.wait = wait
+        self.started = started
+        self.calls: list[dict[str, Any]] = []
+        self.cancelled = False
+
+    async def generate(self, **kwargs: Any) -> SummaryGeneration:
+        self.calls.append(dict(kwargs))
+        try:
+            if self.started is not None:
+                self.started.set()
+            if self.wait is not None:
+                await self.wait.wait()
+            if self.error is not None:
+                raise self.error
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        return SummaryGeneration(
+            summary_text=self.summary_text,
+            selection=self.selection,
+        )
+
+
 @pytest.fixture(autouse=True)
-def _use_in_memory_group_lock(monkeypatch: pytest.MonkeyPatch) -> None:
+def _use_in_memory_group_lock(monkeypatch: pytest.MonkeyPatch) -> _FakeSummaryLockManager:
     import komari_bot.plugins.group_history_summary.execution_service as exec_module
 
-    monkeypatch.setattr(exec_module, "_group_lock_manager", _FakeSummaryLockManager())
+    lock = _FakeSummaryLockManager()
+    monkeypatch.setattr(exec_module, "_group_lock_manager", lock)
+    return lock
 
 
-async def _async_return_true(*_args: Any, **_kwargs: Any) -> bool:
-    return True
+@pytest.fixture(autouse=True)
+def _install_fake_dsh_service(monkeypatch: pytest.MonkeyPatch) -> _FakeDshSummaryService:
+    import komari_bot.plugins.group_history_summary.execution_service as exec_module
 
-
-async def _async_return_false(*_args: Any, **_kwargs: Any) -> bool:
-    return False
+    service = _FakeDshSummaryService()
+    monkeypatch.setattr(exec_module, "_dsh_summary_service", service)
+    return service
 
 
 def _build_config(**overrides: Any) -> DynamicConfigSchema:
@@ -81,32 +130,22 @@ def _build_config(**overrides: Any) -> DynamicConfigSchema:
         "max_summary_count": 200,
         "fetch_batch_size": 50,
         "summary_default_count": 50,
-        "summary_planning_model": PLANNING_MODEL,
-        "summary_planning_max_tokens": 800,
         "summary_planning_round_limit": 3,
-        "summary_planning_thinking_mode": False,
-        "summary_planning_reasoning_effort": "",
         "summary_tool_scan_limit": 300,
-        "summary_model": SUMMARY_MODEL,
-        "summary_temperature": 0.4,
-        "summary_max_tokens": 1200,
-        "summary_thinking_mode": False,
-        "summary_reasoning_effort": "",
-        "assistant_prefill_enabled": False,
-        "dsv4_roleplay_instruct_mode": "auto",
+        "history_min_coverage_ratio": 0.8,
         "layout_params": LayoutParamsSchema(),
     }
     defaults.update(overrides)
     return DynamicConfigSchema(**defaults)
 
 
-def _build_history_message(
+def _message(
     *,
-    user_id: str,
-    nickname: str,
-    content: str,
-    timestamp: int,
-    message_seq: int,
+    user_id: str = "1001",
+    nickname: str = "阿明",
+    content: str = "hello",
+    timestamp: int = 1,
+    message_seq: int = 1,
 ) -> HistoryMessage:
     return HistoryMessage(
         user_id=user_id,
@@ -119,322 +158,40 @@ def _build_history_message(
     )
 
 
-def _fake_completion(
-    content: str = "规划完成",
-    tool_calls: list[object] | None = None,
-    finish_reason: str = "stop",
-    usage: object | None = None,
-    duration_ms: float | None = None,
-) -> object:
-    return SimpleNamespace(
-        content=content,
-        tool_calls=tool_calls or [],
-        finish_reason=finish_reason,
-        usage=usage,
-        duration_ms=duration_ms,
-        reasoning_content=None,
-    )
-
-
-def _fake_tool_call(
+def _selection(
+    messages: list[HistoryMessage],
     *,
-    tool_id: str = "call_1",
-    func_name: str = "fetch_recent_group_messages",
-    raw_arguments: str = '{"count": 50}',
-    parsed_arguments: dict[str, object] | None = None,
-) -> object:
-    class _Func:
-        name = func_name
-        arguments = raw_arguments
-
-    return SimpleNamespace(
-        id=tool_id,
-        type="function",
-        function=_Func(),
-        raw_arguments=raw_arguments,
-        parsed_arguments=parsed_arguments or {"count": 50},
+    source: str = "recent_group_messages",
+    metadata: HistoryFetchMetadata | None = None,
+) -> SummarySelection:
+    return SummarySelection(
+        generation=1,
+        source=source,
+        matched_count=len(messages),
+        messages=tuple(messages),
+        filters={"count": 10},
+        history_fetch=metadata,
     )
 
 
-# ======================== 规划轮次追踪测试 ========================
+async def _async_return_true(*_args: Any, **_kwargs: Any) -> bool:
+    return True
+
+
+async def _async_return_false(*_args: Any, **_kwargs: Any) -> bool:
+    return False
 
 
 @pytest.mark.asyncio
-async def test_plan_rounds_use_request_trace_id_and_phase(monkeypatch: Any) -> None:
-    """验证规划每轮携带请求 trace ID 与稳定阶段名（普通运行日志）。"""
-    import komari_bot.plugins.group_history_summary.planner_service as planner_module
-
-    completions = [
-        _fake_completion(
-            tool_calls=[_fake_tool_call()],
-            finish_reason="tool_calls",
-            duration_ms=500.0,
-        ),
-        _fake_completion(
-            tool_calls=[_fake_tool_call(func_name="fetch_messages_by_user", parsed_arguments={"count": 10, "display_name": "阿明"})],
-            finish_reason="tool_calls",
-            duration_ms=300.0,
-        ),
-        _fake_completion(content="够了"),
-    ]
-
-    call_index = 0
-    llm_kwargs: list[dict[str, Any]] = []
-
-    async def _fake_gen(**kwargs: Any) -> object:
-        nonlocal call_index
-        llm_kwargs.append(kwargs)
-        result = completions[min(call_index, len(completions) - 1)]
-        call_index += 1
-        return result
-
-    async def _fake_fetch(_count: int = 50, **_kwargs: Any) -> list[HistoryMessage]:
-        return [_build_history_message(user_id="1001", nickname="test", content="hello", timestamp=1, message_seq=1)]
-
-    monkeypatch.setattr(planner_module.llm_provider, "generate_messages_completion", _fake_gen)
-    monkeypatch.setattr(planner_module, "_fetch_history_window", _fake_fetch)
-
-    result = await planner_module.plan_summary_request(
-        bot=cast("Any", SimpleNamespace()),
-        group_id="123",
-        bot_self_id="999",
-        user_request="总结最近消息",
-        planning_model=PLANNING_MODEL,
-        planning_max_tokens=800,
-        planning_round_limit=3,
-        summary_default_count=50,
-        min_summary_count=10,
-        max_summary_count=200,
-        summary_tool_scan_limit=300,
-        fetch_batch_size=50,
-        request_trace_id="test-trace",
-    )
-
-    assert result.messages is not None
-    assert [kwargs["request_trace_id"] for kwargs in llm_kwargs] == [
-        "test-trace",
-        "test-trace",
-        "test-trace",
-    ]
-    assert [kwargs["request_phase"] for kwargs in llm_kwargs] == [
-        "group_history_summary_plan_round_0",
-        "group_history_summary_plan_round_1",
-        "group_history_summary_plan_round_2",
-    ]
-
-
-# ======================== 最终总结追踪测试 ========================
-
-
-@pytest.mark.asyncio
-async def test_final_summary_uses_request_trace_id_and_phase(
-    monkeypatch: Any,
+async def test_capability_is_checked_before_task_creation(
+    monkeypatch: pytest.MonkeyPatch,
+    _install_fake_dsh_service: _FakeDshSummaryService,
 ) -> None:
-    """最终总结经 str 便捷接口携带请求 trace ID 与稳定阶段名。"""
-    import komari_bot.plugins.group_history_summary.summarize_service as summarize_module
-
-    text_kwargs: dict[str, Any] = {}
-
-    async def _fake_gen_text(**kwargs: Any) -> str:
-        text_kwargs.update(kwargs)
-        return "<content>今天主要讨论了测试。</content>"
-
-    monkeypatch.setattr(
-        summarize_module.llm_provider,
-        "generate_text_with_messages",
-        _fake_gen_text,
-    )
-
-    history = [_build_history_message(user_id="1001", nickname="test", content="hello", timestamp=1, message_seq=1)]
-
-    text = await summarize_module.summarize_history_messages(
-        history_messages=history,
-        model=SUMMARY_MODEL,
-        temperature=0.4,
-        max_tokens=1200,
-        request_trace_id="trace-1",
-    )
-
-    assert text == "今天主要讨论了测试。"
-    assert text_kwargs["request_trace_id"] == "trace-1"
-    # 保留既有非 collector 便捷路径的阶段名
-    assert text_kwargs["request_phase"] == "group_history_summary"
-
-
-@pytest.mark.asyncio
-async def test_final_summary_empty_text_returns_default(monkeypatch: Any) -> None:
-    """最终总结返回空正文时回退到既有安全默认文本。"""
-    import komari_bot.plugins.group_history_summary.summarize_service as summarize_module
-
-    async def _fake_gen_text(**_kwargs: Any) -> str:
-        return ""
-
-    monkeypatch.setattr(
-        summarize_module.llm_provider,
-        "generate_text_with_messages",
-        _fake_gen_text,
-    )
-
-    history = [_build_history_message(user_id="1001", nickname="test", content="hello", timestamp=1, message_seq=1)]
-
-    text = await summarize_module.summarize_history_messages(
-        history_messages=history,
-        model=SUMMARY_MODEL,
-        temperature=0.4,
-        max_tokens=1200,
-    )
-
-    assert "信息较少" in text
-
-
-@pytest.mark.asyncio
-async def test_empty_history_does_not_call_llm(monkeypatch: Any) -> None:
-    """验证空历史不产生任何 LLM 调用。"""
-    import komari_bot.plugins.group_history_summary.summarize_service as summarize_module
-
-    called = False
-
-    async def _fake_noop(**_kwargs: Any) -> object:
-        nonlocal called
-        called = True
-        return SimpleNamespace(content="", tool_calls=[], finish_reason="stop")
-
-    monkeypatch.setattr(
-        summarize_module.llm_provider,
-        "generate_messages_completion",
-        _fake_noop,
-    )
-    monkeypatch.setattr(
-        summarize_module.llm_provider,
-        "generate_text_with_messages",
-        _fake_noop,
-    )
-
-    text = await summarize_module.summarize_history_messages(
-        history_messages=[],
-        model=SUMMARY_MODEL,
-        temperature=0.4,
-        max_tokens=1200,
-    )
-
-    assert "信息较少" in text
-    assert not called
-
-
-# ======================== 锁与能力检查测试 ========================
-
-
-@pytest.mark.asyncio
-async def test_lock_busy_error_on_concurrent_same_group(monkeypatch: Any) -> None:
-    """验证同群重复调用返回 SummaryBusyError。"""
-    import asyncio
-
-    import komari_bot.plugins.group_history_summary.execution_service as exec_module
-
-    monkeypatch.setattr(
-        exec_module, "check_group_history_supported", _async_return_true
-    )
-
-    async def _slow_plan(*_args: Any, **_kwargs: Any) -> object:
-        await asyncio.sleep(0.05)
-        return SimpleNamespace(
-            messages=[],
-            tool_result=None,
-            planner_note="",
-            rounds_used=0,
-        )
-
-    monkeypatch.setattr(exec_module, "plan_summary_request", _slow_plan)
-
-    config = _build_config()
-
-    async def _run() -> None:
-        await execute_group_summary(
-            bot=cast("Any", SimpleNamespace()),
-            group_id="same_group",
-            bot_self_id="999",
-            user_request="总结",
-            config=config,
-        )
-
-    task = asyncio.create_task(_run())
-    await asyncio.sleep(0.01)
-
-    with pytest.raises(SummaryBusyError):
-        await execute_group_summary(
-            bot=cast("Any", SimpleNamespace()),
-            group_id="same_group",
-            bot_self_id="999",
-            user_request="总结",
-            config=config,
-        )
-
-    await task
-
-
-@pytest.mark.asyncio
-async def test_busy_error_while_first_request_checks_capability(
-    monkeypatch: Any,
-) -> None:
-    """首个请求尚在能力检查时，同群第二个请求也必须立即报忙。"""
-    import asyncio
-
-    import komari_bot.plugins.group_history_summary.execution_service as exec_module
-
-    check_started = asyncio.Event()
-    release_check = asyncio.Event()
-
-    async def _slow_check(_bot: object) -> bool:
-        check_started.set()
-        await release_check.wait()
-        return True
-
-    async def _empty_plan(*_args: Any, **_kwargs: Any) -> object:
-        return SimpleNamespace(
-            messages=[],
-            tool_result=None,
-            planner_note="",
-            rounds_used=0,
-        )
-
-    monkeypatch.setattr(exec_module, "check_group_history_supported", _slow_check)
-    monkeypatch.setattr(exec_module, "plan_summary_request", _empty_plan)
-    config = _build_config()
-
-    first = asyncio.create_task(
-        execute_group_summary(
-            bot=cast("Any", SimpleNamespace()),
-            group_id="capability-check-group",
-            bot_self_id="999",
-            user_request="总结",
-            config=config,
-        )
-    )
-    await check_started.wait()
-    try:
-        with pytest.raises(SummaryBusyError):
-            await execute_group_summary(
-                bot=cast("Any", SimpleNamespace()),
-                group_id="capability-check-group",
-                bot_self_id="999",
-                user_request="总结",
-                config=config,
-            )
-    finally:
-        release_check.set()
-        await first
-
-
-@pytest.mark.asyncio
-async def test_capability_not_supported_raises(monkeypatch: Any) -> None:
-    """验证能力不支持时抛出 CapabilityNotSupportedError。"""
     import komari_bot.plugins.group_history_summary.execution_service as exec_module
 
     monkeypatch.setattr(
         exec_module, "check_group_history_supported", _async_return_false
     )
-
-    config = _build_config()
 
     with pytest.raises(CapabilityNotSupportedError):
         await execute_group_summary(
@@ -442,15 +199,64 @@ async def test_capability_not_supported_raises(monkeypatch: Any) -> None:
             group_id="123",
             bot_self_id="999",
             user_request="总结",
-            config=config,
+            config=_build_config(),
         )
+    assert _install_fake_dsh_service.calls == []
 
 
 @pytest.mark.asyncio
-async def test_lock_backend_failure_is_fail_closed(
+async def test_confirmed_capability_is_not_checked_twice(
     monkeypatch: pytest.MonkeyPatch,
+    _install_fake_dsh_service: _FakeDshSummaryService,
 ) -> None:
-    """分布式锁后端不可用时不得降级为无锁执行。"""
+    import komari_bot.plugins.group_history_summary.execution_service as exec_module
+
+    async def _fail_capability_check(_bot: object) -> bool:
+        raise AssertionError
+
+    monkeypatch.setattr(
+        exec_module, "check_group_history_supported", _fail_capability_check
+    )
+    _install_fake_dsh_service.selection = _selection([])
+
+    result = await execute_group_summary(
+        bot=cast("Any", SimpleNamespace()),
+        group_id="123",
+        bot_self_id="999",
+        user_request="总结",
+        config=_build_config(),
+        history_capability_confirmed=True,
+    )
+
+    assert result.filtered_message_count == 0
+    assert len(_install_fake_dsh_service.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_busy_group_does_not_start_a_dsh_task(
+    _install_fake_dsh_service: _FakeDshSummaryService,
+) -> None:
+    import komari_bot.plugins.group_history_summary.execution_service as exec_module
+
+    lock = cast("_FakeSummaryLockManager", exec_module._group_lock_manager)
+    lock.running_groups.add("123")
+
+    with pytest.raises(SummaryBusyError):
+        await execute_group_summary(
+            bot=cast("Any", SimpleNamespace()),
+            group_id="123",
+            bot_self_id="999",
+            user_request="总结",
+            config=_build_config(),
+        )
+    assert _install_fake_dsh_service.calls == []
+
+
+@pytest.mark.asyncio
+async def test_lock_backend_failure_is_fail_closed_before_capability(
+    monkeypatch: pytest.MonkeyPatch,
+    _install_fake_dsh_service: _FakeDshSummaryService,
+) -> None:
     import komari_bot.plugins.group_history_summary.execution_service as exec_module
 
     class _FailingLockManager:
@@ -470,330 +276,116 @@ async def test_lock_backend_failure_is_fail_closed(
     with pytest.raises(SummaryServiceUnavailableError):
         await execute_group_summary(
             bot=cast("Any", SimpleNamespace()),
-            group_id="lock-backend-failure",
+            group_id="123",
             bot_self_id="999",
             user_request="总结",
             config=_build_config(),
         )
 
     assert capability_checked is False
+    assert _install_fake_dsh_service.calls == []
 
 
 @pytest.mark.asyncio
-async def test_confirmed_capability_is_not_checked_twice(monkeypatch: Any) -> None:
-    """入口已确认能力时，共享执行服务不再重复调用平台能力接口。"""
-    import komari_bot.plugins.group_history_summary.execution_service as exec_module
-
-    async def _fail_capability_check(_bot: object) -> bool:
-        raise AssertionError
-
-    async def _empty_plan(*_args: Any, **_kwargs: Any) -> object:
-        return SimpleNamespace(
-            messages=[],
-            tool_result=None,
-            planner_note="",
-            rounds_used=0,
-        )
-
-    monkeypatch.setattr(
-        exec_module,
-        "check_group_history_supported",
-        _fail_capability_check,
-    )
-    monkeypatch.setattr(exec_module, "plan_summary_request", _empty_plan)
-
-    result = await execute_group_summary(
-        bot=cast("Any", SimpleNamespace()),
-        group_id="capability-confirmed-group",
-        bot_self_id="999",
-        user_request="总结",
-        config=_build_config(),
-        history_capability_confirmed=True,
-    )
-
-    assert result.filtered_message_count == 0
-
-
-# ======================== 正常 handler 端到端测试 ========================
-
-
-@pytest.mark.asyncio
-async def test_normal_handler_returns_image_for_non_empty_history(
-    monkeypatch: Any,
+async def test_non_empty_selection_renders_existing_output_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    _install_fake_dsh_service: _FakeDshSummaryService,
 ) -> None:
-    """验证正常执行路径返回图片 base64，并把请求 ID 传给规划与总结。"""
     import komari_bot.plugins.group_history_summary.execution_service as exec_module
-
-    monkeypatch.setattr(
-        exec_module, "check_group_history_supported", _async_return_true
-    )
 
     messages = [
-        _build_history_message(
-            user_id="1001", nickname="阿明", content="hello", timestamp=100, message_seq=1
-        ),
-        _build_history_message(
-            user_id="1002", nickname="小红", content="world", timestamp=200, message_seq=2
+        _message(user_id="1001", nickname="阿明", timestamp=100, message_seq=1),
+        _message(
+            user_id="1002",
+            nickname="小红",
+            content="world",
+            timestamp=200,
+            message_seq=2,
         ),
     ]
+    _install_fake_dsh_service.selection = _selection(messages)
+    _install_fake_dsh_service.summary_text = "今天讨论了 hello 和 world。"
+    rendered: list[dict[str, Any]] = []
 
-    plan_kwargs: dict[str, Any] = {}
-    summarize_kwargs: dict[str, Any] = {}
-
-    async def _fake_plan(*_args: Any, **kwargs: Any) -> object:
-        plan_kwargs.update(kwargs)
+    def _fake_render(**kwargs: Any) -> SimpleNamespace:
+        rendered.append(dict(kwargs))
         return SimpleNamespace(
-            messages=messages,
-            tool_result=SimpleNamespace(
-                source="recent_group_messages",
-                matched_count=2,
-                messages=messages,
-                filters={"count": 50, "include_bot_replies": False},
-            ),
-            planner_note="规划完成",
-            rounds_used=1,
+            images_base64=("page-a", "page-b"),
+            truncated=True,
         )
 
-    async def _fake_summarize(*_args: Any, **kwargs: Any) -> str:
-        summarize_kwargs.update(kwargs)
-        return "今天讨论了 hello 和 world。"
-
-    monkeypatch.setattr(exec_module, "plan_summary_request", _fake_plan)
-    monkeypatch.setattr(exec_module, "summarize_history_messages", _fake_summarize)
-
-    config = _build_config()
+    monkeypatch.setattr(
+        exec_module, "render_summary_image_pages_base64", _fake_render
+    )
 
     result = await execute_group_summary(
         bot=cast("Any", SimpleNamespace()),
         group_id="456",
         bot_self_id="999",
         user_request="总结",
-        config=config,
-        requested_count=50,
+        config=_build_config(),
+        requested_count=30,
         request_trace_id="e2e-trace",
     )
 
-    assert len(result.summary_text) > 0
+    assert result.summary_text == "今天讨论了 hello 和 world。"
     assert result.filtered_message_count == 2
     assert result.filter_label == "recent_group_messages"
-    assert len(result.image_base64) > 0
-    assert "hello" in result.summary_text or "world" in result.summary_text
-    assert plan_kwargs["request_trace_id"] == "e2e-trace"
-    assert summarize_kwargs["request_trace_id"] == "e2e-trace"
-
-
-# ======================== 空历史与回退测试 ========================
+    assert result.image_base64 == "page-a"
+    assert result.image_pages_base64 == ("page-a", "page-b")
+    assert result.image_truncated is True
+    assert result.selection is not None
+    assert any("今天讨论了" in line for line in rendered[0]["body_lines"])
+    assert rendered[0]["title"] == "小鞠的总结时间到！"
+    assert rendered[0]["subtitle"].startswith("recent_group_messages 2 条 | ")
+    call = _install_fake_dsh_service.calls[0]
+    assert call["request_trace_id"] == "e2e-trace"
+    assert call["config"].limits.default_count == 30
 
 
 @pytest.mark.asyncio
-async def test_empty_history_returns_default_text_and_no_image(
-    monkeypatch: Any,
+async def test_empty_selection_returns_deterministic_notice_without_image(
+    monkeypatch: pytest.MonkeyPatch,
+    _install_fake_dsh_service: _FakeDshSummaryService,
 ) -> None:
-    """验证空历史返回默认文本且不生成图片。"""
     import komari_bot.plugins.group_history_summary.execution_service as exec_module
 
+    _install_fake_dsh_service.selection = _selection([])
+    _install_fake_dsh_service.summary_text = "空历史的模型文本"
+    render_calls: list[object] = []
+
+    def _fake_render(**kwargs: Any) -> object:
+        render_calls.append(kwargs)
+        raise AssertionError("空历史不得渲染图片")
+
     monkeypatch.setattr(
-        exec_module, "check_group_history_supported", _async_return_true
+        exec_module, "render_summary_image_pages_base64", _fake_render
     )
-
-    async def _fake_plan(*_args: Any, **_kwargs: Any) -> object:
-        return SimpleNamespace(
-            messages=[],
-            tool_result=None,
-            planner_note="无可用消息",
-            rounds_used=0,
-        )
-
-    monkeypatch.setattr(exec_module, "plan_summary_request", _fake_plan)
-
-    config = _build_config()
 
     result = await execute_group_summary(
         bot=cast("Any", SimpleNamespace()),
         group_id="789",
         bot_self_id="999",
         user_request="总结",
-        config=config,
-    )
-
-    assert "文本记录太少" in result.summary_text
-    assert result.filtered_message_count == 0
-    assert result.image_base64 == ""
-
-
-# ======================== 规划回退 ========================
-
-
-@pytest.mark.asyncio
-async def test_planning_fallback_returns_tool_result(monkeypatch: Any) -> None:
-    """验证规划达到轮数上限时按已取回消息回退继续。"""
-    import komari_bot.plugins.group_history_summary.planner_service as planner_module
-
-    completions = [
-        _fake_completion(
-            tool_calls=[_fake_tool_call()],
-            finish_reason="tool_calls",
-        ),
-    ]
-    call_index = 0
-
-    async def _fake_gen(**_kwargs: Any) -> object:
-        nonlocal call_index
-        result = completions[min(call_index, len(completions) - 1)]
-        call_index += 1
-        return result
-
-    messages = [_build_history_message(user_id="1001", nickname="test", content="fallback test", timestamp=1, message_seq=1)]
-
-    async def _fake_fetch(_count: int = 50, **_kwargs: Any) -> list[HistoryMessage]:
-        return messages
-
-    monkeypatch.setattr(planner_module.llm_provider, "generate_messages_completion", _fake_gen)
-    monkeypatch.setattr(planner_module, "_fetch_history_window", _fake_fetch)
-
-    result = await planner_module.plan_summary_request(
-        bot=cast("Any", SimpleNamespace()),
-        group_id="123",
-        bot_self_id="999",
-        user_request="总结",
-        planning_model=PLANNING_MODEL,
-        planning_max_tokens=800,
-        planning_round_limit=1,
-        summary_default_count=30,
-        min_summary_count=10,
-        max_summary_count=200,
-        summary_tool_scan_limit=300,
-        fetch_batch_size=50,
-        request_trace_id="fallback-trace",
-    )
-
-    assert result.tool_result is not None
-    assert "上限" in result.planner_note or "回退" in result.planner_note
-
-
-# ======================== 总结失败传播 ========================
-
-
-@pytest.mark.asyncio
-async def test_summary_failure_propagates_after_planning(
-    monkeypatch: Any,
-) -> None:
-    """验证总结阶段失败仍向调用方传播（不伪造成功总结）。"""
-    import komari_bot.plugins.group_history_summary.execution_service as exec_module
-
-    monkeypatch.setattr(
-        exec_module, "check_group_history_supported", _async_return_true
-    )
-
-    messages = [_build_history_message(user_id="1001", nickname="test", content="hello", timestamp=1, message_seq=1)]
-
-    async def _fake_plan(*_args: Any, **_kwargs: Any) -> object:
-        return SimpleNamespace(
-            messages=messages,
-            tool_result=SimpleNamespace(
-                source="recent_group_messages",
-                matched_count=1,
-                messages=messages,
-                filters={},
-            ),
-            planner_note="规划完成",
-            rounds_used=1,
-        )
-
-    async def _fake_summarize(*_args: Any, **_kwargs: Any) -> str:
-        raise RuntimeError("模拟总结失败")
-
-    monkeypatch.setattr(exec_module, "plan_summary_request", _fake_plan)
-    monkeypatch.setattr(exec_module, "summarize_history_messages", _fake_summarize)
-
-    config = _build_config()
-
-    with pytest.raises(RuntimeError, match="模拟总结失败"):
-        await execute_group_summary(
-            bot=cast("Any", SimpleNamespace()),
-            group_id="999",
-            bot_self_id="999",
-            user_request="总结",
-            config=config,
-        )
-
-
-@pytest.mark.asyncio
-async def test_image_rendering_runs_outside_event_loop_thread(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """PIL 渲染必须在线程中执行，不能阻塞主事件循环。"""
-    import komari_bot.plugins.group_history_summary.execution_service as exec_module
-
-    messages = [
-        _build_history_message(
-            user_id="1001",
-            nickname="test",
-            content="hello",
-            timestamp=1,
-            message_seq=1,
-        )
-    ]
-
-    async def _fake_plan(*_args: Any, **_kwargs: Any) -> object:
-        return SimpleNamespace(
-            messages=messages,
-            tool_result=SimpleNamespace(
-                source="recent_group_messages",
-                history_fetch=None,
-            ),
-            planner_note="",
-            rounds_used=1,
-        )
-
-    async def _fake_summarize(*_args: Any, **_kwargs: Any) -> str:
-        return "总结内容"
-
-    render_thread_id = 0
-
-    def _fake_render(**_kwargs: Any) -> SimpleNamespace:
-        nonlocal render_thread_id
-        render_thread_id = threading.get_ident()
-        return SimpleNamespace(images_base64=("image-data",), truncated=False)
-
-    monkeypatch.setattr(
-        exec_module, "check_group_history_supported", _async_return_true
-    )
-    monkeypatch.setattr(exec_module, "plan_summary_request", _fake_plan)
-    monkeypatch.setattr(exec_module, "summarize_history_messages", _fake_summarize)
-    monkeypatch.setattr(exec_module, "render_summary_image_pages_base64", _fake_render)
-
-    event_loop_thread_id = threading.get_ident()
-    result = await execute_group_summary(
-        bot=cast("Any", SimpleNamespace()),
-        group_id="render-thread-group",
-        bot_self_id="999",
-        user_request="总结",
         config=_build_config(),
     )
 
-    assert result.image_base64 == "image-data"
-    assert result.image_pages_base64 == ("image-data",)
-    assert result.image_truncated is False
-    assert render_thread_id != event_loop_thread_id
+    assert "文本记录太少" in result.summary_text
+    assert result.summary_text != "空历史的模型文本"
+    assert result.filtered_message_count == 0
+    assert result.filter_label == "无"
+    assert result.time_range == "无"
+    assert result.image_base64 == ""
+    assert render_calls == []
 
 
 @pytest.mark.asyncio
-async def test_allowed_partial_history_is_explicit_in_result_and_image(
+async def test_allowed_partial_history_keeps_notice_metadata_and_image(
     monkeypatch: pytest.MonkeyPatch,
+    _install_fake_dsh_service: _FakeDshSummaryService,
 ) -> None:
-    """达到阈值的部分历史可继续总结，但必须明确展示缺页信息。"""
     import komari_bot.plugins.group_history_summary.execution_service as exec_module
 
-    messages = [
-        _build_history_message(
-            user_id="1001",
-            nickname="test",
-            content="hello",
-            timestamp=1,
-            message_seq=1,
-        )
-    ]
     metadata = HistoryFetchMetadata(
         status="partial",
         requested_count=50,
@@ -803,21 +395,11 @@ async def test_allowed_partial_history_is_explicit_in_result_and_image(
         failed_batch=3,
         failure_code="history_api_error",
     )
-
-    async def _fake_plan(*_args: Any, **_kwargs: Any) -> object:
-        return SimpleNamespace(
-            messages=messages,
-            tool_result=SimpleNamespace(
-                source="recent_group_messages",
-                history_fetch=metadata,
-            ),
-            planner_note="",
-            rounds_used=1,
-        )
-
-    async def _fake_summarize(*_args: Any, **_kwargs: Any) -> str:
-        return "总结内容"
-
+    _install_fake_dsh_service.selection = _selection(
+        [_message(timestamp=1, message_seq=1)],
+        metadata=metadata,
+    )
+    _install_fake_dsh_service.summary_text = "总结内容"
     rendered_lines: list[str] = []
 
     def _fake_render(**kwargs: Any) -> SimpleNamespace:
@@ -825,11 +407,8 @@ async def test_allowed_partial_history_is_explicit_in_result_and_image(
         return SimpleNamespace(images_base64=("image-data",), truncated=False)
 
     monkeypatch.setattr(
-        exec_module, "check_group_history_supported", _async_return_true
+        exec_module, "render_summary_image_pages_base64", _fake_render
     )
-    monkeypatch.setattr(exec_module, "plan_summary_request", _fake_plan)
-    monkeypatch.setattr(exec_module, "summarize_history_messages", _fake_summarize)
-    monkeypatch.setattr(exec_module, "render_summary_image_pages_base64", _fake_render)
 
     result = await execute_group_summary(
         bot=cast("Any", SimpleNamespace()),
@@ -842,3 +421,178 @@ async def test_allowed_partial_history_is_explicit_in_result_and_image(
     assert result.history_fetch is metadata
     assert result.summary_text.startswith("⚠ 历史第 3 批读取失败")
     assert any("约缺 10 条记录" in line for line in rendered_lines)
+
+
+@pytest.mark.asyncio
+async def test_image_rendering_runs_outside_event_loop_thread(
+    monkeypatch: pytest.MonkeyPatch,
+    _install_fake_dsh_service: _FakeDshSummaryService,
+) -> None:
+    import komari_bot.plugins.group_history_summary.execution_service as exec_module
+
+    _install_fake_dsh_service.selection = _selection([_message()])
+    render_thread_id = 0
+
+    def _fake_render(**_kwargs: Any) -> SimpleNamespace:
+        nonlocal render_thread_id
+        render_thread_id = threading.get_ident()
+        return SimpleNamespace(images_base64=("image-data",), truncated=False)
+
+    monkeypatch.setattr(
+        exec_module, "render_summary_image_pages_base64", _fake_render
+    )
+    event_loop_thread_id = threading.get_ident()
+
+    result = await execute_group_summary(
+        bot=cast("Any", SimpleNamespace()),
+        group_id="render-thread-group",
+        bot_self_id="999",
+        user_request="总结",
+        config=_build_config(),
+    )
+
+    assert result.image_base64 == "image-data"
+    assert render_thread_id != event_loop_thread_id
+
+
+@pytest.mark.asyncio
+async def test_admission_denial_before_render_is_silent_normal_control_flow(
+    monkeypatch: pytest.MonkeyPatch,
+    _install_fake_dsh_service: _FakeDshSummaryService,
+) -> None:
+    import komari_bot.plugins.group_history_summary.execution_service as exec_module
+
+    _install_fake_dsh_service.selection = _selection([_message()])
+    render_calls: list[object] = []
+
+    def _deny(**_kwargs: object) -> None:
+        raise SummaryAdmissionDeniedError
+
+    def _fake_render(**kwargs: Any) -> object:
+        render_calls.append(kwargs)
+        raise AssertionError("准入拒绝不得渲染")
+
+    monkeypatch.setattr(exec_module, "ensure_effect_admitted", _deny)
+    monkeypatch.setattr(
+        exec_module, "render_summary_image_pages_base64", _fake_render
+    )
+
+    result = await execute_group_summary(
+        bot=cast("Any", SimpleNamespace()),
+        group_id="denied-group",
+        bot_self_id="999",
+        user_request="总结",
+        config=_build_config(),
+    )
+
+    assert result.summary_text == ""
+    assert result.filtered_message_count == 0
+    assert result.selection is None
+    assert result.image_base64 == ""
+    assert render_calls == []
+
+
+@pytest.mark.asyncio
+async def test_generation_failure_propagates_without_render(
+    monkeypatch: pytest.MonkeyPatch,
+    _install_fake_dsh_service: _FakeDshSummaryService,
+) -> None:
+    import komari_bot.plugins.group_history_summary.execution_service as exec_module
+
+    _install_fake_dsh_service.error = SummaryGenerationError("agent_error")
+    render_calls: list[object] = []
+
+    def _fake_render(**kwargs: Any) -> object:
+        render_calls.append(kwargs)
+        raise AssertionError("生成失败不得渲染")
+
+    monkeypatch.setattr(
+        exec_module, "render_summary_image_pages_base64", _fake_render
+    )
+
+    with pytest.raises(SummaryGenerationError) as exc_info:
+        await execute_group_summary(
+            bot=cast("Any", SimpleNamespace()),
+            group_id="failed-group",
+            bot_self_id="999",
+            user_request="总结",
+            config=_build_config(),
+        )
+
+    assert exc_info.value.code == "agent_error"
+    assert render_calls == []
+
+
+@pytest.mark.asyncio
+async def test_lease_loss_cancels_dsh_task_and_releases_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    _install_fake_dsh_service: _FakeDshSummaryService,
+) -> None:
+    import komari_bot.plugins.group_history_summary.execution_service as exec_module
+
+    started = asyncio.Event()
+    never = asyncio.Event()
+    _install_fake_dsh_service.wait = never
+    _install_fake_dsh_service.started = started
+    release_check = asyncio.Event()
+
+    class _LostLease(_FakeSummaryLease):
+        async def run(self, operation: Any) -> Any:
+            task = asyncio.create_task(operation)
+            await started.wait()
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            raise GroupSummaryLockLostError
+
+        async def close(self) -> None:
+            release_check.set()
+            await super().close()
+
+    class _LostLockManager(_FakeSummaryLockManager):
+        async def try_acquire(self, **_kwargs: object) -> _LostLease:
+            return _LostLease(self, "lost-group")
+
+    monkeypatch.setattr(exec_module, "_group_lock_manager", _LostLockManager())
+
+    with pytest.raises(SummaryServiceUnavailableError):
+        await execute_group_summary(
+            bot=cast("Any", SimpleNamespace()),
+            group_id="lost-group",
+            bot_self_id="999",
+            user_request="总结",
+            config=_build_config(),
+        )
+
+    await release_check.wait()
+    assert _install_fake_dsh_service.cancelled is True
+
+
+@pytest.mark.asyncio
+async def test_caller_cancellation_propagates_and_releases_lease(
+    _install_fake_dsh_service: _FakeDshSummaryService,
+) -> None:
+    import komari_bot.plugins.group_history_summary.execution_service as exec_module
+
+    never = asyncio.Event()
+    started = asyncio.Event()
+    _install_fake_dsh_service.wait = never
+    _install_fake_dsh_service.started = started
+    lock = cast("_FakeSummaryLockManager", exec_module._group_lock_manager)
+
+    task = asyncio.create_task(
+        execute_group_summary(
+            bot=cast("Any", SimpleNamespace()),
+            group_id="cancel-group",
+            bot_self_id="999",
+            user_request="总结",
+            config=_build_config(),
+        )
+    )
+    await started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert _install_fake_dsh_service.cancelled is True
+    assert lock.running_groups == set()
