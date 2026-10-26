@@ -55,6 +55,10 @@ logs/
 
 # Node modules（如果有前端）
 node_modules/
+# DSH 构建产物：由 Dockerfile 的 Node 构建阶段生成
+dsh/node_modules/
+dsh/runtime/dist/
+dsh/runtime/dist-test/
 
 # macOS
 .DS_Store
