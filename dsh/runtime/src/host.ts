@@ -24,6 +24,7 @@ import {
   type TaskKind,
 } from './protocol.js'
 import KomariAgentRuntime, { TaskFailure, type CallbackTransport } from './business.js'
+import { installSanitizedStderr } from './logging.js'
 
 export const PROFILE_BUNDLE = '@komari-bot/dsh-runtime-bundle'
 export const PROFILE_PATCH = 'cordis.patch.yml'
@@ -219,12 +220,15 @@ export async function startHost(options: StartHostOptions): Promise<HostRuntime>
     telemetryDisabledEnv: '1',
   }
   let ctx: Context
+  const restoreStderr = installSanitizedStderr()
   try {
     ctx = await boot('komari-agent', options.baseConfig, patches, (prepared) => {
       prepared.provide('profileContext', profileContext)
     }, pathToFileURL(options.installAnchor).href)
   } catch {
     throw new HostBootError('boot_failed')
+  } finally {
+    restoreStderr()
   }
   try {
     assertComposition(ctx)

@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url'
 import type { PatchOptions } from '@deepseek-ai/cordis-plugin-include'
 import { installFailLoud } from '@deepseek-ai/dsh-app-boot'
 import { HostBootError, startHost, type HostRuntime } from './host.js'
+import { logTo, sanitizeLogText } from './logging.js'
 import {
   encodeFrame,
   parseClientFrame,
@@ -32,23 +33,6 @@ export interface RunOptions {
   readonly stdin?: NodeJS.ReadableStream
   readonly stdout?: NodeJS.WritableStream
   readonly stderr?: NodeJS.WritableStream
-}
-
-const SECRET_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
-  [/\bsk-[A-Za-z0-9._-]{8,}\b/g, '[REDACTED]'],
-  [/\bBearer\s+[^\s]+/gi, 'Bearer [REDACTED]'],
-  [/\b(?:api[_-]?key|token|secret|password)\b\s*[:=]\s*['"]?[^\s'"]+/gi, '[REDACTED]'],
-  [/\/\/[^/@\s]+@/g, '//[REDACTED]@'],
-]
-
-function sanitizeLogText(value: string): string {
-  let text = value.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '')
-  for (const [pattern, replacement] of SECRET_PATTERNS) text = text.replace(pattern, replacement)
-  return text.slice(0, 2000)
-}
-
-function logTo(stream: NodeJS.WritableStream, message: string): void {
-  stream.write(`komari-agent: ${sanitizeLogText(message)}\n`)
 }
 
 function encodeError(error: unknown): string {
@@ -350,12 +334,14 @@ export async function runAgentProcess(argv: readonly string[], options: RunOptio
 
 /** Install the official fail-loud guard and exit with the process result. */
 export async function main(argv: readonly string[], options: RunOptions = {}): Promise<never> {
-  const stderr = options.stderr ?? process.stderr
-  let runtimeClosing: (() => Promise<void>) | undefined
-  installFailLoud('komari-agent', undefined, async () => {
-    await runtimeClosing?.()
+  installFailLoud('komari-agent', {
+    on: process.on.bind(process),
+    off: process.off.bind(process),
+    exit: process.exit.bind(process),
+    stderr: {
+      write: (chunk: string) => process.stderr.write(sanitizeLogText(String(chunk))),
+    },
   })
   const code = await runAgentProcess(argv, options)
-  void stderr
   process.exit(code)
 }
