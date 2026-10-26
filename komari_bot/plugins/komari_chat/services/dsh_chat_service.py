@@ -97,6 +97,12 @@ class ImageTransportUnavailableError(DshChatError):
         super().__init__(self.code)
 
 
+class ChatSubmissionAdmissionError(DshChatError):
+    """Group admission was revoked immediately before a submission effect."""
+
+    code = "submission_admission_denied"
+
+
 @dataclass(frozen=True, slots=True)
 class ChatTaskBudget:
     """The three existing chat budget values frozen at task start."""
@@ -131,6 +137,17 @@ class ChatTaskBudget:
             max_tool_calls_per_round=self.per_round,
             max_total_tool_calls=self.total,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class FrozenChatTaskConfig:
+    """All chat configuration primitives copied before the first awaited effect."""
+
+    budget: ChatTaskBudget
+    bot_nickname: str
+    knowledge_enabled: bool
+    knowledge_limit: int
+    max_favorability_delta: int
 
 
 class DshChatService:
@@ -170,8 +187,7 @@ class DshChatService:
         if not effect_business_admitted(group_id=message.group_id):
             return ReplyResult(content="")
 
-        chat_config = cast("ChatConfigLike", config)
-        budget = ChatTaskBudget.from_config(config)
+        frozen = _freeze_chat_task_config(config)
         recall_query = build_automatic_recall_query(
             current=message,
             recent=recent_messages,
@@ -192,23 +208,11 @@ class DshChatService:
             raise ImageTransportUnavailableError
 
         favorability = await self._load_favorability(message.user_id)
-        try:
-            raw_cap = cast("UserDataConfigLike", _user_data_config()).max_favorability_delta_per_reply
-        except Exception:
-            raise ChatFavorabilityReadError from None
-        if (
-            isinstance(raw_cap, bool)
-            or not isinstance(raw_cap, int)
-            or raw_cap < 0
-        ):
-            raise ChatFavorabilityReadError from None
-        max_favorability_delta = raw_cap
-
         knowledge_results, uid_knowledge_results = await self._load_knowledge(
             message=message,
             recent_messages=recent_messages,
             reply_context=reply_context,
-            config=chat_config,
+            config=frozen,
         )
         group_bindings = self._load_group_bindings(message.group_id)
         task_data = build_chat_task_data(
@@ -219,12 +223,12 @@ class DshChatService:
             knowledge_results=knowledge_results,
             uid_knowledge_results=uid_knowledge_results,
             favorability=favorability,
-            bot_nickname=str(chat_config.bot_nickname),
-            max_favorability_delta=max_favorability_delta,
+            bot_nickname=frozen.bot_nickname,
+            max_favorability_delta=frozen.max_favorability_delta,
             group_bindings=group_bindings,
         )
 
-        candidate = ChatCandidate(max_favorability_delta=max_favorability_delta)
+        candidate = ChatCandidate(max_favorability_delta=frozen.max_favorability_delta)
 
         async def admission(_request: AgentCallbackRequest) -> JsonValue:
             try:
@@ -238,9 +242,13 @@ class DshChatService:
         async def submit_final_response(
             request: AgentCallbackRequest,
         ) -> JsonValue:
+            if not effect_business_admitted(group_id=message.group_id):
+                raise ChatSubmissionAdmissionError
             return _receipt_payload(candidate.submit_final_response(request.data))
 
         async def submit_favorability(request: AgentCallbackRequest) -> JsonValue:
+            if not effect_business_admitted(group_id=message.group_id):
+                raise ChatSubmissionAdmissionError
             return _receipt_payload(candidate.submit_favorability(request.data))
 
         host = self._host_getter()
@@ -248,7 +256,7 @@ class DshChatService:
             task_id=request_trace_id,
             kind=TaskKind.CHAT,
             task_data=cast("dict[str, JsonValue]", task_data.to_dict()),
-            budget=budget.to_agent_budget(),
+            budget=frozen.budget.to_agent_budget(),
         )
         result = await host.execute(
             task,
@@ -288,7 +296,7 @@ class DshChatService:
         message: MessageSchema,
         recent_messages: Sequence[MessageSchema],
         reply_context: ReplyContext | None,
-        config: ChatConfigLike,
+        config: FrozenChatTaskConfig,
     ) -> tuple[list[object], list[tuple[str, object]]]:
         knowledge_results: list[object] = []
         if bool(config.knowledge_enabled):
@@ -337,6 +345,38 @@ class DshChatService:
                 type(exc).__name__,
             )
             return {}
+
+
+def _freeze_chat_task_config(config: object) -> FrozenChatTaskConfig:
+    chat_config = cast("ChatConfigLike", config)
+    try:
+        budget = ChatTaskBudget.from_config(config)
+        bot_nickname = chat_config.bot_nickname
+        knowledge_enabled = bool(chat_config.knowledge_enabled)
+        knowledge_limit = chat_config.knowledge_limit
+    except AttributeError:
+        raise ChatTaskBudgetError from None
+    if (
+        isinstance(knowledge_limit, bool)
+        or not isinstance(knowledge_limit, int)
+        or knowledge_limit < 0
+    ):
+        raise ChatTaskBudgetError from None
+    try:
+        raw_cap = cast(
+            "UserDataConfigLike", _user_data_config()
+        ).max_favorability_delta_per_reply
+    except Exception:
+        raise ChatFavorabilityReadError from None
+    if isinstance(raw_cap, bool) or not isinstance(raw_cap, int) or raw_cap < 0:
+        raise ChatFavorabilityReadError from None
+    return FrozenChatTaskConfig(
+        budget=budget,
+        bot_nickname=str(bot_nickname),
+        knowledge_enabled=knowledge_enabled,
+        knowledge_limit=knowledge_limit,
+        max_favorability_delta=raw_cap,
+    )
 
 
 def _receipt_payload(receipt: ChatSubmissionReceipt) -> JsonValue:
@@ -431,10 +471,12 @@ def _user_data_config() -> object:
 __all__ = [
     "ChatFavorabilityReadError",
     "ChatResultMismatchError",
+    "ChatSubmissionAdmissionError",
     "ChatTaskBudget",
     "ChatTaskBudgetError",
     "DshChatError",
     "DshChatService",
+    "FrozenChatTaskConfig",
     "ImageTransportUnavailableError",
     "RecallQueryBudgetError",
 ]

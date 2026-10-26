@@ -28,7 +28,7 @@ MAX_RECALL_HISTORY_MESSAGES = 10
 
 
 class RecallQueryBudgetError(RuntimeError):
-    """The current trigger alone cannot fit the shared query budget."""
+    """The mandatory current trigger plus quote identity cannot fit the budget."""
 
     code = "recall_query_unfit"
 
@@ -50,12 +50,28 @@ def build_automatic_recall_query(
     current_block = _render_current(current, trigger_text)
     _require_bounded([current_block], label="召回查询")
 
-    history = [
-        message
-        for message in recent
+    indexed_group = [
+        (index, message)
+        for index, message in enumerate(recent)
         if message.group_id == current.group_id
-        and message.message_id != current.message_id
-    ][-MAX_RECALL_HISTORY_MESSAGES:]
+    ]
+    trigger_positions = [
+        index
+        for index, message in indexed_group
+        if message.message_id == current.message_id
+    ]
+    trigger_position = trigger_positions[0] if trigger_positions else None
+    eligible = [
+        (index, message)
+        for index, message in indexed_group
+        if message.message_id != current.message_id
+        and (trigger_position is None or index < trigger_position)
+        and message.timestamp <= current.timestamp
+    ]
+    eligible.sort(key=lambda item: (item[1].timestamp, item[0]))
+    history = [
+        message for _index, message in eligible[-MAX_RECALL_HISTORY_MESSAGES:]
+    ]
 
     quote_text = None if quote is None else quote.text.strip()
     quote_full = (
@@ -71,8 +87,8 @@ def build_automatic_recall_query(
     ]
 
     # First build the richest candidate. Remove the oldest history entries
-    # before reducing quote detail, because the trigger is highest priority and
-    # the quote relationship itself must remain explicit when possible.
+    # before reducing quote detail. The trigger and the explicit quote identity
+    # are mandatory and are never silently discarded for budget pressure.
     quote_choice = quote_full if quote_full is not None else quote_compact
     parts = [current_block]
     if quote_choice is not None:
@@ -92,13 +108,9 @@ def build_automatic_recall_query(
             parts.append(quote_choice)
         parts.extend(rendered_history)
 
-    if _is_over_budget(parts) and quote_choice is not None:
-        quote_choice = None
-        parts = [current_block, *rendered_history]
-
     if _is_over_budget(parts):
-        # The current block alone was validated above, so this can only mean
-        # an unexpected composition bug. Fail closed instead of truncating it.
+        # The mandatory trigger plus the compact explicit quote identity does
+        # not fit. Never drop the quote relationship or truncate the trigger.
         raise RecallQueryBudgetError
     _require_bounded(parts, label="召回查询")
     return "\n".join(parts)

@@ -5,12 +5,16 @@ from __future__ import annotations
 import json
 from importlib import import_module
 from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
 from komari_bot.context.redis_store import MessageSchema
 from komari_bot.llm.content_budget import QUERY_TEXT_BUDGET, validate_text_budget
 from komari_bot.plugins.komari_chat.services.reply_context import ReplyContext
+
+if TYPE_CHECKING:
+    from komari_bot.plugins.komari_chat.services.chat_task_data import ChatTaskData
 
 data_module = import_module(
     "komari_bot.plugins.komari_chat.services.chat_task_data"
@@ -28,16 +32,21 @@ def _message(
     is_bot: bool = False,
     user_id: str | None = None,
     nickname: str | None = None,
+    timestamp: float | None = None,
 ) -> MessageSchema:
     return MessageSchema(
         user_id=user_id or f"u-{index}",
         user_nickname=nickname or f"用户{index}",
         group_id=group_id,
         content=content if content is not None else f"消息{index}",
-        timestamp=float(index),
+        timestamp=float(index) if timestamp is None else timestamp,
         message_id=f"m-{index}",
         is_bot=is_bot,
     )
+
+
+def _current(*, timestamp: float = 100.0, content: str = "当前消息") -> MessageSchema:
+    return _message(0, content=content, user_id="u-0", nickname="当前用户", timestamp=timestamp)
 
 
 def _favorability() -> object:
@@ -72,7 +81,7 @@ def _build(
     memory: list[object] | None = None,
     knowledge: list[object] | None = None,
     uid_knowledge: list[tuple[str, object]] | None = None,
-) -> object:
+) -> ChatTaskData:
     current = _message(0, content="当前消息", user_id="u-0", nickname="当前用户")
     return data_module.build_chat_task_data(
         current=current,
@@ -112,7 +121,7 @@ def test_exact_closed_shape_and_provenance() -> None:
         knowledge=[_knowledge_hit()],
         uid_knowledge=[("u-3", _knowledge_hit(12))],
     )
-    payload = data.to_dict()
+    payload = cast("dict[str, Any]", data.to_dict())
 
     assert set(payload) == {
         "schema",
@@ -194,11 +203,11 @@ def test_exact_closed_shape_and_provenance() -> None:
     assert facts["max_favorability_delta"] == 3
 
 
-def test_recent_is_same_group_trigger_free_and_ten_message_bounded() -> None:
+def test_recent_is_same_group_trigger_free_and_fifty_message_bounded() -> None:
     current = _message(0, group_id="g-1")
     recent = [
         _message(index, group_id="g-1" if index != 2 else "g-2")
-        for index in range(1, 13)
+        for index in range(1, 61)
     ]
     recent.insert(4, current)
     data = data_module.build_chat_task_data(
@@ -213,18 +222,10 @@ def test_recent_is_same_group_trigger_free_and_ten_message_bounded() -> None:
         max_favorability_delta=5,
         group_bindings={},
     )
-    payload = data.to_dict()
+    payload = cast("dict[str, Any]", data.to_dict())
+    assert len(payload["recent"]) == 50
     assert [item["message_id"] for item in payload["recent"]] == [
-        "m-3",
-        "m-4",
-        "m-5",
-        "m-6",
-        "m-7",
-        "m-8",
-        "m-9",
-        "m-10",
-        "m-11",
-        "m-12",
+        f"m-{index}" for index in range(11, 61)
     ]
 
 
@@ -241,7 +242,7 @@ def test_synthetic_source_ids_are_explicit_and_platform_ids_are_not_fabricated()
         max_favorability_delta=5,
         group_bindings={},
     )
-    payload = data.to_dict()
+    payload = cast("dict[str, Any]", data.to_dict())
     assert payload["memory"][0]["source_id"] == "memory:index:0"
     assert payload["knowledge"][0]["source_id"] == "knowledge:index:0"
     assert payload["uid_knowledge"][0]["source_id"] == "knowledge:uid:u-9:index:0"
@@ -252,13 +253,13 @@ def test_untrusted_content_is_bounded_to_existing_extraction_limit() -> None:
         memory=[SimpleNamespace(id=1, text="记" * 5_000)],
         knowledge=[SimpleNamespace(id=2, content="知" * 5_000, source="vector")],
     )
-    payload = data.to_dict()
+    payload = cast("dict[str, Any]", data.to_dict())
     assert len(payload["memory"][0]["content"]) <= 4_000
     assert len(payload["knowledge"][0]["content"]) <= 4_000
 
 
 def test_recall_query_uses_current_ten_history_quote_and_budget() -> None:
-    current = _message(0, content="当前问题", user_id="u-0")
+    current = _current(content="当前问题")
     recent = [_message(index) for index in range(1, 13)]
     quote = ReplyContext(
         source_side="assistant",
@@ -285,7 +286,7 @@ def test_recall_query_uses_current_ten_history_quote_and_budget() -> None:
 
 
 def test_recall_query_trims_oldest_history_first_but_keeps_trigger_and_quote_identity() -> None:
-    current = _message(0, content="触发")
+    current = _current(content="触发")
     recent = [_message(index, content=f"历史{index}-" + "长" * 70) for index in range(1, 11)]
     quote = ReplyContext(
         source_side="user",
@@ -310,7 +311,7 @@ def test_recall_query_trims_oldest_history_first_but_keeps_trigger_and_quote_ide
 
 
 def test_empty_trigger_uses_existing_media_marker_and_does_not_skip_history() -> None:
-    current = _message(0, content="   ")
+    current = _current(content="   ")
     query = query_module.build_automatic_recall_query(
         current=current,
         recent=[_message(1, content="唯一历史")],
@@ -321,7 +322,7 @@ def test_empty_trigger_uses_existing_media_marker_and_does_not_skip_history() ->
 
 
 def test_current_trigger_alone_that_cannot_fit_is_a_bounded_validation_failure() -> None:
-    current = _message(0, content="触" * (QUERY_TEXT_BUDGET.max_characters + 1))
+    current = _current(content="触" * (QUERY_TEXT_BUDGET.max_characters + 1))
     with pytest.raises(query_module.RecallQueryBudgetError) as exc_info:
         query_module.build_automatic_recall_query(
             current=current,
@@ -329,3 +330,94 @@ def test_current_trigger_alone_that_cannot_fit_is_a_bounded_validation_failure()
             quote=None,
         )
     assert exc_info.value.code == "recall_query_unfit"
+
+
+def test_recall_excludes_future_rows_after_trigger_timestamp() -> None:
+    current = _current(timestamp=10.0)
+    query = query_module.build_automatic_recall_query(
+        current=current,
+        recent=[
+            _message(1, content="过去", timestamp=9.0),
+            _message(2, content="未来", timestamp=11.0),
+            _message(3, content="同刻", timestamp=10.0),
+        ],
+        quote=None,
+    )
+    assert "过去" in query
+    assert "同刻" in query
+    assert "未来" not in query
+
+
+def test_recall_uses_buffer_precedence_when_trigger_is_present() -> None:
+    current = _current(timestamp=10.0)
+    trigger_copy = _message(0, content="当前消息", timestamp=10.0)
+    query = query_module.build_automatic_recall_query(
+        current=current,
+        recent=[
+            _message(1, content="同刻之前", timestamp=10.0),
+            trigger_copy,
+            _message(2, content="同刻之后", timestamp=10.0),
+            _message(3, content="未来消息", timestamp=12.0),
+        ],
+        quote=None,
+    )
+    assert "同刻之前" in query
+    assert "同刻之后" not in query
+    assert "未来消息" not in query
+
+
+def test_recall_orders_out_of_order_rows_chronologically_and_stably() -> None:
+    current = _current(timestamp=20.0)
+    query = query_module.build_automatic_recall_query(
+        current=current,
+        recent=[
+            _message(1, content="二", timestamp=2.0),
+            _message(2, content="一", timestamp=1.0),
+            _message(3, content="三", timestamp=3.0),
+            _message(4, content="四", timestamp=3.0),
+        ],
+        quote=None,
+    )
+    assert query.index("一") < query.index("二") < query.index("三") < query.index("四")
+
+
+def test_recall_keeps_quote_identity_when_full_quote_body_cannot_fit() -> None:
+    current = _current(content="触" * 250)
+    quote = ReplyContext(
+        source_side="user",
+        message_id="quoted-1",
+        user_id="u-1",
+        user_nickname="用户1",
+        text="引" * 80,
+        image_sources=(),
+        image_count=0,
+        has_visible_image=False,
+    )
+    query = query_module.build_automatic_recall_query(
+        current=current,
+        recent=[],
+        quote=quote,
+    )
+    validate_text_budget(query, label="召回查询", budget=QUERY_TEXT_BUDGET)
+    assert 'message_id="quoted-1"' in query
+    assert "引" * 80 not in query
+
+
+def test_recall_raises_when_mandatory_trigger_and_quote_identity_cannot_fit() -> None:
+    current = _current(content="触" * 400)
+    quote = ReplyContext(
+        source_side="user",
+        message_id="quoted-1",
+        user_id="u-1",
+        user_nickname="用户1",
+        text="引用",
+        image_sources=(),
+        image_count=0,
+        has_visible_image=False,
+    )
+    with pytest.raises(query_module.RecallQueryBudgetError):
+        query_module.build_automatic_recall_query(
+            current=current,
+            recent=[],
+            quote=quote,
+        )

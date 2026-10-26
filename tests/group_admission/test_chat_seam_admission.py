@@ -11,7 +11,7 @@ import asyncio
 import importlib
 import sys
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
@@ -19,6 +19,9 @@ from tests.group_admission.chat_admission_support import (
     ScriptedAdjudicate,
     install_scripted_adjudicate,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable, Mapping
 
 pytestmark = pytest.mark.group_admission_acceptance
 GROUP_ID = 100
@@ -472,10 +475,14 @@ async def test_context_push_rechecks_live_admission_after_buffer_await(
 class _FakeChatHost:
     """Trusted DSH host double: validates through the real Python candidate."""
 
-    def __init__(self, requests: list[object]) -> None:
+    def __init__(self, requests: list[Any]) -> None:
         self.requests = requests
 
-    async def execute(self, request: object, callbacks: dict[str, object]) -> object:
+    async def execute(
+        self,
+        request: Any,
+        callbacks: Mapping[str, Callable[[Any], Awaitable[Any]]],
+    ) -> Any:
         self.requests.append(request)
         final = callbacks["chat.submit_final_response"]
         favor = callbacks["chat.submit_favorability"]
@@ -498,7 +505,7 @@ def _patch_recall_core(
     monkeypatch: pytest.MonkeyPatch,
     *,
     prompt_calls: list[dict[str, Any]] | None = None,
-    generate_calls: list[dict[str, Any]] | None = None,
+    generate_calls: list[Any] | None = None,
     knowledge_search: Any | None = None,
 ) -> None:
     del prompt_calls
@@ -583,7 +590,7 @@ async def test_recall_restricted_blocks_recall(monkeypatch: pytest.MonkeyPatch) 
     scripted.set_sequence("admitted", "restricted")
     install_scripted_adjudicate(monkeypatch, scripted)
     memory = FakeHindsightMemory()
-    generate_calls: list[dict[str, Any]] = []
+    generate_calls: list[Any] = []
     _patch_recall_core(monkeypatch, generate_calls=generate_calls)
 
     result = await _run_recall_core(_recall_handler(memory))
@@ -623,7 +630,7 @@ async def test_recalled_memory_from_restricted_source_usable_in_admitted_group(
         }
     )
     memory = FakeHindsightMemory(response=response)
-    generate_calls: list[dict[str, Any]] = []
+    generate_calls: list[Any] = []
     _patch_recall_core(monkeypatch, generate_calls=generate_calls)
 
     result = await _run_recall_core(_recall_handler(memory))

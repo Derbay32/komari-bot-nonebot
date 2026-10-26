@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import dataclasses
 import inspect
 from importlib import import_module
 from pathlib import Path
@@ -36,6 +37,7 @@ image_reading_session_module = import_module(
 proactive_reservation_module = import_module(
     "komari_bot.plugins.komari_chat.services.proactive_reservation"
 )
+user_data_module = import_module("komari_bot.plugins.user_data")
 ReservationDenied = proactive_reservation_module.ReservationDenied
 ReservationLostError = proactive_reservation_module.ReservationLostError
 
@@ -68,6 +70,10 @@ def _attempt_recall_session(handler: object) -> FakeRecallSession:
 
 
 
+class _DebugFavorabilityWriteError(AssertionError):
+    """Debug must never reach the user-data favorability write entry."""
+
+
 class _FakeDshChat:
     """Capture the handler-to-DSH seam without running a model."""
 
@@ -78,12 +84,14 @@ class _FakeDshChat:
         delta: int | None = 1,
         reason: str | None = "测试",
         error: Exception | None = None,
+        image_failure_summary: object | None = None,
     ) -> None:
         self.content = content
         self.delta = delta
         self.reason = reason
         self.error = error
-        self.calls: list[dict[str, object]] = []
+        self.image_failure_summary = image_failure_summary
+        self.calls: list[dict[str, Any]] = []
 
     async def generate(self, **kwargs: object) -> object:
         self.calls.append(kwargs)
@@ -93,6 +101,7 @@ class _FakeDshChat:
             content=self.content,
             favorability_delta=self.delta,
             favorability_reason=self.reason,
+            image_failure_summary=self.image_failure_summary,
         )
 
 class _FakeEvent:
@@ -149,6 +158,8 @@ def _chat_memory_stub(**overrides: object) -> SimpleNamespace:
         "context_max_estimated_tokens": 6_000,
         "summary_max_buffer_size": 500,
         "memory_search_limit": 3,
+        "knowledge_enabled": False,
+        "knowledge_limit": 3,
         "bot_nickname": "小鞠",
         "memory_agent_lock_timeout_seconds": 5,
         "global_interaction_enabled": True,
@@ -969,43 +980,12 @@ class _FakeProactiveReservation:
         return lease
 
 
-class _FakeUserDataForDebug:
-    """记录 adjust 调用，验证 debug 路径不调 adjust。"""
-
-    def __init__(self) -> None:
-        self.adjust_calls: list[dict[str, object]] = []
-        self.favorability_calls: list[str] = []
-
-    def get_config(self) -> SimpleNamespace:
-        return SimpleNamespace(max_favorability_delta_per_reply=5)
-
-    async def get_user_favorability(self, user_id: str) -> SimpleNamespace:
-        self.favorability_calls.append(user_id)
-        return SimpleNamespace(
-            user_id=user_id,
-            favorability=0,
-            stage_index=1,
-            stage_name="疏离戒备",
-            stage_prompt="保持距离",
-            updated_at="2026-01-01T00:00:00+00:00",
-        )
-
-    async def adjust_user_favorability(
-        self, user_id: str, delta: int
-    ) -> SimpleNamespace:
-        self.adjust_calls.append({"user_id": user_id, "delta": delta})
-        return SimpleNamespace(
-            user_id=user_id, before=0, delta=delta, after=delta, stage_index=1
-        )
-
-
 def test_generate_debug_reply_skips_all_side_effects(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """验证 debug reply 路径不触发 Redis push、好感度 adjust、互动写入、冷却/频控。"""
     redis = _FakeRedisForDebug()
     memory = FakeHindsightMemory()
-    fake_user_data = _FakeUserDataForDebug()
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
     )
@@ -1015,6 +995,13 @@ def test_generate_debug_reply_skips_all_side_effects(
         content="debug测试回复",
         delta=1,
         reason="debug测试",
+    )
+
+    async def _forbidden_adjust(*_args: object, **_kwargs: object) -> object:
+        raise _DebugFavorabilityWriteError
+
+    monkeypatch.setattr(
+        user_data_module, "adjust_user_favorability", _forbidden_adjust
     )
 
     # 注入必要的全局配置
@@ -1057,9 +1044,84 @@ def test_generate_debug_reply_skips_all_side_effects(
     assert redis.pushed_global_interactions == []  # 没有写互动历史
     # debug 路径不触达预占 module（冷却/频控零副作用）：本测试未布线
     # proactive_reservation，任何预占触达都会以 AttributeError 红灯
-    assert fake_user_data.adjust_calls == []  # 没有调好感度 adjust
     assert memory.recall_calls == []  # fake service owns recall in this seam test
 
+
+
+def test_generate_debug_reply_projects_partial_image_summary_without_effects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Successful debug keeps only the safe summary and performs no effect."""
+    redis = _FakeRedisForDebug()
+    memory = FakeHindsightMemory()
+    summary = image_reading_session_module.ImageFailureSummary(
+        mode="native",
+        all_images_unavailable=False,
+        total_images=2,
+        attempted_images=2,
+        failed_images=1,
+        error_types=("image_unavailable",),
+        stages=("download",),
+    )
+    handler = message_handler_module.MessageHandler.__new__(
+        message_handler_module.MessageHandler
+    )
+    handler.redis = redis
+    handler.hindsight_memory = memory
+    handler.dsh_chat = _FakeDshChat(
+        content="debug附图回复",
+        delta=0,
+        reason="无变化",
+        image_failure_summary=summary,
+    )
+    _patch_both_configs(monkeypatch, lambda: _chat_memory_stub())
+
+    async def _forbidden_adjust(*_args: object, **_kwargs: object) -> object:
+        raise _DebugFavorabilityWriteError
+
+    monkeypatch.setattr(
+        user_data_module, "adjust_user_favorability", _forbidden_adjust
+    )
+
+    def _forbidden_notifier(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("debug must not construct the notifier")  # noqa: TRY003
+
+    monkeypatch.setattr(
+        message_handler_module, "GroupTaskFailureNotifier", _forbidden_notifier
+    )
+
+    async def _forbidden_notify(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("debug must not notify")  # noqa: TRY003
+
+    monkeypatch.setattr(handler, "_notify_image_failure_summary", _forbidden_notify)
+
+    async def _forbidden_summary_adjust(
+        *_args: object, **_kwargs: object
+    ) -> object:
+        raise _DebugFavorabilityWriteError
+
+    monkeypatch.setattr(
+        user_data_module, "adjust_user_favorability", _forbidden_summary_adjust
+    )
+
+    result = asyncio.run(
+        handler.generate_debug_reply(
+            group_id="debug-group-summary",
+            user_id="user-debug-summary",
+            user_nickname="图片用户",
+            content="debug 成功摘要",
+        )
+    )
+
+    assert result.reply == "debug附图回复"
+    assert result.image_failure_summary is summary
+    rendered = dataclasses.asdict(summary)
+    assert "image_unavailable" in str(rendered)
+    assert "http" not in str(rendered)
+    assert "base64" not in str(rendered)
+    assert redis.pushed_messages == []
+    assert redis.pushed_global_interactions == []
+    assert memory.retain_calls == []
 
 def test_generate_debug_reply_uses_explicit_request_trace_id(
     monkeypatch: pytest.MonkeyPatch,

@@ -40,7 +40,7 @@ class FavorabilityProfile(Protocol):
     stage_prompt: str
 
 
-MAX_RECENT_MESSAGES = 10
+MAX_RECENT_MESSAGES = 50
 MAX_UNTRUSTED_CONTENT_CHARS = 4_000
 _UNTRUSTED_CONTENT_BUDGET = TextBudget(
     max_characters=MAX_UNTRUSTED_CONTENT_CHARS,

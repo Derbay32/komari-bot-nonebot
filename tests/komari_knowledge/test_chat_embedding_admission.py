@@ -19,6 +19,9 @@ from typing import TYPE_CHECKING, Any, cast
 import pytest
 
 from komari_bot.plugins import embedding_provider
+from komari_bot.plugins.komari_chat.services.dsh_chat_service import (
+    ChatSubmissionAdmissionError,
+)
 from komari_bot.plugins.komari_knowledge import engine as engine_module
 from komari_bot.plugins.komari_knowledge.engine import KnowledgeEngine
 from tests.group_admission.chat_admission_support import (
@@ -412,9 +415,15 @@ async def _run_chat_knowledge_turn(
 
     monkeypatch.setattr(FakeRecallSession, "recall", _recall)
     memory = FakeHindsightMemory()
-    result = await seam._run_recall_core(seam._recall_handler(memory))
+    submission_error: ChatSubmissionAdmissionError | None = None
+    try:
+        result = await seam._run_recall_core(seam._recall_handler(memory))
+    except ChatSubmissionAdmissionError as exc:
+        result = None
+        submission_error = exc
     return SimpleNamespace(
         result=result,
+        submission_error=submission_error,
         generate_calls=generate_calls,
         embedding_calls=embedding_calls,
         pool=pool,
@@ -437,7 +446,8 @@ async def test_chat_knowledge_after_recall_loss_never_embeds(
     assert "你好" in run.memory.recall_calls[0]
     assert run.embedding_calls == []
     assert run.pool.vector_queries == []
-    assert run.result.content == "ok"
+    assert run.result is None
+    assert run.submission_error is not None
     task_data = run.generate_calls[0].task_data
     assert task_data["knowledge"] == []
 

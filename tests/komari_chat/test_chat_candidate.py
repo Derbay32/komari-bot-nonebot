@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 from importlib import import_module
+from typing import TYPE_CHECKING
 
 import pytest
+
+if TYPE_CHECKING:
+    from komari_bot.plugins.komari_chat.services.chat_candidate import ChatCandidate
 
 candidate_module = import_module(
     "komari_bot.plugins.komari_chat.services.chat_candidate"
 )
 
 
-def _candidate(*, cap: int = 5) -> object:
+def _candidate(*, cap: int = 5) -> ChatCandidate:
     return candidate_module.ChatCandidate(max_favorability_delta=cap)
 
 

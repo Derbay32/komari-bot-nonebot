@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from komari_bot.agent import AgentTaskError
 from komari_bot.context.redis_store import MessageSchema
 from komari_bot.plugins.komari_chat.services.reply_context import ReplyContext
 from tests.komari_agent.dsh_test_support import (
@@ -329,3 +330,91 @@ async def test_real_dsh_debug_uses_same_preset_without_side_effects(
     assert redis.pushed == []
     assert memory.retain_calls == []
     assert session.target_fingerprint
+
+
+async def _run_service_until_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    responses: tuple[ToolCallResponse, ...],
+    allow_admission_checks: int,
+) -> tuple[AgentTaskError, FakeHindsightMemory, int]:
+    decisions = {"calls": 0}
+
+    def _admission(**_kwargs: object) -> bool:
+        decisions["calls"] += 1
+        return decisions["calls"] <= allow_admission_checks
+
+    monkeypatch.setattr(service_module, "effect_business_admitted", _admission)
+    monkeypatch.setattr(
+        service_module,
+        "_user_data_config",
+        lambda: SimpleNamespace(max_favorability_delta_per_reply=3),
+    )
+    memory = FakeHindsightMemory(response=recall_response())
+    session = fake_recall_session(memory)
+    async with running_dsh(
+        tmp_path,
+        responses=responses,
+        entry_script=MAIN_HOST_SCRIPT,
+        prompt="冻结的准入角色提示词。",
+    ) as (host, server):
+        service = service_module.DshChatService(
+            host_getter=lambda: host,
+            knowledge_search=_empty_search,
+            uid_search=_empty_uid,
+            favorability_getter=_favorability,
+            group_bindings_getter=_group_bindings,
+        )
+        with pytest.raises(AgentTaskError) as exc_info:
+            await service.generate(
+                message=_message(0, content="准入提交测试"),
+                recent_messages=[],
+                reply_context=None,
+                recall_session=session,
+                request_trace_id="chat-admission-submit",
+                config=_config(),
+            )
+        request_count = len(server.requests)
+    assert memory.retain_calls == []
+    return exc_info.value, memory, request_count
+
+
+async def test_real_submission_admission_revoked_before_first_tool_is_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    error, memory, request_count = await _run_service_until_terminal(
+        tmp_path,
+        monkeypatch,
+        responses=(
+            ToolCallResponse("final_response", {"content": "不应完成"}),
+        ),
+        allow_admission_checks=3,
+    )
+
+    assert error.code == "callback_failed"
+    assert len(memory.recall_calls) == 1
+    assert request_count == 1
+
+
+async def test_real_submission_admission_revoked_between_tools_is_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    error, memory, request_count = await _run_service_until_terminal(
+        tmp_path,
+        monkeypatch,
+        responses=(
+            ToolCallResponse("final_response", {"content": "先提交"}),
+            ToolCallResponse(
+                "record_favorability_delta",
+                {"delta": 1, "reason": "后提交"},
+            ),
+        ),
+        allow_admission_checks=5,
+    )
+
+    assert error.code == "callback_failed"
+    assert len(memory.recall_calls) == 1
+    assert request_count == 2

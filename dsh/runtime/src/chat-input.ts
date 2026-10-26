@@ -251,7 +251,7 @@ export function decodeChatTaskData(value: unknown): ChatTaskData {
   exactKeys(value, CHAT_TASK_KEYS)
   if (value.schema !== 1) invalid()
   const recentValue = value.recent
-  if (!Array.isArray(recentValue) || recentValue.length > 10) invalid()
+  if (!Array.isArray(recentValue) || recentValue.length > 50) invalid()
   const current = decodeMessage(value.current)
   if (current.trust_level !== 'untrusted') invalid()
   return {

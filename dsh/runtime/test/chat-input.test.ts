@@ -72,8 +72,10 @@ test('closed decoder rejects extra, missing, wrong-source, and oversized fields'
   ;(wrongSource.current as Record<string, unknown>).source_type = 'memory'
   assert.throws(() => decodeChatTaskData(wrongSource), /invalid_chat_task_data/)
 
-  const eleven = minimalChatTaskData({ recent: Array.from({ length: 11 }, (_, index) => `m${index}`) })
-  assert.throws(() => decodeChatTaskData(eleven), /invalid_chat_task_data/)
+  const fiftyOne = minimalChatTaskData({ recent: Array.from({ length: 51 }, (_, index) => `m${index}`) })
+  assert.throws(() => decodeChatTaskData(fiftyOne), /invalid_chat_task_data/)
+  const fifty = minimalChatTaskData({ recent: Array.from({ length: 50 }, (_, index) => `m${index}`) })
+  assert.equal(decodeChatTaskData(fifty).recent.length, 50)
 
   const imageUrl = minimalChatTaskData()
   ;(imageUrl.quote as unknown) = {
