@@ -97,6 +97,8 @@ interface LiveTask {
   readonly model: string
   readonly reasoningEffort: ReasoningEffortId | undefined
   readonly prompt: string
+  /** Deeply frozen, task-owned copy of the decoded request data. */
+  readonly taskData: { readonly [key: string]: JsonValue }
   readonly controller: AbortController
   readonly admissionAttempts: Map<AdmissionPurpose, number>
   cancelled: boolean
@@ -105,6 +107,11 @@ interface LiveTask {
   terminalFailure: TaskPolicyFailure | undefined
   policy: SharedTaskPolicy | undefined
   handle: AgentHandle | undefined
+}
+
+function snapshotTaskData(data: { readonly [key: string]: JsonValue }): { readonly [key: string]: JsonValue } {
+  assertJsonValue(data)
+  return deepFreezeJson(JSON.parse(JSON.stringify(data)) as { [key: string]: JsonValue })
 }
 
 function timeoutSentinel<T>(promise: Promise<T>, ms: number): Promise<T | typeof TIMEOUT> {
@@ -181,6 +188,14 @@ export default class KomariAgentRuntime extends Service {
 
   listLiveTaskIds(): readonly string[] {
     return [...this.liveByRequest.keys()]
+  }
+
+  /**
+   * Read the task-owned frozen data snapshot for the actual Agent session.
+   * This is a narrow trusted preset seam, never a model-visible tool/callback.
+   */
+  getTaskData(agent: Agent): { readonly [key: string]: JsonValue } | undefined {
+    return this.taskForAgent(agent)?.taskData
   }
 
   /**
@@ -306,7 +321,7 @@ export default class KomariAgentRuntime extends Service {
         throw new TaskFailure('cancelled')
       }
       handle.agent.followup(createUserMessage({
-        content: [{ type: 'text', text: this.renderTaskInput(request) }],
+        content: [{ type: 'text', text: this.renderTaskInput(live.kind, live.taskData) }],
         source: { kind: 'user' },
       }))
       // A live task is bounded by its model/tool budgets, not the shutdown
@@ -383,6 +398,7 @@ export default class KomariAgentRuntime extends Service {
       model,
       reasoningEffort,
       prompt,
+      taskData: snapshotTaskData(request.task_data),
       controller: new AbortController(),
       admissionAttempts: new Map(),
       cancelled: false,
@@ -405,17 +421,20 @@ export default class KomariAgentRuntime extends Service {
       && (binding.prompt?.trim().length ?? 0) > 0
   }
 
-  private renderTaskInput(request: TaskRequestPayload): string {
-    if (request.kind === 'chat') {
+  private renderTaskInput(
+    kind: TaskKind,
+    taskData: { readonly [key: string]: JsonValue },
+  ): string {
+    if (kind === 'chat') {
       try {
-        return renderChatTaskInput(decodeChatTaskData(request.task_data))
+        return renderChatTaskInput(decodeChatTaskData(taskData))
       } catch {
         throw new TaskFailure('invalid_task_data')
       }
     }
     return JSON.stringify({
-      task_kind: request.kind,
-      task_data: request.task_data,
+      task_kind: kind,
+      task_data: taskData,
     })
   }
 

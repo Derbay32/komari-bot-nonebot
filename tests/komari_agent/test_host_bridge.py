@@ -334,8 +334,12 @@ async def test_production_composition_exposes_only_chat_preset_tools(tmp_path: P
         assert exc_info.value.code == "budget_exhausted"
         assert len(server.requests) == 1
         assert set(server.requests[0].tool_names) == {
+            "fetch_page",
             "final_response",
+            "recall_memory",
             "record_favorability_delta",
+            "search_knowledge",
+            "search_web",
         }
         assert len(server.requests[0].user_texts) == 1
         assert "<komari_chat_task" in server.requests[0].user_texts[0]

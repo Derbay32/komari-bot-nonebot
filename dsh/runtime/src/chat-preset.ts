@@ -11,7 +11,8 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-loop'
 import type {} from '@deepseek-ai/dsh-settings'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { CHAT_SAFETY_BOUNDARY } from './chat-input.js'
+import { CHAT_SAFETY_BOUNDARY, decodeChatTaskData } from './chat-input.js'
+import { registerChatQueryTools } from './chat-query-tools.js'
 import { isPlainObject, type JsonValue } from './protocol.js'
 
 export const name = 'komari-chat-preset'
@@ -39,6 +40,7 @@ interface ChatPresetState {
   missing: readonly Requirement[]
   completed: boolean
   cleanupRegistered: boolean
+  queryToolsRegistered: boolean
 }
 
 const states = new Map<string, ChatPresetState>()
@@ -103,7 +105,12 @@ function ensureState(ctx: Context, agent: Agent): ChatPresetState {
   const id = String(agent.id)
   let state = states.get(id)
   if (state === undefined) {
-    state = { missing: [...REQUIRED], completed: false, cleanupRegistered: false }
+    state = {
+      missing: [...REQUIRED],
+      completed: false,
+      cleanupRegistered: false,
+      queryToolsRegistered: false,
+    }
     states.set(id, state)
   }
   if (!state.cleanupRegistered) {
@@ -117,6 +124,20 @@ function ensureState(ctx: Context, agent: Agent): ChatPresetState {
 
 function registerMissingRequirements(ctx: Context, agent: Agent, state: ChatPresetState): void {
   ctx.komariAgent.registerCompletionCheck(agent, () => state.missing)
+}
+
+/**
+ * Read the frozen task snapshot through the trusted agent/session seam and
+ * declare only the query capability subset this task froze. Registration is
+ * idempotent across the creation event and later pre-step events.
+ */
+function registerFrozenQueryTools(ctx: Context, agent: Agent, state: ChatPresetState): void {
+  if (state.queryToolsRegistered) return
+  const rawTaskData = ctx.komariAgent.getTaskData(agent)
+  if (rawTaskData === undefined) throw new Error('task_data_unavailable')
+  const taskData = decodeChatTaskData(rawTaskData)
+  registerChatQueryTools(ctx, agent, taskData.capabilities)
+  state.queryToolsRegistered = true
 }
 
 function terminalCallbackFailure(ctx: Context, agent: Agent): void {
@@ -135,11 +156,26 @@ export function apply(ctx: Context): void {
     interpolate: false,
   })
 
+  // Register the frozen query-tool capabilities into this agent's scope before
+  // its first request. This event is awaited before agent creation resolves,
+  // which is earlier than the first assembly/pre-step.
+  ctx.on('agent/created', (payload) => {
+    try {
+      const state = ensureState(ctx, payload.agent)
+      registerFrozenQueryTools(ctx, payload.agent, state)
+    } catch (error) {
+      terminalCallbackFailure(ctx, payload.agent)
+      throw error
+    }
+    return undefined
+  })
+
   // Register before the first model step so a bare-text turn can also be
   // steered. Tool execution refreshes the same registration.
   ctx.on('agent/pre-step', async (payload, next) => {
     try {
       const state = ensureState(ctx, payload.agent)
+      registerFrozenQueryTools(ctx, payload.agent, state)
       registerMissingRequirements(ctx, payload.agent, state)
     } catch {
       terminalCallbackFailure(ctx, payload.agent)

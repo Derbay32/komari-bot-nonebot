@@ -418,6 +418,11 @@ def chat_task_data(text: str = "hello") -> dict[str, Any]:
         "memory": [],
         "knowledge": [],
         "uid_knowledge": [],
+        "capabilities": {
+            "knowledge": True,
+            "search": True,
+            "fetch": True,
+        },
         "facts": {
             "bot_nickname": "Fixture",
             "current_favorability": {

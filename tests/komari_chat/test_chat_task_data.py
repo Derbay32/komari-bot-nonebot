@@ -94,6 +94,11 @@ def _build(
         bot_nickname="小鞠",
         max_favorability_delta=3,
         group_bindings={"u-0": "管理员", "u-1": "旅人", "u-4": "同伴"},
+        capabilities=data_module.ChatQueryCapabilities(
+            knowledge=True,
+            search=True,
+            fetch=False,
+        ),
     )
 
 
@@ -132,8 +137,14 @@ def test_exact_closed_shape_and_provenance() -> None:
         "knowledge",
         "uid_knowledge",
         "facts",
+        "capabilities",
     }
     assert payload["schema"] == 1
+    assert payload["capabilities"] == {
+        "knowledge": True,
+        "search": True,
+        "fetch": False,
+    }
     assert payload["current"] == {
         "source_type": "conversation_history",
         "source_id": "m-0",
@@ -221,6 +232,11 @@ def test_recent_is_same_group_trigger_free_and_fifty_message_bounded() -> None:
         bot_nickname="小鞠",
         max_favorability_delta=5,
         group_bindings={},
+        capabilities=data_module.ChatQueryCapabilities(
+            knowledge=False,
+            search=False,
+            fetch=False,
+        ),
     )
     payload = cast("dict[str, Any]", data.to_dict())
     assert len(payload["recent"]) == 50
@@ -241,6 +257,11 @@ def test_synthetic_source_ids_are_explicit_and_platform_ids_are_not_fabricated()
         bot_nickname="小鞠",
         max_favorability_delta=5,
         group_bindings={},
+        capabilities=data_module.ChatQueryCapabilities(
+            knowledge=False,
+            search=False,
+            fetch=False,
+        ),
     )
     payload = cast("dict[str, Any]", data.to_dict())
     assert payload["memory"][0]["source_id"] == "memory:index:0"

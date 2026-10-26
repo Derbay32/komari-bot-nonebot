@@ -17,7 +17,8 @@
     "./package.json": "./package.json",
     "./race-fixture": "./dist/race-fixture.js",
     "./protocol": "./dist/protocol.js",
-    "./test-main": "./dist/test-main.js"
+    "./test-main": "./dist/test-main.js",
+    "./task-data-probe": "./dist/task-data-probe.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json && tsc -p tsconfig.test.json",
