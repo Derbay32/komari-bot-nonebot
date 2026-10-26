@@ -97,6 +97,37 @@ async def test_task_completes_through_business_callback(tmp_path: Path) -> None:
     }
 
 
+async def test_running_task_is_not_limited_by_shutdown_drain_timeout(tmp_path: Path) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def held_callback(request: AgentCallbackRequest) -> JsonValue:
+        started.set()
+        await release.wait()
+        return {"ok": True, "value": request.data["value"]}
+
+    async with running_dsh(
+        tmp_path,
+        responses=(ToolCallResponse("fixture_complete", {"value": "slow-but-valid"}),),
+    ) as (host, _server):
+        task = asyncio.create_task(host.execute(_task(), _callbacks([], fixture=held_callback)))
+        try:
+            await asyncio.wait_for(started.wait(), timeout=10)
+            # The shutdown drain deadline must not become a task execution deadline.
+            # Keep the real callback behind a barrier beyond that ten-second window.
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(task), timeout=11)
+            release.set()
+            result = await task
+            assert result.result == {"ok": True, "value": "slow-but-valid"}
+        finally:
+            release.set()
+            if not task.done():
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+
+
 async def test_second_task_does_not_inherit_first_task_history(tmp_path: Path) -> None:
     responses = (
         ToolCallResponse("fixture_complete", {"value": "one"}),

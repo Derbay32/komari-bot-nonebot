@@ -40,7 +40,6 @@ export const FIXED_RETRY_POLICY: RetryPolicyConfig = Object.freeze({
   maxRetries: 2,
   retryableCodes: [...FIXED_RETRY_CODES],
 })
-const TASK_DRAIN_TIMEOUT_MS = 10_000
 const HANDLE_DISPOSE_TIMEOUT_MS = 10_000
 
 export interface AgentBinding {
@@ -134,6 +133,7 @@ export default class KomariAgentRuntime extends Service {
   private readonly liveBySession = new Map<SessionId, LiveTask>()
   private readonly liveByRequest = new Map<string, LiveTask>()
   private transport: CallbackTransport | undefined
+  private releaseFailed = false
 
   constructor(
     ctx: Context,
@@ -230,9 +230,9 @@ export default class KomariAgentRuntime extends Service {
   }
 
   async runTask(requestId: string, request: TaskRequestPayload): Promise<{ readonly [key: string]: JsonValue }> {
+    if (this.releaseFailed) throw new TaskFailure('host_closed')
     const lease = await this.gate.enterTask()
     let task: LiveTask | undefined
-    let primaryError: unknown
     try {
       const live: LiveTask = await this.createLiveTask(requestId, request)
       task = live
@@ -265,22 +265,29 @@ export default class KomariAgentRuntime extends Service {
         content: [{ type: 'text', text: this.renderTaskInput(request) }],
         source: { kind: 'user' },
       }))
-      const settled = await timeoutSentinel(handle.agent.whenIdle(), TASK_DRAIN_TIMEOUT_MS)
-      if (settled === TIMEOUT) throw new TaskFailure('drain_timeout')
+      // A live task is bounded by its model/tool budgets, not the shutdown
+      // drain window. Cancellation and process shutdown own their deadlines.
+      await handle.agent.whenIdle()
       if (live.cancelled) throw new TaskFailure('cancelled')
       if (live.result !== undefined) return live.result
       if (live.failureCode !== undefined) throw new TaskFailure('agent_error', live.failureCode)
       throw new TaskFailure('incomplete_result')
     } catch (error) {
-      primaryError = error
       throw this.translateFailure(error)
     } finally {
       let releaseFailure: TaskFailure | undefined
-      if (task !== undefined) {
-        releaseFailure = await this.disposeTask(task)
+      try {
+        if (task !== undefined) releaseFailure = await this.disposeTask(task)
+      } finally {
+        lease.release()
       }
-      lease.release()
-      if (releaseFailure !== undefined && primaryError === undefined) throw releaseFailure
+      if (releaseFailure !== undefined) {
+        this.releaseFailed = true
+        this.cancelAll()
+        // Cleanup failure takes precedence: the process must be retired,
+        // including when generation had already failed or been cancelled.
+        throw releaseFailure
+      }
     }
   }
 
@@ -450,26 +457,20 @@ export default class KomariAgentRuntime extends Service {
   private async disposeTask(task: LiveTask): Promise<TaskFailure | undefined> {
     task.controller.abort('task finished')
     let failure: TaskFailure | undefined
-    if (task.handle !== undefined) {
-      const disposed = await timeoutSentinel(task.handle.dispose(), HANDLE_DISPOSE_TIMEOUT_MS)
-      if (disposed === TIMEOUT) {
-        failure = new TaskFailure('release_failed')
-      } else {
-        try {
-          await disposed
-        } catch {
-          failure = new TaskFailure('release_failed')
-        }
+    try {
+      if (task.handle !== undefined) {
+        const disposed = await timeoutSentinel(task.handle.dispose(), HANDLE_DISPOSE_TIMEOUT_MS)
+        if (disposed === TIMEOUT) failure = new TaskFailure('release_failed')
       }
-    }
-    if (failure === undefined && this.ctx.agents.get(task.sessionId) !== undefined) {
+      if (this.ctx.agents.get(task.sessionId) !== undefined || this.ctx.sessions.get(task.sessionId) !== undefined) {
+        failure = new TaskFailure('release_failed')
+      }
+    } catch {
       failure = new TaskFailure('release_failed')
+    } finally {
+      this.liveBySession.delete(task.sessionId)
+      this.liveByRequest.delete(task.requestId)
     }
-    if (failure === undefined && this.ctx.sessions.get(task.sessionId) !== undefined) {
-      failure = new TaskFailure('release_failed')
-    }
-    this.liveBySession.delete(task.sessionId)
-    this.liveByRequest.delete(task.requestId)
     return failure
   }
 

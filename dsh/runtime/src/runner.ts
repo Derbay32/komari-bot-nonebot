@@ -254,6 +254,14 @@ export async function runAgentProcess(argv: readonly string[], options: RunOptio
         } catch {
           // The parent is gone; the reader loop will fail on the next frame.
         }
+        if (failure.code === 'release_failed') {
+          // A possibly retained official executor must not coexist with new
+          // tasks. Retire this process; Python observes exit and never restarts
+          // the failed session. Force exit if official shutdown also stalls.
+          const deadline = setTimeout(() => process.exit(1), SHUTDOWN_DRAIN_MS)
+          deadline.unref()
+          void closeRuntime().catch(() => undefined).finally(() => process.exit(1))
+        }
       } finally {
         taskPromises.delete(frame.id)
         recentlyCompleted.push(frame.id)
