@@ -447,3 +447,16 @@ async def test_prompt_write_audits_without_prompt_text(app: App) -> None:
     assert _PROMPT not in serialized
     assert _PROVIDER_URL not in serialized
     assert any(event.action == "dsh.prompt.put" for event in audit_events)
+
+
+async def test_unquoted_if_match_is_rejected_before_control(app: App) -> None:
+    client = _FakeClient()
+    async with app.test_server(asgi=cast("Any", _app(client))) as ctx:
+        response = await ctx.get_client().put(
+            f"{API_PREFIX}/providers/fixture",
+            headers={**_WRITE_HEADERS, "If-Match": "etag-1"},
+            json=_write_body(),
+        )
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "invalid_request"
+    assert client.calls == []

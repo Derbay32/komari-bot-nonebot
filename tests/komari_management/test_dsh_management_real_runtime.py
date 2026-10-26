@@ -9,6 +9,7 @@ import os
 import signal
 from typing import TYPE_CHECKING, Any, cast
 
+import pytest
 from fastapi import FastAPI
 
 from komari_bot.agent import (
@@ -588,5 +589,66 @@ async def test_child_exit_is_reported_as_a_safe_503(
             assert failed.status_code == 503
             assert failed.json()["detail"]["code"] == "unavailable"
             assert _SECRET not in failed.text
+    finally:
+        await host.close()
+
+
+@pytest.mark.parametrize("case", ["duplicate_models", "off_only", "empty_off"])
+async def test_invalid_provider_semantics_are_422_without_write(
+    app: App, tmp_path: Path, case: str,
+) -> None:
+    host = host_for(tmp_path / "data")
+    await host.start()
+    try:
+        async with app.test_server(asgi=cast("Any", _app(host))) as ctx:
+            http = ctx.get_client()
+            before = await http.get(f"{API_PREFIX}/providers", headers=_AUTH)
+            body = _provider_body("http://127.0.0.1:9/v1")
+            match case:
+                case "duplicate_models":
+                    body["models"].append(dict(body["models"][0]))
+                case "off_only":
+                    body["models"][0]["reasoningEfforts"] = {"off": None}
+                case "empty_off":
+                    body["models"][0]["reasoningEfforts"] = {"off": "", "low": "low"}
+            response = await http.put(
+                f"{API_PREFIX}/providers/fixture",
+                headers=_write_headers(before.json()["etag"], f"invalid-{case}"),
+                json=body,
+            )
+            assert response.status_code == 422
+            assert response.json()["detail"]["code"] == "invalid_provider"
+            after = await http.get(f"{API_PREFIX}/providers", headers=_AUTH)
+            assert after.json() == before.json()
+            valid = await http.put(
+                f"{API_PREFIX}/providers/fixture",
+                headers=_write_headers(before.json()["etag"], "valid-after-invalid"),
+                json=_provider_body("http://127.0.0.1:9/v1"),
+            )
+            assert valid.status_code == 200
+    finally:
+        await host.close()
+
+
+async def test_inherited_object_name_is_not_a_configured_provider(
+    app: App, tmp_path: Path,
+) -> None:
+    host = host_for(tmp_path / "data")
+    await host.start()
+    try:
+        async with app.test_server(asgi=cast("Any", _app(host))) as ctx:
+            http = ctx.get_client()
+            before = await http.get(f"{API_PREFIX}/providers", headers=_AUTH)
+            missing = await http.get(f"{API_PREFIX}/providers/constructor", headers=_AUTH)
+            assert missing.status_code == 404
+            assert missing.json()["detail"]["code"] == "not_found"
+            deletion = await http.delete(
+                f"{API_PREFIX}/providers/constructor",
+                headers=_write_headers(before.json()["etag"], "missing-constructor"),
+            )
+            assert deletion.status_code == 404
+            assert deletion.json()["detail"]["code"] == "not_found"
+            after = await http.get(f"{API_PREFIX}/providers", headers=_AUTH)
+            assert after.json() == before.json()
     finally:
         await host.close()

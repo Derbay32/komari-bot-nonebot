@@ -357,10 +357,9 @@ def _parse_if_match(value: str | None) -> str:
     raw = value.strip()
     if raw in {"", "*"} or raw.startswith("W/") or "," in raw:
         raise _invalid("invalid_request")
-    if len(raw) >= 2 and raw[0] == raw[-1] == '"':
-        raw = raw[1:-1]
-    elif '"' in raw:
+    if len(raw) < 2 or raw[0] != '"' or raw[-1] != '"':
         raise _invalid("invalid_request")
+    raw = raw[1:-1]
     if _ETAG_PATTERN.fullmatch(raw) is None:
         raise _invalid("invalid_request")
     return raw

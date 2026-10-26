@@ -175,7 +175,7 @@ function reasoningEfforts(value: unknown, code: ManagementErrorCode): false | Re
   if (value === false) return false
   if (!isPlainObject(value)) throw new ManagementError(code)
   const keys = Object.keys(value)
-  if (keys.length === 0) throw new ManagementError(code)
+  if (!keys.some((level) => level !== 'off')) throw new ManagementError(code)
   const result: Record<string, string | null> = {}
   for (const level of keys) {
     if (!THINKING_LEVELS.includes(level as (typeof THINKING_LEVELS)[number])) {
@@ -183,7 +183,7 @@ function reasoningEfforts(value: unknown, code: ManagementErrorCode): false | Re
     }
     const wire = value[level]
     if (level === 'off') {
-      if (wire !== null && (typeof wire !== 'string' || wire.length > MAX_MODEL_NAME_CHARS)) {
+      if (wire !== null && (typeof wire !== 'string' || wire.length === 0 || wire.length > MAX_MODEL_NAME_CHARS)) {
         throw new ManagementError(code)
       }
       result[level] = wire
@@ -248,11 +248,11 @@ function normalizeProviderProfile(value: unknown): Record<string, unknown> {
   if (!Array.isArray(value.models) || value.models.length === 0 || value.models.length > MAX_PROVIDER_MODELS) {
     throw new ManagementError('invalid_provider')
   }
-  const profile: Record<string, unknown> = {
-    api,
-    baseURL,
-    models: value.models.map(normalizeModel),
+  const models = value.models.map(normalizeModel)
+  if (new Set(models.map((model) => model.id)).size !== models.length) {
+    throw new ManagementError('invalid_provider')
   }
+  const profile: Record<string, unknown> = { api, baseURL, models }
   if (value.displayName !== undefined) {
     profile.displayName = boundedText(value.displayName, 'invalid_provider', MAX_MODEL_NAME_CHARS)
   }
@@ -506,7 +506,7 @@ export class DshManagementService {
     allowedKeys(args, ['provider'], 'invalid_request')
     const provider = providerId(args.provider)
     const descriptor = this.namespace(LLM_SETTINGS_NS)
-    if (!(provider in this.providers(descriptor))) throw new ManagementError('not_found')
+    if (!Object.hasOwn(this.providers(descriptor), provider)) throw new ManagementError('not_found')
     return this.providerResult(descriptor, provider)
   }
 
@@ -549,7 +549,7 @@ export class DshManagementService {
     return await this.runtime.runConnectionMutation(async () => {
       const descriptor = this.namespace(LLM_SETTINGS_NS)
       const providers = this.providers(descriptor)
-      if (!(provider in providers)) throw new ManagementError('not_found')
+      if (!Object.hasOwn(providers, provider)) throw new ManagementError('not_found')
       this.assertEtag(this.providerListResult({ ...descriptor, value: { providers } }).etag as string, expected)
       const agent = objectOrEmpty(this.namespace(AGENT_SETTINGS_NS).value)
       for (const kind of ['chat', 'summary'] as const) {
@@ -562,7 +562,7 @@ export class DshManagementService {
         descriptor.revision,
       )
       const after = this.namespace(LLM_SETTINGS_NS)
-      if (provider in this.providers(after)) throw new ManagementError('unavailable')
+      if (Object.hasOwn(this.providers(after), provider)) throw new ManagementError('unavailable')
       const result: ControlResult = {
         deleted: true,
         etag: this.providerListResult(after).etag as string,
