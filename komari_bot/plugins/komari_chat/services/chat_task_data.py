@@ -15,6 +15,13 @@ from komari_bot.llm.content_budget import (
     truncate_text_to_budget,
 )
 
+from .native_image import (
+    MAX_TRUSTED_AGGREGATE_BYTES,
+    MAX_TRUSTED_IMAGE_BYTES,
+    MAX_TRUSTED_IMAGE_COUNT,
+    ChatImageDescriptor,
+)
+
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
@@ -167,6 +174,7 @@ class ChatTaskData:
     knowledge: tuple[UntrustedData, ...]
     uid_knowledge: tuple[UntrustedData, ...]
     facts: ChatFacts
+    images: tuple[ChatImageDescriptor, ...]
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -178,6 +186,7 @@ class ChatTaskData:
             "knowledge": [item.to_dict() for item in self.knowledge],
             "uid_knowledge": [item.to_dict() for item in self.uid_knowledge],
             "facts": self.facts.to_dict(),
+            "images": [item.to_dict() for item in self.images],
         }
 
 
@@ -206,6 +215,7 @@ def build_chat_task_data(
     bot_nickname: str,
     max_favorability_delta: int,
     group_bindings: Mapping[str, str],
+    images: Sequence[ChatImageDescriptor] = (),
 ) -> ChatTaskData:
     """Build the exact task data from actual source fields without guessing IDs."""
     same_group_recent = [
@@ -241,7 +251,56 @@ def build_chat_task_data(
             max_favorability_delta=max_favorability_delta,
             group_bindings=group_bindings,
         ),
+        images=_validated_images(images),
     )
+
+
+def _validated_images(
+    images: Sequence[ChatImageDescriptor],
+) -> tuple[ChatImageDescriptor, ...]:
+    """Reject a descriptor list that violates the trusted transport shape."""
+    if len(images) > MAX_TRUSTED_IMAGE_COUNT:
+        raise ValueError
+    previous_index = -1
+    previous_origin: Literal["quoted", "current"] | None = None
+    aggregate = 0
+    for image in images:
+        if (
+            isinstance(image.index, bool)
+            or not isinstance(image.index, int)
+            or image.index <= previous_index
+        ):
+            raise ValueError
+        if previous_origin == "current" and image.origin == "quoted":
+            raise ValueError
+        if image.origin not in {"quoted", "current"}:
+            raise ValueError
+        if image.media_type not in {
+            "image/jpeg",
+            "image/png",
+            "image/gif",
+            "image/webp",
+        }:
+            raise ValueError
+        if (
+            isinstance(image.byte_count, bool)
+            or not isinstance(image.byte_count, int)
+            or image.byte_count <= 0
+            or image.byte_count > MAX_TRUSTED_IMAGE_BYTES
+        ):
+            raise ValueError
+        if (
+            len(image.sha256) != 64
+            or image.sha256.lower() != image.sha256
+            or any(character not in "0123456789abcdef" for character in image.sha256)
+        ):
+            raise ValueError
+        aggregate += image.byte_count
+        previous_index = image.index
+        previous_origin = image.origin
+    if aggregate > MAX_TRUSTED_AGGREGATE_BYTES:
+        raise ValueError
+    return tuple(images)
 
 
 def _message_data(message: MessageSchema, *, trust_level: TrustLevel) -> MessageData:

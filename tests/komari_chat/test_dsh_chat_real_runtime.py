@@ -51,6 +51,14 @@ def _config() -> SimpleNamespace:
         agent_max_rounds=4,
         agent_max_tool_calls_per_round=2,
         agent_max_total_tool_calls=4,
+        vision_image_download_max_count=8,
+        vision_image_download_max_bytes=16 * 1024 * 1024,
+        vision_image_download_total_max_bytes=32 * 1024 * 1024,
+        vision_image_download_max_pixels=100_000_000,
+        vision_image_download_concurrency=2,
+        vision_image_download_connect_timeout_seconds=5.0,
+        vision_image_download_read_timeout_seconds=30.0,
+        vision_image_download_total_timeout_seconds=45.0,
     )
 
 

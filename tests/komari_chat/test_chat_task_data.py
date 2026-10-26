@@ -132,8 +132,10 @@ def test_exact_closed_shape_and_provenance() -> None:
         "knowledge",
         "uid_knowledge",
         "facts",
+        "images",
     }
     assert payload["schema"] == 1
+    assert payload["images"] == []
     assert payload["current"] == {
         "source_type": "conversation_history",
         "source_id": "m-0",

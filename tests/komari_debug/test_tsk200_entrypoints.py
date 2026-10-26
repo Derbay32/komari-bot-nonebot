@@ -22,7 +22,7 @@ import pytest
 from nonebot.adapters.onebot.v11 import GroupMessageEvent, Message
 from nonebot.adapters.onebot.v11.event import Sender
 
-from komari_bot.plugins.komari_chat.services.image_reading_session import (
+from komari_bot.plugins.komari_chat.services.image_failure import (
     ImageFailureSummary,
 )
 

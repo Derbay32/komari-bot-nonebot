@@ -7,16 +7,17 @@ import contextlib
 import logging
 import os
 import shutil
+import tempfile
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
 from komari_bot.core.project_paths import DATA_DIR, PROJECT_ROOT
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
-    from pathlib import Path
 
 from .protocol import (
     MAX_FRAME_BYTES,
@@ -53,6 +54,7 @@ from .types import (
     ReadinessState,
     TaskKind,
     json_payload,
+    validate_error_code,
     validate_json_value,
 )
 
@@ -131,6 +133,8 @@ class AgentHost:
         self._tombstones: deque[str] = deque()
         self._tombstone_set: set[str] = set()
         self._exit_handled = False
+        self.attachment_root: Path | None = None
+        self._attachment_root_cleaned = False
 
     @property
     def state(self) -> HostState:
@@ -169,6 +173,7 @@ class AgentHost:
 
             assert node is not None
             self.profile_dir.mkdir(parents=True, exist_ok=True)
+            self._create_attachment_root()
             environment = dict(os.environ)
             environment["DSH_HOME"] = str(self.dsh_home)
             environment["DSH_TELEMETRY_DISABLED"] = "1"
@@ -185,6 +190,8 @@ class AgentHost:
                     str(self.runtime_root / "compose" / "cordis.yml"),
                     "--dsh-home",
                     str(self.dsh_home),
+                    "--attachment-root",
+                    str(self._require_attachment_root()),
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
@@ -193,6 +200,7 @@ class AgentHost:
                     limit=MAX_FRAME_BYTES,
                 )
             except OSError as exc:
+                self._cleanup_attachment_root()
                 raise AgentHostUnavailableError("spawn_failed") from exc
 
             self._reader_task = asyncio.create_task(self._reader_loop(), name="komari-agent-reader")
@@ -316,6 +324,7 @@ class AgentHost:
                 except TimeoutError:
                     await self._terminate_process(process)
             await self._stop_reader_and_stderr()
+            self._cleanup_attachment_root()
             self._fail_pending("host_closed")
             await self._finish_callback_tasks()
             self._process = None
@@ -323,6 +332,7 @@ class AgentHost:
             self._readiness = HostReadiness(state=ReadinessState.UNAVAILABLE, bindings=_UNAVAILABLE_BINDINGS)
 
     async def _startup_failed(self, code: str) -> None:
+        self._cleanup_attachment_root()
         await self._mark_unavailable(code)
         raise AgentHostUnavailableError(code)
 
@@ -471,8 +481,17 @@ class AgentHost:
             except asyncio.CancelledError:
                 self._send_detached_error(frame.callback_id, "cancelled")
                 raise
-            except Exception:
-                await self._send(encode_callback_result_error(frame.callback_id, "callback_failed"))
+            except Exception as exc:
+                # Trusted callback implementations may expose one fixed safe
+                # code. Never relay exception text or an arbitrary attribute.
+                callback_code = getattr(exc, "callback_code", "callback_failed")
+                if not isinstance(callback_code, str) or not validate_error_code(
+                    callback_code
+                ):
+                    callback_code = "callback_failed"
+                await self._send(
+                    encode_callback_result_error(frame.callback_id, callback_code)
+                )
                 return
             try:
                 validate_json_value(result)
@@ -566,6 +585,36 @@ class AgentHost:
         self._state = HostState.UNAVAILABLE if self._state is not HostState.CLOSED else self._state
         self._readiness = HostReadiness(state=ReadinessState.UNAVAILABLE, bindings=_UNAVAILABLE_BINDINGS)
         await self._finish_callback_tasks()
+        self._cleanup_attachment_root()
+
+    def _require_attachment_root(self) -> Path:
+        root = self.attachment_root
+        if root is None:
+            raise AgentHostUnavailableError("attachment_root_missing")
+        return root
+
+    def _create_attachment_root(self) -> None:
+        if self.attachment_root is not None:
+            return
+        root = Path(tempfile.mkdtemp(prefix="komari-attachments-")).resolve()
+        root.chmod(0o700)
+        self.attachment_root = root
+        self._attachment_root_cleaned = False
+
+    def _cleanup_attachment_root(self) -> None:
+        root = self.attachment_root
+        if root is None or self._attachment_root_cleaned:
+            return
+        try:
+            shutil.rmtree(root)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            self._log.warning(
+                "[komari_agent] attachment root cleanup failed: error_type=OSError"
+            )
+            return
+        self._attachment_root_cleaned = True
 
     def _fail_ready(self, code: str) -> None:
         future = self._ready_future
