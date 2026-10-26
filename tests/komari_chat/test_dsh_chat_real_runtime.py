@@ -978,3 +978,144 @@ async def test_real_dsh_over_limit_search_query_is_rejected_and_still_counted(
     assert request_count == 3
     assert web_calls == []
     assert session.recall_calls == [session.recall_calls[0]]
+
+
+async def test_real_dsh_malformed_fetch_url_is_correctable_then_completes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ValueError-shaped URL is a correctable argument error, not callback failure."""
+    responses = (
+        ToolCallResponse("fetch_page", {"urls": ["https://[invalid"]}),
+        ToolCallResponse("final_response", {"content": "纠正后的回复"}),
+        ToolCallResponse(
+            "record_favorability_delta",
+            {"delta": 0, "reason": "纠正后完成"},
+        ),
+    )
+    memory = FakeHindsightMemory(response=recall_response())
+    session = fake_recall_session(memory)
+    fetch_calls: list[list[str]] = []
+
+    async def fetch_page(urls: list[str], *, request_trace_id: str | None = None) -> str:
+        del request_trace_id
+        fetch_calls.append(urls)
+        return "不应发生"
+
+    config = _config()
+    config.knowledge_enabled = False
+    config.agent_max_rounds = 4
+    config.agent_max_tool_calls_per_round = 2
+    config.agent_max_total_tool_calls = 3
+    monkeypatch.setattr(
+        service_module,
+        "_user_data_config",
+        lambda: SimpleNamespace(max_favorability_delta_per_reply=3),
+    )
+
+    async with running_dsh(
+        tmp_path,
+        responses=responses,
+        entry_script=MAIN_HOST_SCRIPT,
+        prompt="冻结的非法 URL 提示词。",
+    ) as (host, server):
+        service = service_module.DshChatService(
+            host_getter=lambda: host,
+            knowledge_search=_empty_search,
+            uid_search=_empty_uid,
+            favorability_getter=_favorability,
+            group_bindings_getter=_group_bindings,
+            search_available_getter=lambda: False,
+            fetch_available_getter=lambda: True,
+            fetch_page=fetch_page,
+        )
+        result = await service.generate(
+            message=_message(0, content="非法 URL"),
+            recent_messages=[],
+            reply_context=None,
+            recall_session=session,
+            request_trace_id="chat-query-bad-url-1",
+            config=config,
+            caller_is_superuser=False,
+            image_urls=None,
+        )
+        request_count = len(server.requests)
+        tool_texts = [
+            str(message.get("content"))
+            for message in server.requests[1].messages
+            if isinstance(message, dict) and message.get("role") == "tool"
+        ]
+
+    assert result.content == "纠正后的回复"
+    assert request_count == 3
+    assert fetch_calls == []
+    assert tool_texts
+    assert "query arguments were rejected" in "\n".join(tool_texts)
+    assert "https://[invalid" not in "\n".join(tool_texts)
+
+
+async def test_real_dsh_malformed_fetch_url_consumes_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The rejected malformed fetch call still consumes one total tool-budget unit."""
+    responses = (
+        ToolCallResponse("fetch_page", {"urls": ["https://[invalid"]}),
+        ToolCallResponse("final_response", {"content": "仅完成正文"}),
+        ToolCallResponse(
+            "record_favorability_delta",
+            {"delta": 0, "reason": "预算应耗尽"},
+        ),
+    )
+    memory = FakeHindsightMemory(response=recall_response())
+    session = fake_recall_session(memory)
+    fetch_calls: list[list[str]] = []
+
+    async def fetch_page(urls: list[str], *, request_trace_id: str | None = None) -> str:
+        del request_trace_id
+        fetch_calls.append(urls)
+        return "不应发生"
+
+    config = _config()
+    config.knowledge_enabled = False
+    config.agent_max_rounds = 4
+    config.agent_max_tool_calls_per_round = 2
+    config.agent_max_total_tool_calls = 2
+    monkeypatch.setattr(
+        service_module,
+        "_user_data_config",
+        lambda: SimpleNamespace(max_favorability_delta_per_reply=3),
+    )
+
+    async with running_dsh(
+        tmp_path,
+        responses=responses,
+        entry_script=MAIN_HOST_SCRIPT,
+        prompt="冻结的非法 URL 预算提示词。",
+    ) as (host, server):
+        service = service_module.DshChatService(
+            host_getter=lambda: host,
+            knowledge_search=_empty_search,
+            uid_search=_empty_uid,
+            favorability_getter=_favorability,
+            group_bindings_getter=_group_bindings,
+            search_available_getter=lambda: False,
+            fetch_available_getter=lambda: True,
+            fetch_page=fetch_page,
+        )
+        with pytest.raises(AgentTaskError) as exc_info:
+            await service.generate(
+                message=_message(0, content="非法 URL 预算"),
+                recent_messages=[],
+                reply_context=None,
+                recall_session=session,
+                request_trace_id="chat-query-bad-url-budget-1",
+                config=config,
+                caller_is_superuser=False,
+                image_urls=None,
+            )
+        request_count = len(server.requests)
+
+    assert exc_info.value.code == "budget_exhausted"
+    assert request_count == 3
+    assert fetch_calls == []

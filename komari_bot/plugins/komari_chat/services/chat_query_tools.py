@@ -257,13 +257,18 @@ def _closed_urls(data: Mapping[str, JsonValue]) -> list[str] | None:
         if not isinstance(raw_url, str):
             return None
         candidate = raw_url.strip()
-        if not candidate:
-            return None
-        parsed = urlparse(candidate)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        if not candidate or not _is_http_url(candidate):
             return None
         urls.append(candidate)
     return urls or None
+
+
+def _is_http_url(candidate: str) -> bool:
+    try:
+        parsed = urlparse(candidate)
+    except ValueError:
+        return False
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
 
 def _source_id(value: object, fallback: str) -> str:

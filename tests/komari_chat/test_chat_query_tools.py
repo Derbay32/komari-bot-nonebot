@@ -155,6 +155,8 @@ async def test_hindsight_failure_stays_an_exception() -> None:
         ("chat.fetch_page", {"urls": []}),
         ("chat.fetch_page", {"urls": ["https://example.com", 1]}),
         ("chat.fetch_page", {"urls": ["not a url"]}),
+        ("chat.fetch_page", {"urls": ["https://[invalid"]}),
+        ("chat.fetch_page", {"urls": ["https://example.com\uff0fevil"]}),
         (
             "chat.fetch_page",
             {"urls": [f"https://example.com/{index}" for index in range(6)]},
