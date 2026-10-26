@@ -9,6 +9,7 @@
 .github
 # 本地 Agent 工作树、原型与执行记录
 .agents/
+.pi/
 
 # Docker 相关
 Dockerfile
