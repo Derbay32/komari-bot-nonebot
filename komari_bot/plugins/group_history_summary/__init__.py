@@ -45,7 +45,6 @@ require("config_manager")
 from komari_bot.plugins import config_manager as config_manager_plugin
 
 require("group_admission")
-require("agent_run_logger")
 
 require("character_binding")
 require("komari_decision")

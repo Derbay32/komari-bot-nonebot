@@ -16,7 +16,6 @@ from typing import Any, cast
 
 import pytest
 
-from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
 from komari_bot.plugins.group_history_summary.config_schema import (
     DynamicConfigSchema,
     LayoutParamsSchema,
@@ -178,8 +177,8 @@ class _ScriptedLlmProvider:
 
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
-        self.planning_queue: list[object] = []
-        self.summary_queue: list[object] = []
+        self.planning_queue: list[Any] = []
+        self.summary_queue: list[Any] = []
 
     def plan_final(self) -> None:
         self.planning_queue.append(_fake_completion(content="sao", finish_reason="stop"))
@@ -192,15 +191,21 @@ class _ScriptedLlmProvider:
     async def generate_messages_completion(self, **kwargs: Any) -> object:
         self.calls.append(kwargs)
         phase = str(kwargs.get("request_phase", ""))
-        if phase == "group_history_summary_final":
-            if not self.summary_queue:
-                raise AssertionError("summary LLM 被调用: 受限时应不进入总结")  # noqa: TRY003
-            return self.summary_queue.pop(0)
         if phase.startswith("group_history_summary_plan_round_"):
             if not self.planning_queue:
                 raise AssertionError("planning LLM 被调用: 受限时应不进入规划")  # noqa: TRY003
             return self.planning_queue.pop(0)
         raise AssertionError(f"unexpected provider phase: {phase}")  # noqa: TRY003
+
+    async def generate_text_with_messages(self, **kwargs: Any) -> str:
+        self.calls.append(kwargs)
+        phase = str(kwargs.get("request_phase", ""))
+        if phase != "group_history_summary":
+            raise AssertionError(f"unexpected provider phase: {phase}")  # noqa: TRY003
+        if not self.summary_queue:
+            raise AssertionError("summary LLM 被调用: 受限时应不进入总结")  # noqa: TRY003
+        completion = self.summary_queue.pop(0)
+        return str(completion.content)
 
 
 def _count_planning(provider: _ScriptedLlmProvider) -> list[dict[str, Any]]:
@@ -213,7 +218,7 @@ def _count_planning(provider: _ScriptedLlmProvider) -> list[dict[str, Any]]:
 def _count_summary(provider: _ScriptedLlmProvider) -> list[dict[str, Any]]:
     return [
         k for k in provider.calls
-        if str(k.get("request_phase", "")) == "group_history_summary_final"
+        if str(k.get("request_phase", "")) == "group_history_summary"
     ]
 
 
@@ -229,6 +234,11 @@ def _install_stage_fakes(
     provider_obj = cast("Any", provider)
     monkeypatch.setattr(
         llm_provider, "generate_messages_completion", provider_obj.generate_messages_completion
+    )
+    monkeypatch.setattr(
+        llm_provider,
+        "generate_text_with_messages",
+        provider_obj.generate_text_with_messages,
     )
 
     def _fake_render(**kwargs: Any) -> SimpleNamespace:
@@ -287,17 +297,15 @@ def _setup_harness(
     provider.summary_result()
     render_calls: list[int] = []
     _install_stage_fakes(monkeypatch, provider, render_calls)
-    collector = LLMDiagnosticCollector(request_id="summary-admission")
     return SimpleNamespace(
         bot=bot,
         provider=provider,
         render=render_calls,
         config=_build_config(),
-        collector=collector,
     )
 
 
-async def _execute(bot: _FakeBot, config: DynamicConfigSchema, *, collector: Any) -> tuple[Any, Any]:
+async def _execute(bot: _FakeBot, config: DynamicConfigSchema) -> tuple[Any, Any]:
     try:
         result = await execute_group_summary(
             bot=cast("Any", bot),
@@ -305,7 +313,7 @@ async def _execute(bot: _FakeBot, config: DynamicConfigSchema, *, collector: Any
             bot_self_id="999",
             user_request="总结最近消息",
             config=config,
-            collector=collector,
+            request_trace_id="summary-admission",
             history_capability_confirmed=True,
         )
     except Exception as exc:
@@ -315,7 +323,7 @@ async def _execute(bot: _FakeBot, config: DynamicConfigSchema, *, collector: Any
 
 
 # ---------------------------------------------------------------------------
-# AC-1/AC-4: 获准全链路 + 群锁/连接/collector 清理
+# AC-1/AC-4: 获准全链路 + 群锁/连接清理
 # ---------------------------------------------------------------------------
 
 
@@ -323,23 +331,12 @@ async def test_summary_admitted_pipeline_and_cleanup(
     monkeypatch: pytest.MonkeyPatch,
     _use_in_memory_group_lock: Any,
 ) -> None:
-    """获准后各阶段 Fake 均执行一次, 租约释放, 诊断收尾一次 (绿意图锁定)."""
+    """获准后各阶段 Fake 均执行一次, 租约释放 (绿意图锁定)."""
     scripted = ScriptedAdjudicate("admitted")
     ns = _setup_harness(monkeypatch, scripted)
     lock = cast("Any", _use_in_memory_group_lock)
 
-    import komari_bot.plugins.group_history_summary.execution_service as exec_mod
-
-    real_finalize = exec_mod.agent_run_logger_plugin.finalize_collector
-    finalize_calls: list[dict[str, Any]] = []
-
-    async def _wrapped(coll: Any, **kw: Any) -> Any:
-        finalize_calls.append(kw)
-        return await real_finalize(coll, **kw)
-
-    monkeypatch.setattr(exec_mod.agent_run_logger_plugin, "finalize_collector", _wrapped)
-
-    result, exc = await _execute(ns.bot, ns.config, collector=ns.collector)
+    result, exc = await _execute(ns.bot, ns.config)
     assert exc is None
     assert result is not None and result.image_base64 == "page-a", "获准后应产出图片"
     assert ns.bot.history_reads, "获准后群历史平台读取应发生"
@@ -348,8 +345,6 @@ async def test_summary_admitted_pipeline_and_cleanup(
     assert len(ns.render) == 1
     assert GROUP_ID in lock.released_groups
     assert lock.running == set(), "群锁不得泄漏"
-    assert len(finalize_calls) == 1, "诊断收尾最多一次"
-    assert ns.collector.status == "success"
     assert scripted.calls != [], "获准路径效果前未调用 adjudicate"
 
 
@@ -366,12 +361,13 @@ async def test_summary_restricted_blocks_all_stages(
     scripted = ScriptedAdjudicate("restricted")
     ns = _setup_harness(monkeypatch, scripted)
 
-    result, ns_exc = await _execute(ns.bot, ns.config, collector=ns.collector)
+    result, ns_exc = await _execute(ns.bot, ns.config)
     assert ns.provider.calls == [], "planning/summary LLM 不得被调用"
     assert ns.bot.history_reads == [], "群历史平台读取不得发生"
     assert ns.render == [], "图片渲染不得发生"
-    assert ns.collector.errors == [], "准入拒绝不得记录为失败"
-    _ = result or ns_exc  # 结果或终止异常都不影响: 准入拒绝视为正常控制流
+    assert ns_exc is None, "准入拒绝不得以异常收口"
+    assert result is not None and result.summary_text == ""
+
 
 
 # ---------------------------------------------------------------------------
@@ -385,7 +381,7 @@ async def test_planning_llm_restricted_blocks_provider(
     """summary.planning_llm: 规划 LLM 前裁决, 受限时 provider 不调用."""
     scripted = ScriptedAdjudicate("restricted")
     ns = _setup_harness(monkeypatch, scripted)
-    await _execute(ns.bot, ns.config, collector=ns.collector)
+    await _execute(ns.bot, ns.config)
     assert ns.provider.calls == [], "planning LLM 受限时不得调用 provider"
     assert scripted.calls != [], "planning LLM 效果前未调用 adjudicate"
 
@@ -397,7 +393,7 @@ async def test_history_read_restricted_blocks_platform_read(
     scripted = ScriptedAdjudicate("admitted")
     scripted.set_sequence("admitted", "restricted", "restricted", "restricted")
     ns = _setup_harness(monkeypatch, scripted)
-    await _execute(ns.bot, ns.config, collector=ns.collector)
+    await _execute(ns.bot, ns.config)
     assert len(_count_planning(ns.provider)) >= 1, "规划已获选则应发生 planning"
     assert ns.bot.history_reads == [], "history 平台读取受限时不得发生 get_group_msg_history"
     assert scripted.calls != [], "history_read 效果前未调用裁决"
@@ -415,7 +411,7 @@ async def test_summary_llm_restricted_blocks_provider(
     scripted = ScriptedAdjudicate("admitted")
     scripted.set_sequence("admitted", "admitted", "restricted", "restricted")
     ns = _setup_harness(monkeypatch, scripted)
-    await _execute(ns.bot, ns.config, collector=ns.collector)
+    await _execute(ns.bot, ns.config)
     assert ns.bot.history_reads, "规划+读取获选则历史应被读取(已开始阶段可完成)"
     assert _count_summary(ns.provider) == [], "summary LLM 受限时不得调用 provider"
     assert ns.render == [], "summary 受限时更后的图片渲染不得发生"
@@ -429,7 +425,7 @@ async def test_image_render_restricted_blocks_render(
     scripted = ScriptedAdjudicate("admitted")
     scripted.set_sequence("admitted", "admitted", "admitted", "restricted")
     ns = _setup_harness(monkeypatch, scripted)
-    await _execute(ns.bot, ns.config, collector=ns.collector)
+    await _execute(ns.bot, ns.config)
     assert len(_count_planning(ns.provider)) >= 1
     assert len(_count_summary(ns.provider)) >= 1, "总结获选则 summary LLM 已完成"
     assert ns.render == [], "图片渲染受限时不得渲染"
@@ -451,12 +447,11 @@ async def test_debug_public_restricted_blocks_group_keeps_private(
     scripted = ScriptedAdjudicate("restricted")
     install_scripted_adjudicate(monkeypatch, scripted)
     bot = _RecordingBot()
-    collector = LLMDiagnosticCollector(request_id="debug-summary-1")
 
     await build_and_send_diagnostic_report(
         bot=cast("Any", bot),
         user_id=999,
-        collector=collector,
+        request_id="debug-summary-1",
         result_type="summary",
         succeeded=True,
         public_group_id=int(GROUP_ID),
@@ -571,9 +566,9 @@ async def test_summary_denial_does_not_trigger_failure_notification(
     )
     # 若失败通知/异常进入 handler 的失败收口，会以 retry 重发；denial 是
     # 正常控制流，不得抛出、不得通知、不得记录失败。
-    result, ns_exc = await _execute(ns.bot, ns.config, collector=ns.collector)
+    result, ns_exc = await _execute(ns.bot, ns.config)
     assert ns_exc is None, "准入拒绝是正常控制流: 不得以异常/失败通知收口"
     assert result is not None and not result.image_base64, "受限时不得产出图片"
-    assert ns.collector.errors == [], "准入拒绝不得记录为失败"
+    assert ns_exc is None, "准入拒绝不得记录为失败"
     assert ns.provider.calls == [], "受限时 provider 不得被调用"
     _ = ns_exc

@@ -34,14 +34,17 @@ class _FakeLLMProvider:
     active: ClassVar[int] = 0
     max_active: ClassVar[int] = 0
     fail_next: ClassVar[bool] = False
+    calls: ClassVar[list[dict[str, Any]]] = []
 
     @classmethod
     def reset(cls) -> None:
         cls.active = 0
         cls.max_active = 0
         cls.fail_next = False
+        cls.calls = []
 
     async def generate_messages_completion(self, **kwargs: Any) -> SimpleNamespace:
+        self.__class__.calls.append(kwargs)
         self.__class__.active += 1
         self.__class__.max_active = max(
             self.__class__.max_active,
@@ -150,47 +153,21 @@ async def test_read_images_formats_single_image_failure(
 
 
 @pytest.mark.asyncio
-async def test_read_images_passes_trace_to_collector(
+async def test_read_images_forwards_request_trace_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """视觉调用在传入 collector 时记录 LLMCallTrace。"""
+    """TSK-200：视觉调用的 trace 只进入普通运行日志请求参数。"""
     _patch_vision_dependencies(monkeypatch)
-    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
-
-    collector = LLMDiagnosticCollector(request_id="test-vision-trace")
     result = await vision_service_module.read_images(
         ["image-trace"],
         vision_model="vision-model",
         request_trace_id="trace-1",
-        parent_call_id="parent-1",
-        collector=collector,
     )
 
     assert result == ["图片描述：image-trace"]
-    assert len(collector.calls) == 1
-    assert collector.calls[0].phase == "vision_read_image"
-    assert collector.calls[0].parent_call_id == "parent-1"
-
-
-@pytest.mark.asyncio
-async def test_read_images_records_error_in_collector(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """视觉调用失败时记录错误到 collector。"""
-    _patch_vision_dependencies(monkeypatch)
-    _FakeLLMProvider.fail_next = True
-    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
-
-    collector = LLMDiagnosticCollector(request_id="test-vision-error")
-    result = await vision_service_module.read_images(
-        ["image-fail"],
-        vision_model="vision-model",
-        collector=collector,
-    )
-
-    assert "图片读取失败" in result[0]
-    assert len(collector.errors) >= 1
-    assert collector.errors[0]["type"] == "RuntimeError"
+    assert len(_FakeLLMProvider.calls) == 1
+    assert _FakeLLMProvider.calls[0]["request_trace_id"] == "trace-1"
+    assert _FakeLLMProvider.calls[0]["request_phase"] == "vision_read_image"
 
 
 @pytest.mark.asyncio
@@ -332,8 +309,8 @@ async def test_read_images_failure_normalized_without_secret_leak(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """TSK-195 第二轮：provider 异常正文内嵌 secret URL/data URI 时，视觉
-    失败回主模型与收集器的文本只含稳定异常类型，绝不泄漏 URL/base64；
-    日志不捕获 traceback（无 exc_info）且不含敏感正文。"""
+    失败回主模型的文本只含稳定异常类型，绝不泄漏 URL/base64；日志不捕获
+    traceback（无 exc_info）且不含敏感正文。"""
     _patch_vision_dependencies(monkeypatch)
     recorder = _CapturingLogRecorder()
     monkeypatch.setattr(vision_service_module, "logger", recorder)
@@ -349,53 +326,16 @@ async def test_read_images_failure_normalized_without_secret_leak(
         "llm_provider",
         _SecretLeakingProvider(),
     )
-    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
-
-    collector = LLMDiagnosticCollector(request_id="test-vision-secret")
     result = await vision_service_module.read_images(
         [_SECRET_DATA_URI],
         vision_model="vision-model",
         request_trace_id="trace-secret",
-        parent_call_id="parent-secret",
-        collector=collector,
     )
 
     # 回主模型的工具文本只含稳定异常类型，绝不携带 provider 原始正文
     assert result == ["[图片读取失败: RuntimeError]"]
     assert _SECRET_URL not in result[0]
     assert _SECRET_DATA_URI not in result[0]
-
-    # collector 内存 errors / call error 只含安全归一化信息
-    assert len(collector.errors) == 1
-    assert collector.errors[0]["type"] == "RuntimeError"
-    assert collector.errors[0]["message"] == "[图片读取失败: RuntimeError]"
-    assert _SECRET_URL not in str(collector.errors)
-    assert _SECRET_DATA_URI not in str(collector.errors)
-    assert len(collector.calls) == 1
-    call = collector.calls[0]
-    assert call.status == "error"
-    assert call.phase == "vision_read_image"
-    assert call.parent_call_id == "parent-secret"
-    assert call.error == {
-        "type": "RuntimeError",
-        "message": "[图片读取失败: RuntimeError]",
-    }
-    assert _SECRET_URL not in str(collector.calls)
-    assert _SECRET_DATA_URI not in str(collector.calls)
-
-    # 最终 projection（含 request 的既有结构化 trace）也不含敏感正文；
-    # 请求对象走现有 sanitizer 保留二进制摘要。
-    collector.mark_finished(status="error", error=RuntimeError("boom"))
-    record = collector.build_record()
-    record_json = json.dumps(record, ensure_ascii=False, default=str)
-    assert _SECRET_URL not in record_json
-    assert _SECRET_DATA_URI not in record_json
-    assert "/private/" not in record_json and "photo.png" not in record_json
-    assert "token=abc123" not in record_json
-    image_url_summary = record["rounds"][0]["request"]["messages"][0]["content"][1][
-        "image_url"
-    ]["url"]
-    assert image_url_summary["redacted_binary"] is True
 
     # 日志不捕获 traceback（无 exc_info/exception）且不含敏感正文
     assert recorder.records, "视觉失败应产生日志"

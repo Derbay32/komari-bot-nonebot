@@ -434,7 +434,6 @@ _REAL_MANAGEMENT_INIT = _MGMT_DIR / "__init__.py"
 
 _SHIM_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "komari_knowledge": ("register_knowledge_api", "get_engine"),
-    "agent_run_logger": ("register_agent_run_log_api", "get_agent_run_log_reader"),
     "user_ban": ("register_user_ban_api", "get_service"),
     "komari_chat": ("get_reply_fulfillment_ops_service",),
     "character_binding": (

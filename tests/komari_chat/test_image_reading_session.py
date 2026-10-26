@@ -158,7 +158,6 @@ def _build_session(
         vision_thinking_mode=False,
         vision_reasoning_effort="",
         request_trace_id="trace-session-1",
-        collector=None,
     )
     return session, fake_vision
 

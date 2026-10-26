@@ -2,16 +2,12 @@
 
 from __future__ import annotations
 
-import json
 import threading
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 
-from komari_bot.plugins.agent_run_logger.diagnostic import (
-    LLMDiagnosticCollector,
-)
 from komari_bot.plugins.group_history_summary.config_schema import (
     DynamicConfigSchema,
     LayoutParamsSchema,
@@ -164,8 +160,8 @@ def _fake_tool_call(
 
 
 @pytest.mark.asyncio
-async def test_plan_rounds_recorded_in_collector(monkeypatch: Any) -> None:
-    """验证规划每轮在 collector 中产生 LLMCallTrace 与 ToolExecutionTrace。"""
+async def test_plan_rounds_use_request_trace_id_and_phase(monkeypatch: Any) -> None:
+    """验证规划每轮携带请求 trace ID 与稳定阶段名（普通运行日志）。"""
     import komari_bot.plugins.group_history_summary.planner_service as planner_module
 
     completions = [
@@ -198,8 +194,6 @@ async def test_plan_rounds_recorded_in_collector(monkeypatch: Any) -> None:
     monkeypatch.setattr(planner_module.llm_provider, "generate_messages_completion", _fake_gen)
     monkeypatch.setattr(planner_module, "_fetch_history_window", _fake_fetch)
 
-    collector = LLMDiagnosticCollector(request_id="test-trace")
-
     result = await planner_module.plan_summary_request(
         bot=cast("Any", SimpleNamespace()),
         group_id="123",
@@ -214,19 +208,9 @@ async def test_plan_rounds_recorded_in_collector(monkeypatch: Any) -> None:
         summary_tool_scan_limit=300,
         fetch_batch_size=50,
         request_trace_id="test-trace",
-        collector=collector,
     )
 
     assert result.messages is not None
-    assert len(collector.calls) == 3
-    assert collector.calls[0].phase == "group_history_summary_plan_round_0"
-    assert collector.calls[1].phase == "group_history_summary_plan_round_1"
-    assert collector.calls[2].phase == "group_history_summary_plan_round_2"
-    assert collector.calls[0].duration_ms == 500.0
-    assert collector.calls[1].duration_ms == 300.0
-    assert len(collector.tools) == 2
-    assert collector.tools[0].tool_name == "fetch_recent_group_messages"
-    assert collector.tools[1].tool_name == "fetch_messages_by_user"
     assert [kwargs["request_trace_id"] for kwargs in llm_kwargs] == [
         "test-trace",
         "test-trace",
@@ -239,86 +223,28 @@ async def test_plan_rounds_recorded_in_collector(monkeypatch: Any) -> None:
     ]
 
 
-@pytest.mark.asyncio
-async def test_plan_tool_summary_excludes_message_content(monkeypatch: Any) -> None:
-    """验证工具结果摘要不包含消息正文。"""
-    import komari_bot.plugins.group_history_summary.planner_service as planner_module
-
-    completions = [
-        _fake_completion(
-            tool_calls=[_fake_tool_call(parsed_arguments={"count": 20, "include_bot_replies": False})],
-            finish_reason="tool_calls",
-        ),
-        _fake_completion(content="够了"),
-    ]
-    call_index = 0
-
-    async def _fake_gen(**_kwargs: Any) -> object:
-        nonlocal call_index
-        result = completions[min(call_index, len(completions) - 1)]
-        call_index += 1
-        return result
-
-    async def _fake_fetch(_count: int = 50, **_kwargs: Any) -> list[HistoryMessage]:
-        return [_build_history_message(user_id="1001", nickname="test", content="秘密内容不应该出现在摘要中", timestamp=1, message_seq=1)]
-
-    monkeypatch.setattr(planner_module.llm_provider, "generate_messages_completion", _fake_gen)
-    monkeypatch.setattr(planner_module, "_fetch_history_window", _fake_fetch)
-
-    collector = LLMDiagnosticCollector()
-
-    await planner_module.plan_summary_request(
-        bot=cast("Any", SimpleNamespace()),
-        group_id="123",
-        bot_self_id="999",
-        user_request="总结",
-        planning_model=PLANNING_MODEL,
-        planning_max_tokens=800,
-        planning_round_limit=3,
-        summary_default_count=50,
-        min_summary_count=10,
-        max_summary_count=200,
-        summary_tool_scan_limit=300,
-        fetch_batch_size=50,
-        request_trace_id="trace",
-        collector=collector,
-    )
-
-    assert len(collector.tools) == 1
-    result_summary = json.loads(collector.tools[0].result_summary or "{}")
-    assert result_summary["source"] == "recent_group_messages"
-    assert result_summary["matched_count"] == 1
-    assert "filters" in result_summary
-    assert "秘密内容" not in str(result_summary)
-
-
 # ======================== 最终总结追踪测试 ========================
 
 
 @pytest.mark.asyncio
-async def test_final_summary_recorded_in_collector(monkeypatch: Any) -> None:
-    """验证最终总结调用在 collector 中产生正确的阶段追踪。"""
+async def test_final_summary_uses_request_trace_id_and_phase(
+    monkeypatch: Any,
+) -> None:
+    """最终总结经 str 便捷接口携带请求 trace ID 与稳定阶段名。"""
     import komari_bot.plugins.group_history_summary.summarize_service as summarize_module
 
-    completion_kwargs: dict[str, Any] = {}
+    text_kwargs: dict[str, Any] = {}
 
-    async def _fake_gen(**kwargs: Any) -> object:
-        completion_kwargs.update(kwargs)
-        return SimpleNamespace(
-            content="<content>今天主要讨论了测试。</content>",
-            tool_calls=[],
-            finish_reason="stop",
-            usage=None,
-            duration_ms=250.0,
-        )
+    async def _fake_gen_text(**kwargs: Any) -> str:
+        text_kwargs.update(kwargs)
+        return "<content>今天主要讨论了测试。</content>"
 
     monkeypatch.setattr(
         summarize_module.llm_provider,
-        "generate_messages_completion",
-        _fake_gen,
+        "generate_text_with_messages",
+        _fake_gen_text,
     )
 
-    collector = LLMDiagnosticCollector()
     history = [_build_history_message(user_id="1001", nickname="test", content="hello", timestamp=1, message_seq=1)]
 
     text = await summarize_module.summarize_history_messages(
@@ -327,40 +253,28 @@ async def test_final_summary_recorded_in_collector(monkeypatch: Any) -> None:
         temperature=0.4,
         max_tokens=1200,
         request_trace_id="trace-1",
-        collector=collector,
     )
 
     assert text == "今天主要讨论了测试。"
-    assert completion_kwargs["request_trace_id"] == "trace-1"
-    assert completion_kwargs["request_phase"] == "group_history_summary_final"
-    assert len(collector.calls) == 1
-    assert collector.calls[0].phase == "group_history_summary_final"
-    assert collector.calls[0].parent_call_id == "trace-1"
-    assert collector.calls[0].finish_reason == "stop"
-    assert collector.calls[0].duration_ms == 250.0
+    assert text_kwargs["request_trace_id"] == "trace-1"
+    # 保留既有非 collector 便捷路径的阶段名
+    assert text_kwargs["request_phase"] == "group_history_summary"
 
 
 @pytest.mark.asyncio
-async def test_final_summary_empty_text_result_recorded(monkeypatch: Any) -> None:
-    """验证最终总结返回空 content 时仍记录调用。"""
+async def test_final_summary_empty_text_returns_default(monkeypatch: Any) -> None:
+    """最终总结返回空正文时回退到既有安全默认文本。"""
     import komari_bot.plugins.group_history_summary.summarize_service as summarize_module
 
-    async def _fake_gen(**_kwargs: Any) -> object:
-        return SimpleNamespace(
-            content="",
-            tool_calls=[],
-            finish_reason="stop",
-            usage=None,
-            duration_ms=100.0,
-        )
+    async def _fake_gen_text(**_kwargs: Any) -> str:
+        return ""
 
     monkeypatch.setattr(
         summarize_module.llm_provider,
-        "generate_messages_completion",
-        _fake_gen,
+        "generate_text_with_messages",
+        _fake_gen_text,
     )
 
-    collector = LLMDiagnosticCollector()
     history = [_build_history_message(user_id="1001", nickname="test", content="hello", timestamp=1, message_seq=1)]
 
     text = await summarize_module.summarize_history_messages(
@@ -368,16 +282,14 @@ async def test_final_summary_empty_text_result_recorded(monkeypatch: Any) -> Non
         model=SUMMARY_MODEL,
         temperature=0.4,
         max_tokens=1200,
-        collector=collector,
     )
 
     assert "信息较少" in text
-    assert len(collector.calls) == 1
 
 
 @pytest.mark.asyncio
-async def test_empty_history_no_llm_call_traced(monkeypatch: Any) -> None:
-    """验证空历史不产生 LLM 调用追踪。"""
+async def test_empty_history_does_not_call_llm(monkeypatch: Any) -> None:
+    """验证空历史不产生任何 LLM 调用。"""
     import komari_bot.plugins.group_history_summary.summarize_service as summarize_module
 
     called = False
@@ -398,110 +310,15 @@ async def test_empty_history_no_llm_call_traced(monkeypatch: Any) -> None:
         _fake_noop,
     )
 
-    collector = LLMDiagnosticCollector()
     text = await summarize_module.summarize_history_messages(
         history_messages=[],
         model=SUMMARY_MODEL,
         temperature=0.4,
         max_tokens=1200,
-        collector=collector,
     )
 
     assert "信息较少" in text
     assert not called
-    assert len(collector.calls) == 0
-
-
-# ======================== 阶段聚合测试 ========================
-
-
-def test_phase_aggregation_correctly_groups_by_phase() -> None:
-    """验证按阶段聚合的 token 统计正确。"""
-    from komari_bot.plugins.agent_run_logger.diagnostic import LLMCallTrace
-    from komari_bot.plugins.llm_provider.base_client import UnifiedUsageSchema
-
-    collector = LLMDiagnosticCollector()
-
-    collector.add_call(
-        LLMCallTrace(
-            call_id="a",
-            phase="group_history_summary_plan_round_0",
-            model="plan",
-            finish_reason="tool_calls",
-            duration_ms=100.0,
-            usage=UnifiedUsageSchema(input_tokens=100, output_tokens=50, total_tokens=150),
-        )
-    )
-    collector.add_call(
-        LLMCallTrace(
-            call_id="b",
-            phase="group_history_summary_plan_round_1",
-            model="plan",
-            finish_reason="stop",
-            duration_ms=50.0,
-            usage=UnifiedUsageSchema(input_tokens=200, output_tokens=30, total_tokens=230),
-        )
-    )
-    collector.add_call(
-        LLMCallTrace(
-            call_id="c",
-            phase="group_history_summary_final",
-            model="summary",
-            finish_reason="stop",
-            duration_ms=80.0,
-            usage=UnifiedUsageSchema(input_tokens=500, output_tokens=100, total_tokens=600),
-        )
-    )
-
-    plan_0 = collector.aggregate_phase("group_history_summary_plan_round_0")
-    assert plan_0.input_tokens == 100
-    assert plan_0.output_tokens == 50
-    assert plan_0.call_count == 1
-
-    plan_1 = collector.aggregate_phase("group_history_summary_plan_round_1")
-    assert plan_1.input_tokens == 200
-    assert plan_1.call_count == 1
-
-    final = collector.aggregate_phase("group_history_summary_final")
-    assert final.input_tokens == 500
-    assert final.call_count == 1
-
-    unknown = collector.aggregate_phase("nonexistent")
-    assert unknown.input_tokens == 0
-    assert unknown.call_count == 0
-
-    overall = collector.aggregate_overall()
-    assert overall.input_tokens == 800
-    assert overall.call_count == 3
-    assert overall.input_tokens_complete is True
-
-
-def test_phase_aggregation_marks_incomplete_when_missing_usage() -> None:
-    """验证部分调用缺少 usage 时标注为不完整。"""
-    from komari_bot.plugins.agent_run_logger.diagnostic import LLMCallTrace
-
-    collector = LLMDiagnosticCollector()
-    collector.add_call(
-        LLMCallTrace(
-            call_id="a",
-            phase="group_history_summary_plan_round_0",
-            model="plan",
-            usage=None,
-        )
-    )
-    collector.add_call(
-        LLMCallTrace(
-            call_id="b",
-            phase="group_history_summary_plan_round_0",
-            model="plan",
-            finish_reason="stop",
-        )
-    )
-
-    agg = collector.aggregate_phase("group_history_summary_plan_round_0")
-    assert agg.input_tokens_complete is False
-    assert agg.call_count == 2
-    assert agg.input_tokens == 0
 
 
 # ======================== 锁与能力检查测试 ========================
@@ -704,7 +521,7 @@ async def test_confirmed_capability_is_not_checked_twice(monkeypatch: Any) -> No
 async def test_normal_handler_returns_image_for_non_empty_history(
     monkeypatch: Any,
 ) -> None:
-    """验证正常执行路径返回图片 base64 且 collector 保留完整 trace。"""
+    """验证正常执行路径返回图片 base64，并把请求 ID 传给规划与总结。"""
     import komari_bot.plugins.group_history_summary.execution_service as exec_module
 
     monkeypatch.setattr(
@@ -720,25 +537,11 @@ async def test_normal_handler_returns_image_for_non_empty_history(
         ),
     ]
 
+    plan_kwargs: dict[str, Any] = {}
+    summarize_kwargs: dict[str, Any] = {}
+
     async def _fake_plan(*_args: Any, **kwargs: Any) -> object:
-        collector = kwargs.get("collector")
-        if collector is not None:
-            from komari_bot.plugins.agent_run_logger.diagnostic import LLMCallTrace
-            from komari_bot.plugins.llm_provider.base_client import UnifiedUsageSchema
-
-            collector.add_call(
-                LLMCallTrace(
-                    call_id="plan-1",
-                    parent_call_id=kwargs.get("request_trace_id"),
-                    phase="group_history_summary_plan_round_0",
-                    round_index=0,
-                    model=PLANNING_MODEL,
-                    finish_reason="stop",
-                    duration_ms=300.0,
-                    usage=UnifiedUsageSchema(input_tokens=50, output_tokens=10, total_tokens=60),
-                )
-            )
-
+        plan_kwargs.update(kwargs)
         return SimpleNamespace(
             messages=messages,
             tool_result=SimpleNamespace(
@@ -752,29 +555,12 @@ async def test_normal_handler_returns_image_for_non_empty_history(
         )
 
     async def _fake_summarize(*_args: Any, **kwargs: Any) -> str:
-        collector = kwargs.get("collector")
-        if collector is not None:
-            from komari_bot.plugins.agent_run_logger.diagnostic import LLMCallTrace
-            from komari_bot.plugins.llm_provider.base_client import UnifiedUsageSchema
-
-            collector.add_call(
-                LLMCallTrace(
-                    call_id="summary-1",
-                    parent_call_id=kwargs.get("request_trace_id"),
-                    phase="group_history_summary_final",
-                    round_index=0,
-                    model=SUMMARY_MODEL,
-                    finish_reason="stop",
-                    duration_ms=200.0,
-                    usage=UnifiedUsageSchema(input_tokens=200, output_tokens=80, total_tokens=280),
-                )
-            )
+        summarize_kwargs.update(kwargs)
         return "今天讨论了 hello 和 world。"
 
     monkeypatch.setattr(exec_module, "plan_summary_request", _fake_plan)
     monkeypatch.setattr(exec_module, "summarize_history_messages", _fake_summarize)
 
-    collector = LLMDiagnosticCollector(request_id="e2e-test")
     config = _build_config()
 
     result = await execute_group_summary(
@@ -784,7 +570,7 @@ async def test_normal_handler_returns_image_for_non_empty_history(
         user_request="总结",
         config=config,
         requested_count=50,
-        collector=collector,
+        request_trace_id="e2e-trace",
     )
 
     assert len(result.summary_text) > 0
@@ -792,15 +578,8 @@ async def test_normal_handler_returns_image_for_non_empty_history(
     assert result.filter_label == "recent_group_messages"
     assert len(result.image_base64) > 0
     assert "hello" in result.summary_text or "world" in result.summary_text
-
-    assert len(collector.calls) == 2
-    phases = {c.phase for c in collector.calls}
-    assert "group_history_summary_plan_round_0" in phases
-    assert "group_history_summary_final" in phases
-
-    overall = collector.aggregate_overall()
-    assert overall.call_count == 2
-    assert overall.input_tokens == 250
+    assert plan_kwargs["request_trace_id"] == "e2e-trace"
+    assert summarize_kwargs["request_trace_id"] == "e2e-trace"
 
 
 # ======================== 空历史与回退测试 ========================
@@ -828,7 +607,6 @@ async def test_empty_history_returns_default_text_and_no_image(
     monkeypatch.setattr(exec_module, "plan_summary_request", _fake_plan)
 
     config = _build_config()
-    collector = LLMDiagnosticCollector()
 
     result = await execute_group_summary(
         bot=cast("Any", SimpleNamespace()),
@@ -836,21 +614,19 @@ async def test_empty_history_returns_default_text_and_no_image(
         bot_self_id="999",
         user_request="总结",
         config=config,
-        collector=collector,
     )
 
     assert "文本记录太少" in result.summary_text
     assert result.filtered_message_count == 0
     assert result.image_base64 == ""
-    assert len(collector.calls) == 0
 
 
-# ======================== 规划回退保留部分 trace ========================
+# ======================== 规划回退 ========================
 
 
 @pytest.mark.asyncio
-async def test_planning_fallback_preserves_partial_trace(monkeypatch: Any) -> None:
-    """验证规划回退时已完成调用仍保留在 collector 中。"""
+async def test_planning_fallback_returns_tool_result(monkeypatch: Any) -> None:
+    """验证规划达到轮数上限时按已取回消息回退继续。"""
     import komari_bot.plugins.group_history_summary.planner_service as planner_module
 
     completions = [
@@ -875,8 +651,6 @@ async def test_planning_fallback_preserves_partial_trace(monkeypatch: Any) -> No
     monkeypatch.setattr(planner_module.llm_provider, "generate_messages_completion", _fake_gen)
     monkeypatch.setattr(planner_module, "_fetch_history_window", _fake_fetch)
 
-    collector = LLMDiagnosticCollector()
-
     result = await planner_module.plan_summary_request(
         bot=cast("Any", SimpleNamespace()),
         group_id="123",
@@ -891,25 +665,20 @@ async def test_planning_fallback_preserves_partial_trace(monkeypatch: Any) -> No
         summary_tool_scan_limit=300,
         fetch_batch_size=50,
         request_trace_id="fallback-trace",
-        collector=collector,
     )
 
     assert result.tool_result is not None
     assert "上限" in result.planner_note or "回退" in result.planner_note
-    # 至少 1 轮 LLM 调用被记录
-    assert len(collector.calls) >= 1
-    plan_phases = [c.phase for c in collector.calls if "plan_round" in c.phase]
-    assert len(plan_phases) >= 1
 
 
-# ======================== 总结失败保留部分 trace ========================
+# ======================== 总结失败传播 ========================
 
 
 @pytest.mark.asyncio
-async def test_summary_failure_preserves_plan_trace(
+async def test_summary_failure_propagates_after_planning(
     monkeypatch: Any,
 ) -> None:
-    """验证总结失败时规划阶段 trace 仍然保留。"""
+    """验证总结阶段失败仍向调用方传播（不伪造成功总结）。"""
     import komari_bot.plugins.group_history_summary.execution_service as exec_module
 
     monkeypatch.setattr(
@@ -918,21 +687,7 @@ async def test_summary_failure_preserves_plan_trace(
 
     messages = [_build_history_message(user_id="1001", nickname="test", content="hello", timestamp=1, message_seq=1)]
 
-    async def _fake_plan(*_args: Any, **kwargs: Any) -> object:
-        collector = kwargs.get("collector")
-        if collector is not None:
-            from komari_bot.plugins.agent_run_logger.diagnostic import LLMCallTrace
-
-            collector.add_call(
-                LLMCallTrace(
-                    call_id="plan-1",
-                    parent_call_id=kwargs.get("request_trace_id"),
-                    phase="group_history_summary_plan_round_0",
-                    round_index=0,
-                    model=PLANNING_MODEL,
-                    finish_reason="tool_calls",
-                )
-            )
+    async def _fake_plan(*_args: Any, **_kwargs: Any) -> object:
         return SimpleNamespace(
             messages=messages,
             tool_result=SimpleNamespace(
@@ -945,17 +700,13 @@ async def test_summary_failure_preserves_plan_trace(
             rounds_used=1,
         )
 
-    async def _fake_summarize(*_args: Any, **kwargs: Any) -> str:
-        collector = kwargs.get("collector")
-        if collector is not None:
-            collector.add_error("summarize", "LLMError", "模拟总结失败")
+    async def _fake_summarize(*_args: Any, **_kwargs: Any) -> str:
         raise RuntimeError("模拟总结失败")
 
     monkeypatch.setattr(exec_module, "plan_summary_request", _fake_plan)
     monkeypatch.setattr(exec_module, "summarize_history_messages", _fake_summarize)
 
     config = _build_config()
-    collector = LLMDiagnosticCollector()
 
     with pytest.raises(RuntimeError, match="模拟总结失败"):
         await execute_group_summary(
@@ -964,13 +715,7 @@ async def test_summary_failure_preserves_plan_trace(
             bot_self_id="999",
             user_request="总结",
             config=config,
-            collector=collector,
         )
-
-    assert len(collector.calls) >= 1
-    assert any("plan_round" in c.phase for c in collector.calls)
-    assert len(collector.errors) == 1
-    assert collector.errors[0]["type"] == "LLMError"
 
 
 @pytest.mark.asyncio

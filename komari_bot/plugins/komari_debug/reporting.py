@@ -1,13 +1,15 @@
-"""诊断报告格式化与私密投递。
+"""debug 安全结果报告格式化与私密投递。
 
-安全约束：
-- 绝不输出完整历史、画像、搜索正文、prompt、reasoning content、base64
-- 未报告的 token 字段显示为"未报告"而非 0；值为 0 时正确显示 0
-- 零调用聚合全部显示"未报告"，不伪造 0
+TSK-200：Agent Run 采集器退役后，报告只是请求 ID、结果类型、成功/失败、
+安全固定错误码与最终结果的纯渲染：
+
+- 不渲染逐轮 LLM 调用、工具参数/结果或 token 用量聚合
+- 不持有或读取采集历史；调用方只传显式 ``request_id``
+- 最终结果只渲染固定的安全字段白名单
 - 单节点按行切分并限制体积，每批不超过 50 个节点
 - 合并转发失败时按同章节普通文本逐条发送
 - 完整报告只投递到发起 SUPERUSER 的私聊
-- 显式公开时仅发送二次脱敏的结构化诊断
+- 显式公开时仅发送二次脱敏的结构化摘要
 """
 
 from __future__ import annotations
@@ -24,15 +26,30 @@ from komari_bot.onebot.onebot_messages import plain_text_message
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-    from komari_bot.plugins.agent_run_logger.diagnostic import (
-        LLMCallTrace,
-        LLMDiagnosticCollector,
-        ToolExecutionTrace,
-    )
-
 MAX_NODE_TEXT_LENGTH = 3500
 MAX_NODES_PER_BATCH = 50
 _ERROR_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
+#: 最终结果允许渲染的固定安全字段（键 → 报告标签）。
+#: 只包含业务结果与聚合计数/标签；不含用户标识、输入正文、异常正文或
+#: 工具参数。未列出的键一律丢弃。
+_SAFE_FINAL_RESULT_LABELS: dict[str, str] = {
+    "reply_text": "回复正文",
+    "favorability_delta": "拟议好感度",
+    "reply_to_message_id": "引用消息 ID",
+    "filtered_message_count": "筛选消息数",
+    "filter_label": "筛选方式",
+    "time_range": "时间范围",
+    "image_page_count": "图片页数",
+    "image_truncated": "图片是否截断",
+    "history_status": "历史状态",
+    "history_coverage_ratio": "历史覆盖率",
+    "history_completed_batches": "历史完成批次",
+    "history_failed_batch": "历史失败批次",
+    "image_failure_mode": "图片失败模式",
+    "image_failure_stages": "图片失败阶段",
+    "image_failed_count": "图片失败数量",
+}
 
 
 def _group_business_admitted(group_id: int | None) -> bool:
@@ -58,159 +75,8 @@ class DiagnosticDeliveryResult:
     public_delivered: bool | None
 
 
-def _fmt_token(val: int | None, *, complete: bool) -> str:
-    if val is None or not complete:
-        return "未报告"
-    return str(val)
-
-
-def _fmt_ms(val: float | None) -> str:
-    if val is None:
-        return "未报告"
-    return f"{val:.0f}ms"
-
-
-def _fmt_token_per_call(val: int | None) -> str:
-    """格式化单次调用的 token 值：None → 未报告，0 → 0。"""
-    if val is None:
-        return "未报告"
-    return str(val)
-
-
-def _format_call_line(call: LLMCallTrace, index: int) -> str:
-    """格式化单次 LLM 调用行。"""
-    parts = [
-        f"调用 #{index}: {call.phase}",
-        f"  模型: {call.model or '未知'}",
-        f"  轮次: {call.round_index}",
-        f"  finish: {call.finish_reason or '未知'}",
-        f"  耗时: {_fmt_ms(call.duration_ms)}",
-    ]
-    if call.request_api is not None:
-        stream_text = (
-            ("开" if call.stream_enabled else "关")
-            if call.stream_enabled is not None
-            else "未报告"
-        )
-        parts.append(f"  协议: {call.request_api} / 流式: {stream_text}")
-    if call.parent_call_id:
-        parts.append(f"  父调用: {call.parent_call_id}")
-    if call.usage:
-        u = call.usage
-        parts.append(
-            f"  token: in={_fmt_token_per_call(u.input_tokens)} "
-            f"cache_hit={_fmt_token_per_call(u.cached_input_tokens)} "
-            f"cache_miss={_fmt_token_per_call(u.cache_miss_input_tokens)} "
-            f"out={_fmt_token_per_call(u.output_tokens)} "
-            f"reasoning_out={_fmt_token_per_call(u.reasoning_output_tokens)} "
-            f"total={_fmt_token_per_call(u.total_tokens)}"
-        )
-    else:
-        parts.append("  token: 全部未报告")
-    return "\n".join(parts)
-
-
-def _format_tool_line(
-    tool: ToolExecutionTrace,
-    *,
-    public_redacted: bool = False,
-) -> str:
-    """格式化单次工具执行行。"""
-    lines = [
-        f"工具: {tool.tool_name}",
-        f"  状态: {tool.status}",
-    ]
-    if public_redacted:
-        lines.append("  参数与结果: 公开模式已隐藏")
-    else:
-        safe_arguments = _build_safe_tool_arguments(
-            tool.tool_name,
-            tool.parsed_arguments,
-        )
-        lines.append(f"  参数: {_truncate_dict(safe_arguments, 200)}")
-    if tool.error_summary and not public_redacted:
-        lines.append("  错误: 已记录（异常正文已隐藏）")
-    if tool.result_summary:
-        lines.append("  结果: 已记录（内容已隐藏）")
-    return "\n".join(lines)
-
-
-def _build_safe_tool_arguments(
-    tool_name: str,
-    arguments: dict[str, Any],
-) -> dict[str, Any]:
-    """按工具白名单生成私聊诊断可展示的参数摘要。"""
-    safe: dict[str, Any] = {}
-    match tool_name:
-        case "record_favorability_delta":
-            delta = arguments.get("delta")
-            if isinstance(delta, int):
-                safe["delta"] = delta
-        case "read_image":
-            image_index = arguments.get("image_index")
-            if isinstance(image_index, int):
-                safe["image_index"] = image_index
-        case "search_web":
-            query = arguments.get("query")
-            if isinstance(query, str):
-                safe["query_chars"] = len(query)
-        case "fetch_page":
-            urls = arguments.get("urls")
-            if isinstance(urls, list):
-                safe["url_count"] = len(urls)
-        case "read_profile":
-            keys = arguments.get("keys")
-            if isinstance(keys, list):
-                safe["requested_key_count"] = len(keys)
-        case "final_response":
-            content_chars = arguments.get("content_chars")
-            if not isinstance(content_chars, int):
-                content = arguments.get("content")
-                content_chars = len(content) if isinstance(content, str) else None
-            if content_chars is not None:
-                safe["content_chars"] = content_chars
-        case "fetch_recent_group_messages":
-            safe = _pick_safe_scalar_arguments(
-                arguments,
-                "count",
-                "include_bot_replies",
-            )
-        case "fetch_messages_by_user":
-            safe = _pick_safe_scalar_arguments(arguments, "count", "scan_limit")
-            safe["has_user_filter"] = bool(
-                arguments.get("user_id") or arguments.get("display_name")
-            )
-        case "fetch_messages_by_topic":
-            safe = _pick_safe_scalar_arguments(arguments, "count", "scan_limit")
-            keywords = arguments.get("keywords")
-            if isinstance(keywords, list):
-                safe["keyword_count"] = len(keywords)
-        case _:
-            pass
-    return safe
-
-
-def _pick_safe_scalar_arguments(
-    arguments: dict[str, Any],
-    *keys: str,
-) -> dict[str, int | bool]:
-    """提取允许公开的整数或布尔参数。"""
-    return {
-        key: value
-        for key in keys
-        if isinstance((value := arguments.get(key)), (int, bool))
-    }
-
-
-def _truncate_dict(d: dict[str, Any], max_len: int) -> str:
-    text = str(d)
-    if len(text) <= max_len:
-        return text
-    return text[: max_len - 3] + "..."
-
-
 def _truncate_text(content: str, max_chars: int = 500) -> str:
-    """截断文本，用于错误信息、工具结果、参数和降级文本。"""
+    """截断安全字段文本；回复正文由调用方决定是否原样渲染。"""
     if len(content) <= max_chars:
         return content
     return content[:max_chars] + "..."
@@ -221,36 +87,24 @@ def _safe_error_code(value: str | None) -> str:
     return candidate if _ERROR_CODE_PATTERN.fullmatch(candidate) else "internal_error"
 
 
-def _format_phase_subtotal(phase: str, collector: LLMDiagnosticCollector) -> str:
-    """格式化阶段 token 小计，0 次调用时全部显示为未报告。"""
-    agg = collector.aggregate_phase(phase)
-    call_count = agg.call_count
-    lines = [
-        f"阶段 [{phase}] 小计 ({call_count} 次调用):",
-        f"  输入: {_fmt_token(agg.input_tokens, complete=agg.input_tokens_complete and call_count > 0)}",
-        f"  缓存命中: {_fmt_token(agg.cached_input_tokens, complete=agg.cached_input_tokens_complete and call_count > 0)}",
-        f"  缓存未命中: {_fmt_token(agg.cache_miss_input_tokens, complete=agg.cache_miss_input_tokens_complete and call_count > 0)}",
-        f"  输出: {_fmt_token(agg.output_tokens, complete=agg.output_tokens_complete and call_count > 0)}",
-        f"  推理输出: {_fmt_token(agg.reasoning_output_tokens, complete=agg.reasoning_output_tokens_complete and call_count > 0)}",
-        f"  总计: {_fmt_token(agg.total_tokens, complete=agg.total_tokens_complete and call_count > 0)}",
-    ]
-    return "\n".join(lines)
-
-
-def _format_overall_total(collector: LLMDiagnosticCollector) -> str:
-    """格式化全链路 token 总计，0 次调用时全部显示为未报告。"""
-    agg = collector.aggregate_overall()
-    call_count = agg.call_count
-    lines = [
-        f"全链路总计 ({call_count} 次调用):",
-        f"  输入: {_fmt_token(agg.input_tokens, complete=agg.input_tokens_complete and call_count > 0)}",
-        f"  缓存命中: {_fmt_token(agg.cached_input_tokens, complete=agg.cached_input_tokens_complete and call_count > 0)}",
-        f"  缓存未命中: {_fmt_token(agg.cache_miss_input_tokens, complete=agg.cache_miss_input_tokens_complete and call_count > 0)}",
-        f"  输出: {_fmt_token(agg.output_tokens, complete=agg.output_tokens_complete and call_count > 0)}",
-        f"  推理输出: {_fmt_token(agg.reasoning_output_tokens, complete=agg.reasoning_output_tokens_complete and call_count > 0)}",
-        f"  总计: {_fmt_token(agg.total_tokens, complete=agg.total_tokens_complete and call_count > 0)}",
-    ]
-    return "\n".join(lines)
+def _render_final_result_fields(
+    final_result_info: Mapping[str, Any] | None,
+) -> list[str]:
+    """按固定安全白名单渲染最终结果字段。"""
+    if not final_result_info:
+        return []
+    lines: list[str] = []
+    for key, value in final_result_info.items():
+        label = _SAFE_FINAL_RESULT_LABELS.get(key)
+        if label is None:
+            continue
+        if key == "reply_text":
+            lines.append(f"{label}:\n{value}")
+        elif key == "favorability_delta":
+            lines.append(f"{label}: {value}")
+        else:
+            lines.append(f"{label}: {_truncate_text(str(value), max_chars=300)}")
+    return lines
 
 
 def _split_into_nodes(text: str) -> list[str]:
@@ -295,135 +149,60 @@ def _split_into_nodes(text: str) -> list[str]:
 
 
 def _build_chapters(
-    collector: LLMDiagnosticCollector,
+    request_id: str,
     result_type: str,
     *,
     succeeded: bool,
     error: str | None,
-    extra_info: Mapping[str, Any] | None,
     final_result_info: Mapping[str, Any] | None = None,
     public_redacted: bool = False,
 ) -> list[tuple[str, str]]:
     """构建报告章节列表，每项为 (章节标题, 章节正文)。
 
-    extra_info: 安全的请求元数据（user_id, content 等），不放回复正文
-    final_result_info: 最终结果信息（reply_text, favorability_delta 等），
-                       进入"最终结果"章节且回复正文不截断
-    """
-    chapters: list[tuple[str, str]] = []
+    TSK-200：只有「请求总览」与「最终结果」两章。
 
-    # 1. 请求总览：仅安全元数据
+    request_id: 命令显式持有并传入的任务请求 ID
+    result_type: "reply" 或 "summary"
+    error: 安全固定错误码；非安全码形状归一化为 internal_error
+    final_result_info: 只允许安全字段白名单中的键；回复正文不截断
+    public_redacted: 群公开二次脱敏（隐藏输入、输出、用户标识与异常正文）
+    """
     overview_lines = [
-        f"请求 ID: {collector.request_id}",
+        f"请求 ID: {request_id}",
         f"类型: {result_type}",
         f"状态: {'成功' if succeeded else '失败'}",
     ]
-    if extra_info and not public_redacted:
-        for key, val in extra_info.items():
-            safe_val = _truncate_text(str(val), max_chars=300)
-            overview_lines.append(f"{key}: {safe_val}")
-    chapters.append(("请求总览", "\n".join(overview_lines)))
 
-    # 2. 最终结果
     if public_redacted:
         final_lines = [
             f"最终结果: {'已成功完成' if succeeded else '执行失败'}",
             "输入、输出、用户标识与异常正文已隐藏",
         ]
+        if not succeeded:
+            final_lines.append(f"错误码: {_safe_error_code(error)}")
     elif succeeded:
         final_lines = ["最终结果: 已成功完成"]
-        if final_result_info:
-            for key, val in final_result_info.items():
-                if key == "reply_text":
-                    final_lines.append(f"回复正文:\n{val}")
-                elif key == "favorability_delta":
-                    final_lines.append(f"拟议好感度: {val}")
-                elif key == "reply_to_message_id":
-                    final_lines.append(f"引用消息 ID: {val}")
-                else:
-                    safe_val = _truncate_text(str(val), max_chars=500)
-                    final_lines.append(f"{key}: {safe_val}")
+        final_lines.extend(_render_final_result_fields(final_result_info))
     else:
         final_lines = [
             "最终结果: 执行失败",
             f"错误码: {_safe_error_code(error)}",
         ]
-        if final_result_info:
-            for key, val in final_result_info.items():
-                safe_val = _truncate_text(str(val), max_chars=300)
-                final_lines.append(f"{key}: {safe_val}")
-    chapters.append(("最终结果", "\n".join(final_lines)))
 
-    # 3. LLM 调用详情（按阶段/轮次分组）
-    if collector.calls:
-        call_lines: list[str] = []
-        ordered_calls = sorted(
-            collector.calls,
-            key=lambda c: (c.phase, c.round_index, c.call_id),
-        )
-        current_phase = ""
-        for idx, call in enumerate(ordered_calls):
-            if call.phase != current_phase:
-                current_phase = call.phase
-                call_lines.append(f"\n--- 阶段: {current_phase} ---")
-            call_lines.append(_format_call_line(call, idx + 1))
-        chapters.append(("LLM 调用详情", "\n".join(call_lines)))
-    else:
-        chapters.append(("LLM 调用详情", "无 LLM 调用记录"))
-
-    # 4. 工具摘要
-    if collector.tools:
-        tool_lines: list[str] = []
-        grouped: dict[str, list] = {}
-        for t in collector.tools:
-            grouped.setdefault(t.call_id, []).append(t)
-        for call_id, tools in grouped.items():
-            tool_lines.append(f"\n调用 {call_id} 的工具:")
-            tool_lines.extend(
-                _format_tool_line(t, public_redacted=public_redacted) for t in tools
-            )
-        chapters.append(("工具摘要", "\n".join(tool_lines)))
-    else:
-        chapters.append(("工具摘要", "无工具调用记录"))
-
-    # 5. 阶段 token 小计
-    if collector.calls:
-        phases = sorted({c.phase for c in collector.calls})
-        subtotal_lines = [_format_phase_subtotal(phase, collector) for phase in phases]
-        chapters.append(("阶段 token 小计", "\n".join(subtotal_lines)))
-    else:
-        chapters.append(("阶段 token 小计", "无"))
-
-    # 6. 全链路 token 小计
-    chapters.append(("全链路 token 小计", _format_overall_total(collector)))
-
-    # 7. 错误/降级
-    if collector.errors:
-        if public_redacted:
-            error_lines = [f"共 {len(collector.errors)} 个错误或降级事件，详情已隐藏"]
-        else:
-            error_lines = [
-                f"阶段: {err['phase']} | "
-                f"类型: {_truncate_text(err['type'], max_chars=100)} | "
-                "异常正文: 已隐藏"
-                for err in collector.errors
-            ]
-        chapters.append(("错误/降级", "\n".join(error_lines)))
-    else:
-        chapters.append(("错误/降级", "无"))
-
-    return chapters
+    return [
+        ("请求总览", "\n".join(overview_lines)),
+        ("最终结果", "\n".join(final_lines)),
+    ]
 
 
 async def build_and_send_diagnostic_report(
     *,
     bot: Bot,
     user_id: int,
-    collector: LLMDiagnosticCollector,
+    request_id: str,
     result_type: str,
     succeeded: bool,
     error: str | None = None,
-    extra_info: Mapping[str, Any] | None = None,
     final_result_info: Mapping[str, Any] | None = None,
     public_group_id: int | None = None,
 ) -> DiagnosticDeliveryResult:
@@ -432,20 +211,18 @@ async def build_and_send_diagnostic_report(
     Args:
         bot: OneBot Bot 实例
         user_id: 已通过鉴权的 SUPERUSER ID
-        collector: 诊断收集器
+        request_id: 命令显式持有的任务请求 ID
         result_type: "reply" 或 "summary"
         succeeded: 是否成功
-        error: 错误信息（失败时）
-        extra_info: 私聊报告使用的请求元数据
-        final_result_info: 最终结果信息（回复正文、好感度变化等）
+        error: 安全固定错误码（失败时）
+        final_result_info: 最终结果安全字段（回复正文、好感度变化等）
         public_group_id: 显式请求公开脱敏报告时的目标群 ID
     """
     private_chapters = _build_chapters(
-        collector,
+        request_id,
         result_type,
         succeeded=succeeded,
         error=error,
-        extra_info=extra_info,
         final_result_info=final_result_info,
     )
     private_delivered = await _send_report_nodes(
@@ -469,11 +246,10 @@ async def build_and_send_diagnostic_report(
                 public_delivered=None,
             )
         public_chapters = _build_chapters(
-            collector,
+            request_id,
             result_type,
             succeeded=succeeded,
             error=error,
-            extra_info=extra_info,
             final_result_info=final_result_info,
             public_redacted=True,
         )

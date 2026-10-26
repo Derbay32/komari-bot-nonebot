@@ -141,7 +141,6 @@ async def test_planner_passes_planning_slot_request_mode(monkeypatch: Any) -> No
         planning_request_api="responses",
         planning_stream_enabled=True,
         request_trace_id="trace",
-        collector=None,
     )
 
     assert llm_kwargs
@@ -188,7 +187,6 @@ async def test_planner_plain_mode_keeps_auto_tool_choice(monkeypatch: Any) -> No
         planning_request_api="responses",
         planning_stream_enabled=False,
         request_trace_id="trace",
-        collector=None,
     )
 
     assert llm_kwargs[0]["tool_choice"] == "auto"
@@ -233,7 +231,6 @@ async def test_planner_thinking_mode_omits_tool_choice(monkeypatch: Any) -> None
         planning_request_api="responses",
         planning_stream_enabled=False,
         request_trace_id="trace",
-        collector=None,
     )
 
     assert "tool_choice" not in llm_kwargs[0], "思考模式必须保持省略 tool_choice"
@@ -257,7 +254,7 @@ async def test_summarize_passes_summary_slot_request_mode(monkeypatch: Any) -> N
     monkeypatch.setattr(
         summarize_module.llm_provider, "generate_messages_completion", _fake_gen
     )
-    # collector=None 时走 str 便捷接口，两路径都必须透传
+    # TSK-200：总结固定走 str 便捷接口，槽位配置必须透传
     monkeypatch.setattr(
         summarize_module.llm_provider, "generate_text_with_messages", _fake_gen_text
     )
@@ -270,7 +267,6 @@ async def test_summarize_passes_summary_slot_request_mode(monkeypatch: Any) -> N
         request_api="responses",
         stream_enabled=True,
         request_trace_id="trace",
-        collector=None,
     )
 
     assert llm_kwargs
@@ -338,7 +334,7 @@ async def test_execute_group_summary_wires_config_slots_to_llm_calls(
         return "<content>今天主要讨论了测试。</content>"
 
     # conftest 的 llm_provider 替身是跨插件共享单例，按 request_phase 分发记录；
-    # dummy create_collector 返回 None，总结走 str 便捷接口，两个方法都要打桩
+    # TSK-200：总结固定走 str 便捷接口，两个方法都要打桩
     monkeypatch.setattr(
         planner_module.llm_provider, "generate_messages_completion", _fake_gen
     )
@@ -443,7 +439,6 @@ async def test_planner_attaches_continuation_to_assistant_message(
         planning_request_api="responses",
         planning_stream_enabled=False,
         request_trace_id="trace",
-        collector=None,
     )
 
     assert len(llm_kwargs) == 2

@@ -10,7 +10,7 @@ provider 瞬时重试仍属同一逻辑轮次（AC8）、Agent Run 结构化预�
 （``generate_reply`` / ``generate_reply_with_tools``）与公开无副作用 debug
 生成入口（``MessageHandler.generate_debug_reply``），配合可控 provider 与
 业务工具替身；只断言可观察行为（provider 请求次数/轮次阶段/工具执行次数/
-结果/collector 记录），不断言私有计数 helper 或内部常量。
+结果），不断言私有计数 helper 或内部常量。
 
 所有预算 fixture 必须满足真实 Schema 约束（``per_round <= total <=
 rounds*per_round``，另含字段范围 2..20 / 1..8 / 2..64），由
@@ -28,10 +28,8 @@ from typing import Any
 import pytest
 
 from komari_bot.context.redis_store import MessageSchema
-from komari_bot.plugins.agent_run_logger.diagnostic import AgentRunCollector
 from komari_bot.plugins.llm_provider.base_client import (
     LLMCompletionResultSchema,
-    LLMProviderContinuationSchema,
     LLMToolCallFunctionSchema,
     LLMToolCallSchema,
 )
@@ -808,88 +806,6 @@ def test_provider_transient_retry_stays_within_same_logical_round(
     ]
 
 
-# ── Agent Run 预算元数据（AC9） ────────────────────────────────────────
-
-
-def test_agent_run_records_frozen_budget_and_consumption(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Agent Run 记录冻结预算与轮次/工具消耗，且保留既有记录结构。
-
-    ``record["budget"]`` 块（任务开始冻结的预算值 + rounds_used /
-    tool_calls_used）是本 ticket 选定的外部 JSONL contract，经公开
-    collector 构造 seam 观察；消耗计数与 ``record["rounds"]`` 的工具提案
-    数一致。只断言预算相关字段与既有顶层键存在，不复制/校验与预算无关的
-    完整正文（正文内容由 agent_run_logger 自有测试基线负责）。
-    """
-    config = _build_config(
-        agent_max_rounds=2,
-        agent_max_tool_calls_per_round=4,
-        agent_max_total_tool_calls=4,
-    )
-    provider = _ScriptedProvider(
-        [
-            _search_completion("a"),
-            _final_response_completion("预算记录回复"),
-        ]
-    )
-    search = _FakeSearch()
-    original_search_web = search.search_web
-
-    async def _mutating_search_web(query: str, **kwargs: object) -> str:
-        # 任务执行期间把配置改为合法最小值：记录中必须是任务开始时的冻结预算
-        config.agent_max_rounds = 2
-        config.agent_max_tool_calls_per_round = 1
-        config.agent_max_total_tool_calls = 2
-        return await original_search_web(query, **kwargs)
-
-    monkeypatch.setattr(llm_service_module, "llm_provider", provider)
-    monkeypatch.setattr(
-        llm_service_module,
-        "komari_search",
-        SimpleNamespace(search_web=_mutating_search_web, fetch_page=search.fetch_page),
-    )
-    collector = AgentRunCollector(request_id="budget-tsk-192")
-
-    result = asyncio.run(
-        llm_service_module.generate_reply_with_tools(
-            config=config,
-            messages=[{"role": "user", "content": "预算记录"}],
-            tools=[llm_service_module.SEARCH_WEB_TOOL],
-            collector=collector,
-        )
-    )
-    collector.mark_finished(status="success", output=result)
-    record = collector.build_record()
-
-    budget = record["budget"]
-    assert budget["agent_max_rounds"] == 2
-    assert budget["agent_max_tool_calls_per_round"] == 4
-    assert budget["agent_max_total_tool_calls"] == 4
-    assert budget["rounds_used"] == 2
-    assert budget["tool_calls_used"] == 2
-
-    # 消耗计数与结构化 trace 一致，不断言/复制完整正文
-    assert len(record["rounds"]) == budget["rounds_used"]
-    proposed_calls = sum(
-        len(trace_entry["response"]["tool_calls"]) for trace_entry in record["rounds"]
-    )
-    assert proposed_calls == budget["tool_calls_used"]
-
-    # 既有记录结构不因新增预算元数据而改变（脱敏边界不被削弱）；仅检查
-    # 顶层键存在，不校验与预算无关的正文内容
-    for key in (
-        "schema_version",
-        "rounds",
-        "tool_executions",
-        "errors",
-        "usage",
-        "input",
-        "output",
-    ):
-        assert key in record
-
-
 # ── 隐藏封顶删除（AC4 / 边界 AC10） ───────────────────────────────────
 
 
@@ -1325,81 +1241,6 @@ def test_handler_reports_incompatible_provider_rejection_as_reply_failure(
         assert call["model"] == "chat-model"
 
 
-def test_agent_run_records_frozen_tool_mode_violation_and_usage(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """TSK-193 AC7/AC9：裸文本违例保留完整诊断，消耗 1 轮但 0 工具调用。
-
-    记录冻结的 tool mode、协议违例与预算 usage；被拒绝的 completion 的
-    正文 / reasoning / continuation 完整留在 collector 投影中。
-    """
-    config = _build_config(
-        agent_tool_call_mode="prompt_guided",
-        agent_max_rounds=2,
-        agent_max_tool_calls_per_round=4,
-        agent_max_total_tool_calls=4,
-    )
-    continuation = LLMProviderContinuationSchema(
-        api="responses",
-        output_items=[
-            {"type": "message", "id": "msg_1"},
-            {"type": "reasoning", "id": "rs_1"},
-        ],
-    )
-    provider = _ScriptedProvider(
-        [
-            LLMCompletionResultSchema(
-                content="裸文本违例正文",
-                reasoning_content="裸文本轮推理正文",
-                tool_calls=[],
-                finish_reason="stop",
-                continuation=continuation,
-            ),
-            _final_response_completion("违例后成功回复"),
-        ]
-    )
-    monkeypatch.setattr(llm_service_module, "llm_provider", provider)
-    monkeypatch.setattr(retry_module.asyncio, "sleep", _no_sleep)
-    collector = AgentRunCollector(request_id="tsk193-violation")
-
-    result = asyncio.run(
-        llm_service_module.generate_reply_with_tools(
-            config=config,
-            messages=[{"role": "user", "content": "违例诊断"}],
-            tools=[llm_service_module.SEARCH_WEB_TOOL],
-            collector=collector,
-        )
-    )
-    collector.mark_finished(status="success", output=result)
-    record = collector.build_record()
-
-    # 被拒 completion 完整保留（正文 / reasoning / continuation）
-    first_response = record["rounds"][0]["response"]
-    assert first_response["content"] == "裸文本违例正文"
-    assert first_response["reasoning_content"] == "裸文本轮推理正文"
-    assert first_response["continuation"]["output_items"] == [
-        {"type": "message", "id": "msg_1"},
-        {"type": "reasoning", "id": "rs_1"},
-    ]
-
-    # 冻结 tool mode 与任务整体消耗：违例轮(0 工具) + 成功轮(1 工具)
-    assert record["budget"].get("agent_tool_call_mode") == "prompt_guided"
-    assert record["budget"]["rounds_used"] == 2
-    assert record["budget"]["tool_calls_used"] == 1
-    assert len(record["rounds"]) == 2
-    # 违例轮本身：1 个轮次、0 个工具调用
-    assert len(record["rounds"][0]["response"]["tool_calls"]) == 0
-
-    # 协议违例进入诊断错误列表（消息文本为既有可观察诊断文案）
-    assert record["errors"], "裸文本违例必须记录协议违例诊断"
-    assert any(
-        "未调用任何工具" in str(error.get("message", "")) for error in record["errors"]
-    )
-
-    # 后续合法 final_response 仍成功
-    assert result.content == "违例后成功回复"
-
-
 # ── TSK-193 修订：from_config 严格 no-fallback 契约 ─────────────────────
 
 
@@ -1462,18 +1303,14 @@ def test_consecutive_bare_text_until_rounds_exhausted_is_diagnosable_protocol_fa
     )
     monkeypatch.setattr(llm_service_module, "llm_provider", provider)
     monkeypatch.setattr(retry_module.asyncio, "sleep", _no_sleep)
-    collector = AgentRunCollector(request_id="tsk193-rounds-exhausted")
 
     with pytest.raises(RuntimeError) as excinfo:
         asyncio.run(
             llm_service_module.generate_reply(
                 config=config,
                 messages=[{"role": "user", "content": "连续裸文本"}],
-                collector=collector,
             )
         )
-    collector.mark_finished(status="error", error=excinfo.value)
-    record = collector.build_record()
 
     assert len(provider.completion_calls) == 2, "必须恰好消耗配置轮次，无隐藏纠错轮"
     assert "未调用任何工具" in str(excinfo.value)
@@ -1481,6 +1318,3 @@ def test_consecutive_bare_text_until_rounds_exhausted_is_diagnosable_protocol_fa
     assert not any(message.get("role") == "assistant" for message in second_messages), (
         "裸文本轮不得作为 assistant 消息进入下一轮"
     )
-    assert record["budget"]["rounds_used"] == 2
-    assert record["budget"]["tool_calls_used"] == 0
-    assert record["errors"], "轮次耗尽协议失败必须进入诊断错误列表"

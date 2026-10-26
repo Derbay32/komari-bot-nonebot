@@ -661,7 +661,6 @@ def build_management_components() -> Any:
     keep old component constructions green with a no-op default).
     """
 
-    from komari_bot.plugins.agent_run_logger.api import register_agent_run_log_api
     from komari_bot.plugins.character_binding.management_api import (
         register_character_binding_repair_api,
     )
@@ -689,8 +688,6 @@ def build_management_components() -> Any:
         knowledge_engine_getter=lambda: None,
         register_help_api=register_help_api,
         help_engine_getter=lambda: None,
-        register_agent_run_log_api=register_agent_run_log_api,
-        agent_run_log_reader_getter=lambda: None,
         register_search_api=register_search_api,
         register_user_ban_api=register_user_ban_api,
         user_ban_service_getter=lambda: None,

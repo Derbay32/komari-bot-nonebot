@@ -19,8 +19,6 @@ from .prompt_template import get_template
 
 if TYPE_CHECKING:
     from komari_bot.llm.llm_protocol import RequestApi
-    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
-    from komari_bot.plugins.llm_provider.base_client import LLMCompletionResultSchema
 
 require("llm_provider")
 from komari_bot.plugins import llm_provider
@@ -71,15 +69,10 @@ async def _summarize_history_internal(
     request_api: "RequestApi" = "chat_completions",
     stream_enabled: bool = False,
     request_trace_id: str | None = None,
-    collector: "LLMDiagnosticCollector | None" = None,
-) -> tuple[str, "LLMCompletionResultSchema | None"]:
-    """内部总结方法，同时返回文本和 completion 详情。
-
-    当 collector 非 None 时使用 generate_messages_completion 获取
-    completion 级元数据并记录到 collector；否则使用 str 便捷接口。
-    """
+) -> str:
+    """内部总结方法：只经 str 便捷接口生成总结正文。"""
     if not history_messages:
-        return DEFAULT_SUMMARY_TEXT, None
+        return DEFAULT_SUMMARY_TEXT
 
     template = await get_template()
     transcript = _build_transcript(history_messages)
@@ -110,62 +103,8 @@ async def _summarize_history_internal(
             ]
         )
 
-    if collector is not None:
-        from komari_bot.plugins.agent_run_logger.diagnostic import (
-            record_completion_call,
-            record_failed_call,
-        )
-
-        request_data = {
-            "messages": messages,
-            "model": model,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "thinking_mode": thinking_mode,
-            "reasoning_effort": reasoning_effort,
-            "request_api": request_api,
-            "stream_enabled": stream_enabled,
-        }
-        # TSK-229：summary LLM 为不可分瞬时效果；调用前按目标群 BUSINESS
-        # 裁决，受限即抛 SummaryAdmissionDeniedError 终止本任务（正常控制流）。
-        ensure_effect_admitted(group_id=group_id)
-        try:
-            completion = await llm_provider.generate_messages_completion(
-                **request_data,
-                request_trace_id=request_trace_id,
-                request_phase="group_history_summary_final",
-            )
-        except Exception as exc:
-            record_failed_call(
-                collector,
-                phase="group_history_summary_final",
-                round_index=0,
-                method="generate_messages_completion",
-                model=model,
-                request=request_data,
-                error=exc,
-                parent_call_id=request_trace_id,
-            )
-            raise
-
-        record_completion_call(
-            collector,
-            parent_call_id=request_trace_id,
-            phase="group_history_summary_final",
-            round_index=0,
-            method="generate_messages_completion",
-            model=model,
-            request=request_data,
-            completion=completion,
-        )
-
-        summary_text = _extract_tag_content(completion.content, "content")
-        if not summary_text:
-            return DEFAULT_SUMMARY_TEXT, completion
-
-        return summary_text, completion
-
-    # TSK-229：非 collector 便捷路径同样在 summary LLM 前按目标群裁决。
+    # TSK-229：summary LLM 为不可分瞬时效果；调用前按目标群 BUSINESS
+    # 裁决，受限即抛 SummaryAdmissionDeniedError 终止本任务（正常控制流）。
     ensure_effect_admitted(group_id=group_id)
     raw_result = await llm_provider.generate_text_with_messages(
         messages=messages,  # type: ignore[arg-type]
@@ -177,13 +116,14 @@ async def _summarize_history_internal(
         request_api=request_api,
         stream_enabled=stream_enabled,
         request_phase="group_history_summary",
+        request_trace_id=request_trace_id or "",
     )
     summary_text = _extract_tag_content(raw_result, "content")
 
     if not summary_text:
-        return DEFAULT_SUMMARY_TEXT, None
+        return DEFAULT_SUMMARY_TEXT
 
-    return summary_text, None
+    return summary_text
 
 
 async def summarize_history_messages(
@@ -200,10 +140,9 @@ async def summarize_history_messages(
     request_api: "RequestApi" = "chat_completions",
     stream_enabled: bool = False,
     request_trace_id: str | None = None,
-    collector: "LLMDiagnosticCollector | None" = None,
 ) -> str:
     """总结历史消息，返回总结正文。"""
-    text, _completion = await _summarize_history_internal(
+    return await _summarize_history_internal(
         history_messages,
         model,
         temperature,
@@ -216,9 +155,7 @@ async def summarize_history_messages(
         request_api=request_api,
         stream_enabled=stream_enabled,
         request_trace_id=request_trace_id,
-        collector=collector,
     )
-    return text
 
 
 def summary_text_to_lines(summary_text: str) -> list[str]:

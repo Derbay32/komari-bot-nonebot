@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from nonebot import logger
-from nonebot.plugin import require
 
 from .admission_gate import SummaryAdmissionDeniedError, ensure_effect_admitted
 from .group_lock import GroupSummaryLockLostError, group_summary_lock_manager
@@ -23,8 +22,6 @@ from .summarize_service import summarize_history_messages, summary_text_to_lines
 
 if TYPE_CHECKING:
     from nonebot.adapters.onebot.v11 import Bot
-
-    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
 
     from .config_schema import DynamicConfigSchema
 
@@ -60,8 +57,6 @@ SUMMARY_TITLE = "小鞠的总结时间到！"
 EMPTY_HISTORY_TEXT = "可用的文本记录太少，没法总结……"
 
 _group_lock_manager = group_summary_lock_manager
-require("agent_run_logger")
-from komari_bot.plugins import agent_run_logger as agent_run_logger_plugin
 
 
 def _format_time_range(start_ts: int, end_ts: int) -> str:
@@ -107,7 +102,7 @@ async def _execute_group_summary_core(
     user_request: str,
     config: DynamicConfigSchema,
     requested_count: int | None,
-    collector: "LLMDiagnosticCollector | None",
+    request_trace_id: str,
     history_capability_confirmed: bool,
 ) -> SummaryExecutionResult:
     """在已持有群租约时执行规划、总结和渲染。"""
@@ -119,10 +114,6 @@ async def _execute_group_summary_core(
             "[GroupHistorySummary] 当前 Onebot/Napcat 实现尚未支持获取群聊记录能力"
         )
         raise CapabilityNotSupportedError
-
-    request_trace_id = (
-        collector.request_id if collector is not None else uuid.uuid4().hex[:12]
-    )
 
     logger.info("[GroupHistorySummary] 开始执行总结，trace_id={}", request_trace_id)
 
@@ -144,7 +135,6 @@ async def _execute_group_summary_core(
         planning_request_api=config.summary_planning_request_api,
         planning_stream_enabled=config.summary_planning_stream_enabled,
         request_trace_id=request_trace_id,
-        collector=collector,
         history_min_coverage_ratio=config.history_min_coverage_ratio,
     )
 
@@ -184,7 +174,6 @@ async def _execute_group_summary_core(
         request_api=config.summary_request_api,
         stream_enabled=config.summary_stream_enabled,
         request_trace_id=request_trace_id,
-        collector=collector,
     )
 
     result_summary_text = (
@@ -231,7 +220,7 @@ async def execute_group_summary(
     user_request: str,
     config: DynamicConfigSchema,
     requested_count: int | None = None,
-    collector: "LLMDiagnosticCollector | None" = None,
+    request_trace_id: str | None = None,
     *,
     history_capability_confirmed: bool = False,
 ) -> SummaryExecutionResult:
@@ -240,6 +229,7 @@ async def execute_group_summary(
     由正常 handler 与 debug 插件共同调用，内部处理能力检查、群锁、
     规划、总结和图片渲染。正常入口已完成能力检查时，可通过
     ``history_capability_confirmed`` 避免对同一请求重复探测。
+    ``request_trace_id`` 只用于普通运行日志；缺省时生成既有风格的请求 ID。
 
     Raises:
         SummaryBusyError: 同群已有总结任务运行中
@@ -247,31 +237,13 @@ async def execute_group_summary(
         HistoryIncompleteError: 群历史读取失败且完整度低于配置阈值
         SummaryServiceUnavailableError: 分布式锁服务不可用或租约丢失
     """
-    if collector is None:
-        collector = agent_run_logger_plugin.create_collector(
-            run_type="group_history_summary",
-            task_kind="group_history_summary",
-            trace_id=f"group-summary-{uuid.uuid4().hex[:12]}",
-            input_data={
-                "group_id": group_id,
-                "bot_self_id": bot_self_id,
-                "user_request": user_request,
-                "requested_count": requested_count,
-            },
-        )
+    trace_id = request_trace_id or f"group-summary-{uuid.uuid4().hex[:12]}"
     try:
         lease = await _group_lock_manager.try_acquire(
             group_id=group_id,
             redis_db=config.redis_db,
             ttl_seconds=config.summary_lock_ttl_seconds,
         )
-    except asyncio.CancelledError as exc:
-        await agent_run_logger_plugin.finalize_collector(
-            collector,
-            status="cancelled",
-            error=exc,
-        )
-        raise
     except Exception as exc:
         logger.error(
             "[GroupHistorySummary] 分布式锁获取失败: error_type={}",
@@ -280,21 +252,10 @@ async def execute_group_summary(
         error = SummaryServiceUnavailableError(
             "群总结服务暂时不可用，请稍后重试"
         )
-        await agent_run_logger_plugin.finalize_collector(
-            collector,
-            status="error",
-            error=exc,
-        )
         raise error from None
 
     if lease is None:
-        error = SummaryBusyError("在、在看了……等、等会！")
-        await agent_run_logger_plugin.finalize_collector(
-            collector,
-            status="error",
-            error=error,
-        )
-        raise error
+        raise SummaryBusyError("在、在看了……等、等会！")
 
     try:
         try:
@@ -306,7 +267,7 @@ async def execute_group_summary(
                     user_request=user_request,
                     config=config,
                     requested_count=requested_count,
-                    collector=collector,
+                    request_trace_id=trace_id,
                     history_capability_confirmed=history_capability_confirmed,
                 )
             )
@@ -329,36 +290,12 @@ async def execute_group_summary(
                 time_range="无",
                 history_fetch=None,
             )
-        except GroupSummaryLockLostError as exc:
+        except GroupSummaryLockLostError:
             error = SummaryServiceUnavailableError(
                 "群总结任务租约已失效，请稍后重试"
             )
-            await agent_run_logger_plugin.finalize_collector(
-                collector,
-                status="error",
-                error=exc,
-            )
             raise error from None
-        except asyncio.CancelledError as exc:
-            await agent_run_logger_plugin.finalize_collector(
-                collector,
-                status="cancelled",
-                error=exc,
-            )
-            raise
-        except Exception as exc:
-            await agent_run_logger_plugin.finalize_collector(
-                collector,
-                status="error",
-                error=exc,
-            )
-            raise
         else:
-            await agent_run_logger_plugin.finalize_collector(
-                collector,
-                status="success",
-                output=result,
-            )
             return result
     finally:
         await lease.close()

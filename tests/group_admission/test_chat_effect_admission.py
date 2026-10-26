@@ -227,7 +227,6 @@ async def test_tool_dispatch_restricted_blocks_tool_body(
         caller_group_id=None,
         caller_is_superuser=False,
         request_trace_id="chat-1",
-        parent_call_id=None,
     )
 
     assert scripted.calls != [], "chat.tool_dispatch 工具前未调用 adjudicate"
@@ -273,7 +272,6 @@ async def test_tool_search_restricted_blocks_search_web(
         caller_group_id=None,
         caller_is_superuser=False,
         request_trace_id="chat-2",
-        parent_call_id=None,
     )
 
     assert scripted.calls != [], "chat.tool_search 搜索前未调用 adjudicate"

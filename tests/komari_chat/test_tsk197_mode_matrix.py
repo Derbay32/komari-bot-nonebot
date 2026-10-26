@@ -343,15 +343,5 @@ def test_tool_and_image_mode_matrix(
             vision_results[0].get("content", "")
         ), "工具结果必须携带视觉描述正文"
 
-        # Agent Run 工具 trace 保留 read_image 成功执行记录
-        record = result.collector.build_record()
-        read_image_traces = [
-            trace
-            for trace in record["tool_executions"]
-            if trace["tool_name"] == "read_image"
-        ]
-        assert len(read_image_traces) == 1, (
-            "Agent Run 必须记录 read_image 工具执行 trace"
-        )
-        assert read_image_traces[0]["status"] == "success"
-        assert VISION_DESCRIPTION in str(read_image_traces[0]["result"])
+        # TSK-200：采集器退役后不再保留 Agent Run 工具 trace；视觉效果业务
+        # 断言由上面的 vision 子调用与工具结果回流覆盖。

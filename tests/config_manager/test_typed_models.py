@@ -14,7 +14,6 @@ if TYPE_CHECKING:
     from komari_bot.config.typed_config import TypedConfigModel
 
 CONFIG_SCHEMA_MODULES = (
-    "komari_bot.plugins.agent_run_logger.config_schema",
     "komari_bot.plugins.embedding_provider.config_schema",
     "komari_bot.plugins.group_history_summary.config_schema",
     "komari_bot.plugins.komari_context.config_schema",
@@ -49,7 +48,7 @@ def _config_models() -> list[type[TypedConfigModel]]:
                     getattr(
                         module,
                         "KomariContextConfigSchema",
-                        getattr(module, "AgentRunLoggerConfigSchema", None),
+                        None,
                     ),
                 ),
             ),
@@ -63,7 +62,8 @@ def _config_models() -> list[type[TypedConfigModel]]:
 def test_every_dynamic_config_is_a_distinct_typed_table() -> None:
     models = _config_models()
 
-    assert len(models) == 15
+    # TSK-200 起 agent_run_logger 配置模型随插件退役（15 → 14）。
+    assert len(models) == 14
     assert all(issubclass(model, SQLModel) for model in models)
     assert all(hasattr(model, "__table__") for model in models)
     table_names = {model.__table__.name for model in models}

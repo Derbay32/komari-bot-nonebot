@@ -115,15 +115,6 @@ _RESOURCE_SPECS: tuple[ResourceSpec, ...] = (
         legacy_table="komari_plugin_configs",
         legacy_key_column="plugin_name",
         legacy_data_column="config_data",
-        key_value="agent_run_logger",
-        target_table="komari_agent_run_logger_config",
-        columns=("log_enabled", "retention_days"),
-        deprecated_keys=_DEPRECATED_PLUGIN_KEYS,
-    ),
-    ResourceSpec(
-        legacy_table="komari_plugin_configs",
-        legacy_key_column="plugin_name",
-        legacy_data_column="config_data",
         key_value="embedding_provider",
         target_table="komari_embedding_provider_config",
         columns=(

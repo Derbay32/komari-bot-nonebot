@@ -256,15 +256,6 @@ def _wire_entry(
             favorability_reason="测试",
         )
 
-    async def _finalize(_collector: object, **_kwargs: object) -> None:
-        return None
-
-    def _collector(**_kwargs: object) -> object:
-        return SimpleNamespace(
-            request_id="trace-1",
-            add_error=lambda **_error: None,
-        )
-
     async def _not_superuser(_bot: object, _event: object) -> bool:
         return False
 
@@ -286,14 +277,6 @@ def _wire_entry(
         ),
     )
     monkeypatch.setattr(mh, "SUPERUSER", _not_superuser)
-    monkeypatch.setattr(
-        mh,
-        "agent_run_logger_plugin",
-        SimpleNamespace(
-            create_collector=_collector,
-            finalize_collector=_finalize,
-        ),
-    )
     return SimpleNamespace(
         config=chat_config,
         generate_calls=generate_calls,

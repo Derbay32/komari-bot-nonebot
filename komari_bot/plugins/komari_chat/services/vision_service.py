@@ -16,9 +16,6 @@ from nonebot.plugin import require
 
 from komari_bot.plugins.llm_provider.config_schema import DynamicConfigSchema
 
-if __import__("typing", fromlist=["TYPE_CHECKING"]).TYPE_CHECKING:
-    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
-
 require("config_manager")
 require("llm_provider")
 
@@ -57,8 +54,8 @@ async def _load_vision_description_prompt() -> str:
 def _format_error(error: Exception) -> str:
     """归一化读图失败信息（TSK-195 第二轮安全验收反馈）。
 
-    只返回异常类型名作为稳定错误码；该值会回流主模型工具结果与诊断
-    收集器，绝不携带 provider 原始异常消息、URL 或 data URI。
+    只返回异常类型名作为稳定错误码；该值会回流主模型工具结果与普通
+    运行日志，绝不携带 provider 原始异常消息、URL 或 data URI。
     """
     return type(error).__name__
 
@@ -76,8 +73,6 @@ async def _read_single_image(
     thinking_mode: bool = False,
     reasoning_effort: str = "",
     request_trace_id: str | None = None,
-    parent_call_id: str | None = None,
-    collector: "LLMDiagnosticCollector | None" = None,
     group_id: str | None = None,
 ) -> str:
     """调用视觉模型读取单张图片。"""
@@ -135,22 +130,6 @@ async def _read_single_image(
         content = completion.content or ""
         description = content.strip() or "[图片读取失败: 视觉模型返回空内容]"
 
-        if collector is not None:
-            from komari_bot.plugins.agent_run_logger.diagnostic import (
-                record_completion_call,
-            )
-
-            record_completion_call(
-                collector,
-                parent_call_id=parent_call_id,
-                phase="vision_read_image",
-                round_index=image_index,
-                method="generate_messages_completion",
-                model=vision_model,
-                request=request_data,
-                completion=completion,
-            )
-
         logger.info(
             "[VisionService] 图片读取完成: index={} model={} description_chars={}",
             image_index,
@@ -170,27 +149,6 @@ async def _read_single_image(
             vision_model,
             error_type,
         )
-        if collector is not None:
-            from komari_bot.plugins.agent_run_logger.diagnostic import (
-                record_failed_call,
-            )
-
-            record_failed_call(
-                collector,
-                phase="vision_read_image",
-                round_index=image_index,
-                method="generate_messages_completion",
-                model=vision_model,
-                request=request_data,
-                error=error,
-                parent_call_id=parent_call_id,
-                message=failure_text,
-            )
-            collector.add_error(
-                phase="vision_read_image",
-                error_type=error_type,
-                message=failure_text,
-            )
         return failure_text
     else:
         return description
@@ -207,8 +165,6 @@ async def read_images(
     thinking_mode: bool = False,
     reasoning_effort: str = "",
     request_trace_id: str | None = None,
-    parent_call_id: str | None = None,
-    collector: "LLMDiagnosticCollector | None" = None,
     group_id: str | None = None,
 ) -> list[str]:
     """调用多模态 AI 读取图片，返回图片描述列表。"""
@@ -231,8 +187,6 @@ async def read_images(
                 thinking_mode=thinking_mode,
                 reasoning_effort=reasoning_effort,
                 request_trace_id=request_trace_id,
-                parent_call_id=parent_call_id,
-                collector=collector,
                 group_id=group_id,
             )
             for index, image_data_uri in enumerate(base64_images)

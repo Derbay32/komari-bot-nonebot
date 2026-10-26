@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
@@ -30,7 +29,6 @@ if TYPE_CHECKING:
     from nonebot.adapters.onebot.v11 import Bot
 
     from komari_bot.llm.llm_protocol import RequestApi
-    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
     from komari_bot.plugins.llm_provider.base_client import LLMCompletionResultSchema
 
 from komari_bot.plugins.llm_provider.base_client import build_assistant_message
@@ -555,7 +553,6 @@ async def plan_summary_request(
     planning_request_api: "RequestApi" = "chat_completions",
     planning_stream_enabled: bool = False,
     request_trace_id: str | None = None,
-    collector: "LLMDiagnosticCollector | None" = None,
     history_min_coverage_ratio: float = 0.8,
 ) -> SummaryPlanResult:
     """使用工具调用规划总结所需的历史记录。"""
@@ -624,50 +621,14 @@ async def plan_summary_request(
         # TSK-229：planning LLM 为不可分瞬时效果；调用前按目标群 BUSINESS
         # 裁决，受限即抛 SummaryAdmissionDeniedError 终止本任务（正常控制流）。
         ensure_effect_admitted(group_id=group_id)
-        try:
-            completion = cast(
-                "LLMCompletionResultSchema",
-                await llm_provider.generate_messages_completion(
-                    **request_data,
-                    request_trace_id=request_trace_id,
-                    request_phase=trace_phase,
-                ),
-            )
-        except Exception as exc:
-            if collector is not None:
-                from komari_bot.plugins.agent_run_logger.diagnostic import (
-                    record_failed_call,
-                )
-
-                record_failed_call(
-                    collector,
-                    phase=trace_phase,
-                    round_index=round_index - 1,
-                    method="generate_messages_completion",
-                    model=planning_model,
-                    request=request_data,
-                    error=exc,
-                    parent_call_id=request_trace_id,
-                )
-            raise
-
-        if collector is not None:
-            from komari_bot.plugins.agent_run_logger.diagnostic import (
-                record_completion_call,
-            )
-
-            round_call_id = record_completion_call(
-                collector,
-                phase=trace_phase,
-                round_index=round_index - 1,
-                method="generate_messages_completion",
-                model=planning_model,
-                request=request_data,
-                completion=completion,
-                parent_call_id=request_trace_id,
-            )
-        else:
-            round_call_id = None
+        completion = cast(
+            "LLMCompletionResultSchema",
+            await llm_provider.generate_messages_completion(
+                **request_data,
+                request_trace_id=request_trace_id,
+                request_phase=trace_phase,
+            ),
+        )
 
         if not completion.tool_calls:
             return SummaryPlanResult(
@@ -689,78 +650,9 @@ async def plan_summary_request(
                     "[GroupHistorySummary] 收到未知工具调用: {}",
                     tool_call.function.name,
                 )
-                if collector is not None:
-                    from komari_bot.plugins.agent_run_logger.diagnostic import (
-                        ToolExecutionTrace,
-                    )
-
-                    collector.add_tool(
-                        ToolExecutionTrace(
-                            call_id=round_call_id or "",
-                            tool_name=tool_call.function.name,
-                            parsed_arguments=tool_call.parsed_arguments or {},
-                            status="error",
-                            error=f"未知工具: {tool_call.function.name}",
-                            error_summary=f"未知工具: {tool_call.function.name}",
-                        )
-                    )
                 continue
             arguments = tool_call.parsed_arguments or {}
-            tool_started_at = time.monotonic()
-            try:
-                tool_result = await executor(arguments)
-                tool_status = "success"
-                tool_error = None
-            except Exception as exc:
-                tool_status = "error"
-                tool_error = str(exc)[:200]
-                if collector is not None:
-                    from komari_bot.plugins.agent_run_logger.diagnostic import (
-                        ToolExecutionTrace,
-                    )
-
-                    collector.add_tool(
-                        ToolExecutionTrace(
-                            call_id=round_call_id or "",
-                            tool_name=tool_call.function.name,
-                            parsed_arguments=arguments,
-                            status="error",
-                            error=str(exc),
-                            duration_ms=(time.monotonic() - tool_started_at) * 1000,
-                            error_summary=tool_error,
-                        )
-                    )
-                raise
-
-            if collector is not None:
-                from komari_bot.plugins.agent_run_logger.diagnostic import (
-                    ToolExecutionTrace,
-                )
-
-                collector.add_tool(
-                    ToolExecutionTrace(
-                        call_id=round_call_id or "",
-                        tool_name=tool_call.function.name,
-                        parsed_arguments=arguments,
-                        status=tool_status,
-                        result=tool_result,
-                        duration_ms=(time.monotonic() - tool_started_at) * 1000,
-                        error_summary=tool_error,
-                        result_summary=json.dumps(
-                            {
-                                "source": tool_result.source,
-                                "matched_count": tool_result.matched_count,
-                                "filters": tool_result.filters,
-                                "history_fetch": (
-                                    tool_result.history_fetch.to_public_dict()
-                                    if tool_result.history_fetch is not None
-                                    else None
-                                ),
-                            },
-                            ensure_ascii=False,
-                        ),
-                    )
-                )
+            tool_result = await executor(arguments)
 
             serialized_tool_result = _serialize_tool_result(tool_result)
             messages.append(
@@ -789,34 +681,6 @@ async def plan_summary_request(
         history_min_coverage_ratio=history_min_coverage_ratio,
         arguments={"count": summary_default_count, "include_bot_replies": False},
     )
-    if collector is not None:
-        from komari_bot.plugins.agent_run_logger.diagnostic import ToolExecutionTrace
-
-        collector.add_tool(
-            ToolExecutionTrace(
-                call_id=(collector.calls[-1].call_id if collector.calls else ""),
-                tool_name="fetch_recent_group_messages",
-                parsed_arguments={
-                    "count": summary_default_count,
-                    "include_bot_replies": False,
-                },
-                status="success",
-                result=fallback_result,
-                result_summary=json.dumps(
-                    {
-                        "source": fallback_result.source,
-                        "matched_count": fallback_result.matched_count,
-                        "filters": fallback_result.filters,
-                        "history_fetch": (
-                            fallback_result.history_fetch.to_public_dict()
-                            if fallback_result.history_fetch is not None
-                            else None
-                        ),
-                    },
-                    ensure_ascii=False,
-                ),
-            )
-        )
     return SummaryPlanResult(
         messages=fallback_result.messages,
         tool_result=fallback_result,

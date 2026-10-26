@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import dataclasses
 import inspect
 import json
 from importlib import import_module
@@ -15,7 +16,6 @@ from nonebot.adapters.onebot.v11 import Message, MessageSegment
 from nonebot.adapters.onebot.v11.event import Reply, Sender
 
 from komari_bot.context.redis_store import MessageSchema
-from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -210,21 +210,15 @@ class _FakeQueryRewrite:
     def __init__(self) -> None:
         self.current_query: str | None = None
         self.request_trace_id: str | None = None
-        self.parent_call_id: str | None = None
-        self.collector: object = None
 
     async def rewrite_query(
         self,
         current_query: str,
         *,
         request_trace_id: str | None = None,
-        parent_call_id: str | None = None,
-        collector: object = None,
     ) -> str:
         self.current_query = current_query
         self.request_trace_id = request_trace_id
-        self.parent_call_id = parent_call_id
-        self.collector = collector
         return "重写后的查询"
 
 
@@ -1140,8 +1134,9 @@ def test_generate_debug_reply_skips_all_side_effects(
     assert result.favorability_delta == 1
     assert result.favorability_reason == "debug测试"
     assert not hasattr(result, "interaction_history")
-    assert result.collector is not None
-    assert result.collector.request_id.startswith("debug-reply-")
+    assert not hasattr(result, "collector")
+    assert result.request_id.startswith("debug-reply-")
+    assert result.image_failure_summary is None
     assert result.reply_to_message_id is None
 
     # 断言零副作用
@@ -1153,10 +1148,10 @@ def test_generate_debug_reply_skips_all_side_effects(
     assert memory.recall_calls == ["重写后的查询"]  # debug 允许召回读取
 
 
-def test_generate_debug_reply_collector_has_query_rewrite_trace(
+def test_generate_debug_reply_uses_explicit_request_trace_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """验证 debug reply 的 collector 包含查询重写和生成阶段的 trace。"""
+    """TSK-200：命令持有的请求 ID 显式下传并贯穿查询重写与生成。"""
     redis = _FakeRedisForDebug()
     memory = FakeHindsightMemory()
     handler = message_handler_module.MessageHandler.__new__(
@@ -1192,12 +1187,11 @@ def test_generate_debug_reply_collector_has_query_rewrite_trace(
     async def _fake_build_prompt(**_kwargs: object) -> list[dict[str, object]]:
         return [{"role": "user", "content": "test"}]
 
-    collector_from_generate: object = None
     trace_id_from_generate: str | None = None
 
     async def _fake_generate_with_tools(**kwargs: object) -> object:
-        nonlocal collector_from_generate, trace_id_from_generate
-        collector_from_generate = kwargs.get("collector")
+        nonlocal trace_id_from_generate
+        assert "collector" not in kwargs
         trace_id_from_generate = cast("str | None", kwargs.get("request_trace_id"))
         assert "max_tool_rounds" not in kwargs, (
             "debug 入口不得传递入口专属轮次封顶（TSK-192）"
@@ -1217,22 +1211,19 @@ def test_generate_debug_reply_collector_has_query_rewrite_trace(
         message_handler_module, "generate_reply", _fake_generate_with_tools
     )
 
-    supplied_collector = LLMDiagnosticCollector(request_id="debug-reply-supplied")
     result = asyncio.run(
         handler.generate_debug_reply(
             group_id="debug-group-2",
             user_id="user-trace",
             user_nickname="trace用户",
             content="debug trace测试",
-            collector=supplied_collector,
+            request_trace_id="debug-reply-supplied",
         )
     )
 
-    assert result.collector is supplied_collector
-    assert result.collector.request_id == "debug-reply-supplied"
-    assert collector_from_generate is result.collector
-    assert handler.query_rewrite.request_trace_id == result.collector.request_id
-    assert trace_id_from_generate == result.collector.request_id
+    assert result.request_id == "debug-reply-supplied"
+    assert handler.query_rewrite.request_trace_id == "debug-reply-supplied"
+    assert trace_id_from_generate == "debug-reply-supplied"
 
 
 def test_generate_debug_reply_with_images_and_reply_context(
@@ -1330,7 +1321,7 @@ def test_generate_debug_reply_with_images_and_reply_context(
     )
 
     assert result.reply == "附图debug回复"
-    assert result.collector is not None
+    assert result.request_id.startswith("debug-reply-")
     assert redis.pushed_messages == []
     assert redis.pushed_global_interactions == []
     assert download_batches == [
@@ -1348,9 +1339,10 @@ def test_generate_debug_reply_with_images_and_reply_context(
 def test_generate_debug_reply_with_image_failure_summary_never_notifies(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """TSK-196 复审：debug 干跑在 core 返回带 partial image_failure_summary
-    时，只把安全结果保留在 collector/output，绝不调用通知边界或发送任何
-    群/私聊消息（不依赖“代码没走 process_message”的注释来保证）。"""
+    """TSK-196/TSK-200：debug 干跑在 core 返回带 partial image_failure_summary
+    时，只把安全结果保留在 ``DebugReplyResult.image_failure_summary``，绝不
+    调用通知边界或发送任何群/私聊消息（不依赖“代码没走 process_message”
+    的注释来保证）。"""
     redis = _FakeRedisForDebug()
     memory = FakeHindsightMemory()
     handler = message_handler_module.MessageHandler.__new__(
@@ -1464,9 +1456,13 @@ def test_generate_debug_reply_with_image_failure_summary_never_notifies(
     assert result.reply == "debug附图回复"
     # 零通知：不构造 notifier、不调汇总、bot 零群/私聊调用
     assert bot.calls == []
-    # 安全结果保留在 collector/output：output 投影含 mode=native 摘要且无 URL
-    record = result.collector.build_record()
-    rendered = json.dumps(record, ensure_ascii=False, default=str)
+    # 安全结果保留在结果的 image_failure_summary 投影：含 mode=native 摘要，
+    # 无 URL/base64/视觉正文。
+    summary = result.image_failure_summary
+    assert summary is not None
+    assert summary.mode == "native"
+    assert summary.error_types == ("image_unavailable",)
+    rendered = json.dumps(dataclasses.asdict(summary), ensure_ascii=False, default=str)
     assert "native" in rendered
     assert "image_unavailable" in rendered
     assert "example.com" not in rendered

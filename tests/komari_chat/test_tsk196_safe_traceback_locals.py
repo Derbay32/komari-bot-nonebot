@@ -29,7 +29,6 @@ from typing import Any
 
 import pytest
 
-from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
 from komari_bot.plugins.komari_chat.services.reply_context import ReplyContext
 
 image_reading_session_module = import_module(
@@ -177,7 +176,6 @@ def _assert_wrapper_clean(wrapper: types.FrameType) -> None:
     wrapper_locals = wrapper.f_locals
     assert wrapper_locals.get("image_urls") is None
     assert wrapper_locals.get("reply_context") is None
-    assert wrapper_locals.get("collector") is None
 
 
 def _assert_frames_safe(exc: BaseException) -> None:
@@ -555,7 +553,6 @@ def test_native_provider_failure_core_frame_locals_are_cleared(
     assert core_locals.get("reply_image_urls") is None
     assert core_locals.get("combined_sources") == []
     assert core_locals.get("prompt_messages") == []
-    assert core_locals.get("collector") is None
     # 全部 komari_chat 帧递归投影安全
     _assert_frames_safe(excinfo.value)
 
@@ -594,7 +591,6 @@ def test_native_all_download_unavailable_core_frame_locals_are_cleared(
     assert core_locals.get("image_urls") is None
     assert core_locals.get("reply_context") is None
     assert core_locals.get("prompt_messages") == []
-    assert core_locals.get("collector") is None
     for frame in (wrapper, core_frame):
         rendered = _render_frame_locals(frame)
         assert _CANARY_PATH_QUERY not in rendered
@@ -655,7 +651,6 @@ def test_delegated_all_unavailable_core_frame_locals_are_cleared(
     assert core_locals.get("image_urls") is None
     assert core_locals.get("reply_context") is None
     assert core_locals.get("prompt_messages") == []
-    assert core_locals.get("collector") is None
     _assert_frames_safe(excinfo.value)
 
 
@@ -666,7 +661,7 @@ def test_debug_reply_image_failure_reraise_clears_frame_locals(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """debug 图片失败重抛：``generate_debug_reply`` frame 的 image_urls/
-    reply_context/refetched_context/collector 已清空，最终异常仍是
+    reply_context/refetched_context 已清空，最终异常仍是
     ``ImageUnderstandingFailureError`` 且安全 summary 保留；traceback 的
     komari_chat 帧递归投影不含 canary。"""
     config = _chat_config_stub(image_understanding_mode="native")
@@ -696,10 +691,6 @@ def test_debug_reply_image_failure_reraise_clears_frame_locals(
         image_count=1,
         has_visible_image=True,
     )
-    collector: LLMDiagnosticCollector = LLMDiagnosticCollector(
-        request_id="debug-tsk196-locals"
-    )
-
     with pytest.raises(ImageUnderstandingFailureError) as excinfo:
         asyncio.run(
             handler.generate_debug_reply(
@@ -710,7 +701,7 @@ def test_debug_reply_image_failure_reraise_clears_frame_locals(
                 image_urls=[_CANARY_URL],
                 reply_context=reply_context,
                 _bot=None,
-                collector=collector,
+                request_trace_id="debug-tsk196-locals",
             )
         )
 
@@ -719,9 +710,7 @@ def test_debug_reply_image_failure_reraise_clears_frame_locals(
     assert summary.all_images_unavailable is True
     assert summary.failed_images == 2
     assert isinstance(excinfo.value, ImageUnderstandingFailureError)
-    # collector 已安全 finalize（不因重抛丢失）
-    assert collector.finalized
-    assert collector.status == "error"
+    assert str(excinfo.value)  # 异常自身仍可安全渲染
 
     frames = _iter_komari_chat_frames(excinfo.value)
     assert any(f.f_code.co_name == "generate_debug_reply" for f in frames)
@@ -730,5 +719,4 @@ def test_debug_reply_image_failure_reraise_clears_frame_locals(
     assert debug_locals.get("image_urls") is None
     assert debug_locals.get("reply_context") is None
     assert debug_locals.get("refetched_context") is None
-    assert debug_locals.get("collector") is None
     _assert_frames_safe(excinfo.value)

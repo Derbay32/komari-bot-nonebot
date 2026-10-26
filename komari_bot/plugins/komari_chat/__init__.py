@@ -1,6 +1,7 @@
 """Komari Chat - 群聊消息处理与 AI 聊天插件。"""
 
 import asyncio
+import uuid
 from contextlib import suppress
 from types import SimpleNamespace
 from typing import Any, cast
@@ -328,7 +329,7 @@ async def generate_debug_reply(
     image_urls: list[str] | None = None,
     reply_context: Any = None,
     caller_is_superuser: bool = False,
-    collector: Any = None,
+    request_trace_id: str | None = None,
 ) -> DebugReplyResult:
     """debug 干跑回复生成：复用 ``_get_or_build_handler()`` 获取 handler，
     调用 ``generate_debug_reply()`` 执行纯读取/生成，不执行任何副作用。
@@ -344,7 +345,7 @@ async def generate_debug_reply(
         bot: Bot 实例（可选）
         image_urls: 命令附图的 URL 列表
         reply_context: 引用消息上下文（ReplyContext），可为 None
-        collector: 可选的 LLMDiagnosticCollector，缺省时自行创建
+        request_trace_id: 调试命令持有的请求 ID；缺省时生成既有风格 ID
 
     Returns:
         DebugReplyResult
@@ -352,6 +353,7 @@ async def generate_debug_reply(
     Raises:
         RuntimeError: 底层服务（Redis / Memory）未初始化
     """
+    trace_id = request_trace_id or f"debug-reply-{uuid.uuid4().hex[:12]}"
     # TSK-225：chat.debug_public——debug 干跑的群公开输出（--public 摘要送达）
     # 前按该群裁决；受限时安静丢弃，不生成、不进入 LLM、不发生群公开输出。
     if not effect_business_admitted(group_id=group_id):
@@ -360,7 +362,7 @@ async def generate_debug_reply(
             reply_to_message_id=None,
             favorability_delta=None,
             favorability_reason=None,
-            collector=collector,
+            request_id=trace_id,
         )
     handler = _get_or_build_handler()
     if handler is None:
@@ -377,7 +379,7 @@ async def generate_debug_reply(
         image_urls=image_urls,
         reply_context=reply_context,
         caller_is_superuser=caller_is_superuser,
-        collector=collector,
+        request_trace_id=trace_id,
     )
 
 
