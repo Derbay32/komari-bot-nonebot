@@ -42,7 +42,7 @@ if TYPE_CHECKING:
 _TOKEN = "real-runtime-token-00000000"
 _AUTH = {"Authorization": f"Bearer {_TOKEN}"}
 _SECRET = "real-runtime-secret-c41e"
-_CHAT_PROMPT = "你是一名长期角色管理员文案，必须逐字保留。"
+_CHAT_PROMPT = "\n  你是一名长期角色管理员文案，逐字保留 {{operator_literal}}。  \n"
 _SUMMARY_PROMPT = "独立的总结预设长期指令。"
 
 
