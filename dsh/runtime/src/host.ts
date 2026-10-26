@@ -18,12 +18,17 @@ import type { ServerFrame } from './protocol.js'
 import {
   callbackFrame,
   deepFreezeJson,
+  MAX_CALLBACK_DATA_BYTES,
   MAX_PENDING_CALLBACKS,
   type CallbackPayload,
   type JsonValue,
   type TaskKind,
 } from './protocol.js'
-import KomariAgentRuntime, { TaskFailure, type CallbackTransport } from './business.js'
+import KomariAgentRuntime, {
+  TaskFailure,
+  type CallbackRequestOptions,
+  type CallbackTransport,
+} from './business.js'
 import { DshManagementService } from './management.js'
 import { installSanitizedStderr } from './logging.js'
 
@@ -101,6 +106,7 @@ interface PendingCallback {
   readonly signal: AbortSignal
   readonly onAbort: () => void
   readonly timeout: undefined
+  readonly maxResultBytes: number
 }
 
 /**
@@ -116,7 +122,11 @@ export class CallbackDispatcher implements CallbackTransport {
 
   constructor(private readonly sendFrame: FrameSender) {}
 
-  async requestCallback(payload: CallbackPayload, signal: AbortSignal): Promise<JsonValue> {
+  async requestCallback(
+    payload: CallbackPayload,
+    signal: AbortSignal,
+    options: CallbackRequestOptions = {},
+  ): Promise<JsonValue> {
     if (this.closed) throw new TaskFailure('host_closed')
     if (signal.aborted) throw new TaskFailure('cancelled')
     const count = this.countsByTask.get(payload.request_id) ?? 0
@@ -144,6 +154,7 @@ export class CallbackDispatcher implements CallbackTransport {
         signal,
         onAbort,
         timeout: undefined,
+        maxResultBytes: options.maxResultBytes ?? MAX_CALLBACK_DATA_BYTES,
       })
       this.sendFrame(callbackFrame(id, payload)).catch((error: unknown) => {
         const entry = this.pending.get(id)
@@ -157,6 +168,10 @@ export class CallbackDispatcher implements CallbackTransport {
     const entry = this.pending.get(id)
     if (entry === undefined) return this.tombstoneSet.has(id)
     if (payload.ok) {
+      if (Buffer.byteLength(JSON.stringify(payload.result), 'utf8') > entry.maxResultBytes) {
+        entry.reject(new TaskFailure('callback_failed', 'callback_result_too_large'))
+        return true
+      }
       entry.resolve(deepFreezeJson(payload.result))
     } else {
       entry.reject(new TaskFailure('callback_failed', payload.error.code))

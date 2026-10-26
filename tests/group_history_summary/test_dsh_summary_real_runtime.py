@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
+from komari_bot.agent.types import MAX_RESULT_BYTES
 from komari_bot.plugins.group_history_summary.config_schema import (
     DynamicConfigSchema,
     LayoutParamsSchema,
@@ -17,8 +19,16 @@ from komari_bot.plugins.group_history_summary.dsh_summary_service import (
 )
 from komari_bot.plugins.group_history_summary.execution_service import (
     EMPTY_HISTORY_TEXT,
+    SummaryServiceUnavailableError,
     execute_group_summary,
 )
+from komari_bot.plugins.group_history_summary.group_lock import GroupSummaryLease
+from komari_bot.plugins.group_history_summary.history_service import (
+    HistoryFetchMetadata,
+    HistoryIncompleteError,
+    HistoryMessage,
+)
+from komari_bot.plugins.group_history_summary.history_tools import SummaryToolResult
 from tests.komari_agent.dsh_test_support import (
     MAIN_HOST_SCRIPT,
     HangResponse,
@@ -127,6 +137,7 @@ def _install_summary_runtime(
     host: Any,
     *,
     render_calls: list[dict[str, Any]] | None = None,
+    service: DshSummaryService | None = None,
 ) -> None:
     import komari_bot.plugins.group_history_summary.execution_service as exec_module
     from komari_bot.plugins.group_history_summary import history_tools
@@ -139,7 +150,7 @@ def _install_summary_runtime(
     monkeypatch.setattr(
         exec_module,
         "_dsh_summary_service",
-        DshSummaryService(host_getter=lambda: host),
+        service or DshSummaryService(host_getter=lambda: host),
     )
     def _resolve_name(
         *,
@@ -164,14 +175,18 @@ def _install_summary_runtime(
     monkeypatch.setattr(exec_module, "render_summary_image_pages_base64", _render)
 
 
-async def _execute(bot: _HistoryBot) -> Any:
+async def _execute(
+    bot: _HistoryBot,
+    *,
+    request_trace_id: str = "summary-real-1",
+) -> Any:
     return await execute_group_summary(
         bot=cast("Any", bot),
         group_id="123",
         bot_self_id=BOT_ID,
         user_request="总结最近消息",
         config=_config(),
-        request_trace_id="summary-real-1",
+        request_trace_id=request_trace_id,
         history_capability_confirmed=True,
     )
 
@@ -232,6 +247,241 @@ async def test_real_dsh_summary_preset_returns_validated_result(
     for index in range(1, 21):
         assert f"第{index}条消息" in tool_text
     assert '"rendered_count":20' in tool_text
+
+
+class _OneRowProvider:
+    async def fetch_recent(self, arguments: Any) -> SummaryToolResult:
+        del arguments
+        return SummaryToolResult(
+            source="recent_group_messages",
+            matched_count=1,
+            messages=[
+                HistoryMessage(
+                    user_id="1001",
+                    nickname="阿明",
+                    content="真实历史",
+                    timestamp=1,
+                    message_seq=1,
+                    message_id="m1",
+                    reply_to_message_id=None,
+                )
+            ],
+            filters={"count": 10},
+            history_fetch=None,
+        )
+
+    async def fetch_user(self, arguments: Any) -> SummaryToolResult:
+        del arguments
+        raise AssertionError
+
+    async def fetch_topic(self, arguments: Any) -> SummaryToolResult:
+        del arguments
+        raise AssertionError
+
+
+class _IncompleteProvider:
+    def __init__(self, metadata: HistoryFetchMetadata) -> None:
+        self.metadata = metadata
+
+    async def fetch_recent(self, arguments: Any) -> SummaryToolResult:
+        del arguments
+        raise HistoryIncompleteError(self.metadata)
+
+    async def fetch_user(self, arguments: Any) -> SummaryToolResult:
+        del arguments
+        raise AssertionError
+
+    async def fetch_topic(self, arguments: Any) -> SummaryToolResult:
+        del arguments
+        raise AssertionError
+
+
+async def test_real_dsh_incomplete_history_restores_domain_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata = HistoryFetchMetadata(
+        status="partial",
+        requested_count=50,
+        retrieved_item_count=10,
+        missing_count=40,
+        completed_batches=1,
+        failed_batch=2,
+        failure_code="history_api_error",
+    )
+    provider = _IncompleteProvider(metadata)
+    render_calls: list[dict[str, Any]] = []
+
+    async with running_dsh(
+        tmp_path,
+        responses=(
+            ToolCallResponse("fetch_recent_group_messages", {"count": 20}),
+        ),
+        entry_script=MAIN_HOST_SCRIPT,
+        summary_prompt="总结角色。",
+        context_window=16384,
+    ) as (host, server):
+        service = DshSummaryService(
+            host_getter=lambda: host,
+            history_provider_factory=lambda *_args: provider,
+        )
+        _install_summary_runtime(
+            monkeypatch,
+            host,
+            render_calls=render_calls,
+            service=service,
+        )
+        with pytest.raises(HistoryIncompleteError) as exc_info:
+            await _execute(_HistoryBot(_history_items(3)))
+
+    assert exc_info.value.metadata == metadata
+    assert len(server.requests) == 1
+    assert render_calls == []
+
+
+async def test_real_dsh_final_admission_revocation_prevents_completion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import komari_bot.plugins.group_history_summary.dsh_summary_service as summary_service
+
+    decisions = {"count": 0}
+
+    def _admit(*, group_id: str) -> bool:
+        del group_id
+        decisions["count"] += 1
+        return decisions["count"] <= 3
+
+    monkeypatch.setattr(summary_service, "effect_business_admitted", _admit)
+    provider = _OneRowProvider()
+    render_calls: list[dict[str, Any]] = []
+
+    async with running_dsh(
+        tmp_path,
+        responses=(
+            ToolCallResponse("fetch_recent_group_messages", {"count": 20}),
+            ToolCallResponse("final_summary", {"content": "不得完成"}),
+        ),
+        entry_script=MAIN_HOST_SCRIPT,
+        summary_prompt="总结角色。",
+        context_window=16384,
+    ) as (host, server):
+        service = DshSummaryService(
+            host_getter=lambda: host,
+            history_provider_factory=lambda *_args: provider,
+        )
+        _install_summary_runtime(
+            monkeypatch,
+            host,
+            render_calls=render_calls,
+            service=service,
+        )
+        result = await _execute(_HistoryBot(_history_items(3)))
+
+    assert result.summary_text == ""
+    assert render_calls == []
+    assert len(server.requests) == 2
+    assert decisions["count"] == 4
+
+
+async def _run_large_final(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    content: str,
+) -> tuple[Any, Any]:
+    responses = (
+        ToolCallResponse("fetch_recent_group_messages", {"count": 20}),
+        ToolCallResponse("final_summary", {"content": content}),
+    )
+    render_calls: list[dict[str, Any]] = []
+
+    async with running_dsh(
+        tmp_path,
+        responses=responses,
+        entry_script=MAIN_HOST_SCRIPT,
+        summary_prompt="总结角色。",
+        context_window=2_000_000,
+    ) as (host, server):
+        _install_summary_runtime(monkeypatch, host, render_calls=render_calls)
+        result = await _execute(_HistoryBot(_history_items(3)))
+
+    assert len(server.requests) == 2
+    assert result.summary_text == content
+    return result, render_calls
+
+
+async def test_real_dsh_300k_ascii_summary_succeeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    content = "a" * (300 * 1024)
+    result, render_calls = await _run_large_final(tmp_path, monkeypatch, content)
+
+    assert len(result.summary_text) == len(content)
+    assert result.filtered_message_count == 3
+    assert len(render_calls) == 1
+
+
+async def test_real_dsh_exact_serialized_business_limit_succeeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    overhead = len(
+        json.dumps(
+            {"summary_text": ""},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    content = "a" * (MAX_RESULT_BYTES - overhead)
+    result, _render_calls = await _run_large_final(tmp_path, monkeypatch, content)
+
+    assert len(result.summary_text.encode("utf-8")) == MAX_RESULT_BYTES - overhead
+
+
+async def test_real_dsh_multibyte_summary_near_the_bound_succeeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    content = "汉" * 170_000
+    encoded = json.dumps(
+        {"summary_text": content},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    assert len(encoded) <= MAX_RESULT_BYTES
+
+    result, _render_calls = await _run_large_final(tmp_path, monkeypatch, content)
+
+    assert result.summary_text == content
+
+
+async def test_real_dsh_above_limit_final_is_correctable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    too_large = "a" * MAX_RESULT_BYTES
+    corrected = "修正后的总结"
+    responses = (
+        ToolCallResponse("fetch_recent_group_messages", {"count": 20}),
+        ToolCallResponse("final_summary", {"content": too_large}),
+        ToolCallResponse("final_summary", {"content": corrected}),
+    )
+    render_calls: list[dict[str, Any]] = []
+
+    async with running_dsh(
+        tmp_path,
+        responses=responses,
+        entry_script=MAIN_HOST_SCRIPT,
+        summary_prompt="总结角色。",
+        context_window=2_000_000,
+    ) as (host, server):
+        _install_summary_runtime(monkeypatch, host, render_calls=render_calls)
+        result = await _execute(_HistoryBot(_history_items(3)))
+
+    assert result.summary_text == corrected
+    assert len(server.requests) == 3
+    assert len(render_calls) == 1
 
 
 async def test_real_dsh_empty_read_requires_final_and_returns_notice(
@@ -338,6 +588,161 @@ async def test_real_dsh_cancellation_during_model_request_releases_task(
         assert host.state.value == "ready"
 
 
+async def test_real_dsh_cancellation_during_internal_history_page(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate_started = asyncio.Event()
+    gate_cancelled = asyncio.Event()
+
+    async def _gate() -> None:
+        gate_started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            gate_cancelled.set()
+            raise
+
+    provider = _OneRowProvider()
+    render_calls: list[dict[str, Any]] = []
+
+    async with running_dsh(
+        tmp_path,
+        responses=(
+            ToolCallResponse("fetch_recent_group_messages", {"count": 20}),
+        ),
+        entry_script=MAIN_HOST_SCRIPT,
+        summary_prompt="总结角色。",
+        context_window=16384,
+    ) as (host, server):
+        service = DshSummaryService(
+            host_getter=lambda: host,
+            history_provider_factory=lambda *_args: provider,
+            history_page_gate=_gate,
+        )
+        _install_summary_runtime(
+            monkeypatch,
+            host,
+            render_calls=render_calls,
+            service=service,
+        )
+        task = asyncio.create_task(_execute(_HistoryBot(_history_items(3))))
+        await asyncio.wait_for(gate_started.wait(), timeout=15)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.wait_for(gate_cancelled.wait(), timeout=10)
+        assert host.state.value == "ready"
+
+    assert len(server.requests) == 1
+    assert render_calls == []
+
+
+class _LeaseManager:
+    def __init__(self) -> None:
+        self.release_calls = 0
+        self.release_states: list[str] = []
+        self.renew_calls = 0
+
+    async def release(self, *, key: str, owner_token: str) -> bool:
+        del key, owner_token
+        self.release_calls += 1
+        return True
+
+    async def renew(self, *, key: str, owner_token: str, ttl_seconds: int) -> bool:
+        del key, owner_token, ttl_seconds
+        self.renew_calls += 1
+        return True
+
+
+class _LeaseLockManager:
+    def __init__(self, lease: GroupSummaryLease) -> None:
+        self._lease = lease
+
+    async def try_acquire(self, **_kwargs: object) -> GroupSummaryLease:
+        return self._lease
+
+
+async def test_real_dsh_lease_loss_cancels_running_task_and_releases_after_drain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import komari_bot.plugins.group_history_summary.execution_service as exec_module
+
+    gate_started = asyncio.Event()
+
+    async def _gate() -> None:
+        gate_started.set()
+        await asyncio.Future()
+
+    manager = _LeaseManager()
+    lease = GroupSummaryLease(
+        manager=cast("Any", manager),
+        key="real-lease-loss",
+        owner_token="owner",
+        ttl_seconds=60,
+    )
+    provider = _OneRowProvider()
+    render_calls: list[dict[str, Any]] = []
+
+    async with running_dsh(
+        tmp_path,
+        responses=(
+            ToolCallResponse("fetch_recent_group_messages", {"count": 20}),
+        ),
+        entry_script=MAIN_HOST_SCRIPT,
+        summary_prompt="总结角色。",
+        context_window=16384,
+    ) as (host, server):
+        first_service = DshSummaryService(
+            host_getter=lambda: host,
+            history_provider_factory=lambda *_args: provider,
+            history_page_gate=_gate,
+        )
+        _install_summary_runtime(
+            monkeypatch,
+            host,
+            render_calls=render_calls,
+            service=first_service,
+        )
+        monkeypatch.setattr(
+            exec_module,
+            "_group_lock_manager",
+            _LeaseLockManager(lease),
+        )
+        task = asyncio.create_task(_execute(_HistoryBot(_history_items(3))))
+        await asyncio.wait_for(gate_started.wait(), timeout=15)
+        lease._lost_event.set()
+        with pytest.raises(SummaryServiceUnavailableError):
+            await task
+
+        assert manager.release_calls == 1
+        assert host.state.value == "ready"
+
+        server.enqueue(
+            ToolCallResponse("fetch_recent_group_messages", {"count": 20}),
+            ToolCallResponse("final_summary", {"content": "恢复后的总结"}),
+        )
+        monkeypatch.setattr(
+            exec_module,
+            "_dsh_summary_service",
+            DshSummaryService(
+                host_getter=lambda: host,
+                history_provider_factory=lambda *_args: provider,
+            ),
+        )
+        monkeypatch.setattr(exec_module, "_group_lock_manager", _FakeLockManager())
+        result = await _execute(
+            _HistoryBot(_history_items(3)),
+            request_trace_id="summary-recovered-1",
+        )
+
+    assert result.summary_text == "恢复后的总结"
+    assert result.filtered_message_count == 1
+    assert len(server.requests) == 3
+    assert render_calls != []
+
+
 async def test_real_dsh_cancellation_during_history_read_releases_task(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -353,7 +758,7 @@ async def test_real_dsh_cancellation_during_history_read_releases_task(
         entry_script=MAIN_HOST_SCRIPT,
         summary_prompt="总结角色。",
         context_window=8192,
-    ) as (host, _server):
+    ) as (host, server):
         _install_summary_runtime(monkeypatch, host)
         task = asyncio.create_task(_execute(bot))
         await asyncio.wait_for(bot.started.wait(), timeout=15)
@@ -362,4 +767,14 @@ async def test_real_dsh_cancellation_during_history_read_releases_task(
             await task
         await asyncio.wait_for(bot.cancelled.wait(), timeout=10)
         assert bot.cancelled.is_set()
+        assert host.state.value == "ready"
+        server.enqueue(
+            ToolCallResponse("fetch_recent_group_messages", {"count": 20}),
+            ToolCallResponse("final_summary", {"content": "取消后恢复"}),
+        )
+        recovered = await _execute(
+            _HistoryBot(_history_items(3)),
+            request_trace_id="summary-recovered-2",
+        )
+        assert recovered.summary_text == "取消后恢复"
         assert host.state.value == "ready"

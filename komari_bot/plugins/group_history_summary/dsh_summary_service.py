@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
@@ -22,6 +22,7 @@ from komari_bot.agent import (
 )
 
 from .admission_gate import SummaryAdmissionDeniedError, effect_business_admitted
+from .history_service import HistoryFetchMetadata, HistoryIncompleteError
 from .history_tools import (
     SummaryToolResult,
     execute_recent_tool,
@@ -72,6 +73,7 @@ SummaryHistoryProviderFactory = Callable[
 ]
 HostGetter = Callable[[], "AgentHost"]
 AdmissionChecker = Callable[[str], bool]
+HistoryPageGate = Callable[[], Awaitable[None]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,6 +236,7 @@ class DshSummaryService:
         host_getter: HostGetter | None = None,
         history_provider_factory: SummaryHistoryProviderFactory | None = None,
         admission_checker: AdmissionChecker | None = None,
+        history_page_gate: HistoryPageGate | None = None,
     ) -> None:
         self._host_getter = host_getter or _default_host_getter
         self._history_provider_factory = (
@@ -242,6 +245,7 @@ class DshSummaryService:
         self._admission_checker = admission_checker or (
             lambda group_id: effect_business_admitted(group_id=group_id)
         )
+        self._history_page_gate = history_page_gate
 
     async def generate(
         self,
@@ -261,6 +265,17 @@ class DshSummaryService:
             bot, group_id, bot_self_id, config
         )
         denied: dict[str, bool] = {"value": False}
+        incomplete: dict[str, object] = {"metadata": None}
+
+        async def _call_provider(
+            operation: Awaitable[SummaryToolResult],
+        ) -> SummaryToolResult:
+            try:
+                return await operation
+            except HistoryIncompleteError as exc:
+                # Retain only the safe metadata, never the exception/traceback.
+                incomplete["metadata"] = exc.metadata
+                raise
 
         def _admitted() -> bool:
             try:
@@ -281,7 +296,7 @@ class DshSummaryService:
             if payload is None:
                 return _invalid_arguments(candidate)
             try:
-                result = await provider.fetch_recent(payload)
+                result = await _call_provider(provider.fetch_recent(payload))
             except SummaryAdmissionDeniedError:
                 denied["value"] = True
                 raise
@@ -293,7 +308,7 @@ class DshSummaryService:
             if payload is None:
                 return _invalid_arguments(candidate)
             try:
-                result = await provider.fetch_user(payload)
+                result = await _call_provider(provider.fetch_user(payload))
             except SummaryAdmissionDeniedError:
                 denied["value"] = True
                 raise
@@ -305,7 +320,7 @@ class DshSummaryService:
             if payload is None:
                 return _invalid_arguments(candidate)
             try:
-                result = await provider.fetch_topic(payload)
+                result = await _call_provider(provider.fetch_topic(payload))
             except SummaryAdmissionDeniedError:
                 denied["value"] = True
                 raise
@@ -314,6 +329,8 @@ class DshSummaryService:
 
         async def history_page(request: AgentCallbackRequest) -> JsonValue:
             generation, offset = _validate_page_arguments(request.data)
+            if self._history_page_gate is not None:
+                await self._history_page_gate()
             try:
                 allow = bool(self._admission_checker(group_id))
             except asyncio.CancelledError:
@@ -326,6 +343,8 @@ class DshSummaryService:
             return cast("JsonValue", candidate.page(generation, offset))
 
         async def final_summary(request: AgentCallbackRequest) -> JsonValue:
+            if not _admitted():
+                raise SummaryAdmissionDeniedError
             receipt = candidate.submit_final(request.data)
             return cast("JsonValue", receipt.to_dict())
 
@@ -357,10 +376,19 @@ class DshSummaryService:
         except asyncio.CancelledError:
             raise
         except AgentHostError as exc:
+            # Admission denial is the highest-precedence normal termination;
+            # a captured incomplete-history metadata turns the terminal host
+            # failure back into the original domain result.
             if denied["value"]:
                 raise SummaryAdmissionDeniedError from None
+            metadata = incomplete["metadata"]
+            if isinstance(metadata, HistoryFetchMetadata):
+                raise HistoryIncompleteError(metadata) from None
             raise SummaryGenerationError(exc.code) from None
 
+        metadata = incomplete["metadata"]
+        if isinstance(metadata, HistoryFetchMetadata):
+            raise HistoryIncompleteError(metadata) from None
         summary_text = candidate.verify_host_result(result.result)
         return SummaryGeneration(
             summary_text=summary_text,

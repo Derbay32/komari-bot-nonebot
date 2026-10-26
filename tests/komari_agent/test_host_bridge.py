@@ -21,6 +21,7 @@ from komari_bot.agent import (
     ReadinessState,
     TaskKind,
 )
+from komari_bot.agent.types import MAX_CALLBACK_DATA_BYTES
 from tests.komari_agent.dsh_test_support import (
     MAIN_HOST_SCRIPT,
     EmptyResponse,
@@ -566,3 +567,45 @@ async def test_success_failure_and_cancel_leave_no_session_or_log_artifacts(tmp_
         "dsh/package.json",
         "dsh/cordis.patch.yml",
     }
+
+
+async def test_ordinary_callback_reply_remains_generic_limited(tmp_path: Path) -> None:
+    """A non-summary callback reply above 256 KiB stays a callback failure."""
+    large = "a" * (MAX_CALLBACK_DATA_BYTES + 1)
+
+    async def large_fixture(_request: AgentCallbackRequest) -> JsonValue:
+        return {"ok": True, "value": large}
+
+    responses = (ToolCallResponse("fixture_complete", {"value": "small-request"}),)
+    async with running_dsh(tmp_path, responses=responses) as (host, _server):
+        with pytest.raises(AgentTaskError) as exc_info:
+            await host.execute(
+                _task("generic-reply-limit"),
+                _callbacks([], fixture=large_fixture),
+            )
+
+    assert exc_info.value.code == "callback_failed"
+
+
+async def test_ordinary_callback_request_remains_generic_limited(tmp_path: Path) -> None:
+    """A non-summary callback request above 256 KiB never reaches Python."""
+    large = "a" * (MAX_CALLBACK_DATA_BYTES + 1)
+    called: list[AgentCallbackRequest] = []
+
+    async def record_fixture(request: AgentCallbackRequest) -> JsonValue:
+        called.append(request)
+        return {"ok": True}
+
+    responses = (ToolCallResponse("fixture_complete", {"value": large}),)
+    async with running_dsh(
+        tmp_path,
+        responses=responses,
+        context_window=2_000_000,
+    ) as (host, _server):
+        with pytest.raises(AgentTaskError):
+            await host.execute(
+                _task("generic-request-limit"),
+                _callbacks([], fixture=record_fixture),
+            )
+
+    assert called == []

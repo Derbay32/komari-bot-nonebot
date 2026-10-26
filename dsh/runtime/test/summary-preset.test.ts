@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { startHost } from '../dist/host.js'
+import { MAX_FINAL_SUMMARY_CALLBACK_BYTES } from '../dist/protocol.js'
 import {
   minimalSummaryTaskData,
   startModelEndpoint,
@@ -27,6 +28,7 @@ interface RunSummaryOptions extends SummarySendFrameOptions {
   readonly data?: { readonly [key: string]: import('../dist/protocol.js').JsonValue }
   readonly rows?: ReturnType<typeof summaryHistoryRow>[]
   readonly pageSize?: number
+  readonly contextWindow?: number
 }
 
 async function runSummary(
@@ -43,7 +45,7 @@ async function runSummary(
   const profile = writeTestProfile(root, endpoint.baseURL, {
     prompt: 'Frozen chat role.',
     summaryPrompt: 'Frozen summary role.',
-    contextWindow: 32768,
+    contextWindow: options.contextWindow ?? 32768,
   })
   const runtimeRef: { current?: Awaited<ReturnType<typeof startHost>> } = {}
   const simulator = new SummaryCallbackSimulator()
@@ -286,6 +288,22 @@ test('escaped envelope expansion drops newest rows instead of overstating render
   assert.ok(renderedCount < 100)
   assert.equal(Number(omitted[1]), 100 - renderedCount)
   assert.equal((tool.match(/"rendered_line":/g) ?? []).length, renderedCount)
+})
+
+test('oversized final content is rejected before its callback frame and stays correctable', async () => {
+  const tooLarge = 'a'.repeat(MAX_FINAL_SUMMARY_CALLBACK_BYTES + 1024)
+  const result = await runSummary([
+    { kind: 'tool', name: 'fetch_recent_group_messages', args: { count: 10 } },
+    { kind: 'tool', name: 'final_summary', args: { content: tooLarge } },
+    { kind: 'tool', name: 'final_summary', args: { content: '修正后的总结' } },
+  ], {
+    budget: { max_rounds: 4, max_tool_calls_per_round: 1, max_total_tool_calls: 4 },
+    contextWindow: 4_000_000,
+  })
+
+  assert.deepEqual(result.result, { summary_text: '修正后的总结' })
+  assert.equal(result.simulator.finalCalls.length, 1)
+  assert.equal(result.simulator.finalCalls[0]?.content, '修正后的总结')
 })
 
 test('malicious history content stays inside the untrusted wrapper', async () => {

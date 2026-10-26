@@ -11,7 +11,11 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-loop'
 import type {} from '@deepseek-ai/dsh-settings'
 import { defineTool, type ParameterSchemaSpec, type ToolDefinition } from '@deepseek-ai/dsh-tools'
-import { isPlainObject, type JsonValue } from './protocol.js'
+import {
+  isPlainObject,
+  MAX_FINAL_SUMMARY_CALLBACK_BYTES,
+  type JsonValue,
+} from './protocol.js'
 
 export const name = 'komari-summary-preset'
 export const inject = ['tools', 'systemPrompt', 'komariAgent']
@@ -658,6 +662,15 @@ export function apply(ctx: Context): void {
       } catch (error) {
         terminalCallbackFailure(ctx, exec.agent)
         throw error
+      }
+      const rawArgs = args as unknown as Record<string, unknown>
+      if (Buffer.byteLength(JSON.stringify({ ...rawArgs }), 'utf8') > MAX_FINAL_SUMMARY_CALLBACK_BYTES) {
+        return {
+          accepted: false,
+          code: 'invalid_content',
+          missing: [...state.missing],
+          result: null,
+        } as unknown as JsonValue
       }
       let raw: JsonValue
       try {

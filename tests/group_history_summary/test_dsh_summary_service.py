@@ -27,6 +27,7 @@ from komari_bot.plugins.group_history_summary.dsh_summary_service import (
 )
 from komari_bot.plugins.group_history_summary.history_service import (
     HistoryFetchMetadata,
+    HistoryIncompleteError,
     HistoryMessage,
 )
 from komari_bot.plugins.group_history_summary.history_tools import (
@@ -333,6 +334,88 @@ async def test_malformed_history_arguments_are_correctable_before_read() -> None
 
 
 @pytest.mark.asyncio
+class _TerminalCallbackHost:
+    """Mimic the real host turning any callback exception into a terminal code."""
+
+    def __init__(self, sequence: Callable[[dict[str, Any]], Any]) -> None:
+        self.sequence = sequence
+        self.requests: list[Any] = []
+        self.callbacks: list[dict[str, Any]] = []
+
+    async def execute(self, request: Any, callbacks: dict[str, Any]) -> AgentTaskResult:
+        self.requests.append(request)
+        self.callbacks.append(callbacks)
+        try:
+            await self.sequence(callbacks)
+        except Exception:
+            raise AgentTaskError("callback_failed") from None
+        raise AgentTaskError("agent_error")
+
+
+@pytest.mark.asyncio
+async def test_incomplete_history_metadata_is_restored_from_terminal_host_failure() -> None:
+    provider = _FakeProvider()
+    metadata = HistoryFetchMetadata(
+        status="partial",
+        requested_count=10,
+        retrieved_item_count=4,
+        missing_count=6,
+        completed_batches=1,
+        failed_batch=2,
+        failure_code="history_api_error",
+    )
+    provider.failure = HistoryIncompleteError(metadata)
+
+    async def sequence(callbacks: dict[str, Any]) -> None:
+        await _invoke(callbacks, "summary.fetch_recent", {"count": 10})
+
+    host = _TerminalCallbackHost(sequence)
+    with pytest.raises(HistoryIncompleteError) as exc_info:
+        await _generate(_service(cast("Any", host), provider))
+
+    assert exc_info.value.metadata == metadata
+
+
+@pytest.mark.asyncio
+async def test_arbitrary_history_failure_is_not_classified_as_incomplete() -> None:
+    provider = _FakeProvider()
+    provider.failure = RuntimeError("platform failed")
+
+    async def sequence(callbacks: dict[str, Any]) -> None:
+        await _invoke(callbacks, "summary.fetch_recent", {"count": 10})
+
+    host = _TerminalCallbackHost(sequence)
+    with pytest.raises(SummaryGenerationError) as exc_info:
+        await _generate(_service(cast("Any", host), provider))
+
+    assert exc_info.value.code == "callback_failed"
+
+
+@pytest.mark.asyncio
+async def test_final_submission_admission_precedes_candidate_mutation() -> None:
+    provider = _FakeProvider()
+    decisions = [True, True, True, False]
+
+    def _checker(_group_id: str) -> bool:
+        return decisions.pop(0)
+
+    async def sequence(callbacks: dict[str, Any]) -> None:
+        await _invoke(callbacks, "admission", {"purpose": "conversation"})
+        await _invoke(callbacks, "admission", {"purpose": "conversation"})
+        await _invoke(callbacks, "summary.fetch_recent", {"count": 10})
+        await _invoke(callbacks, "summary.history_page", {"generation": 1, "offset": 0})
+        await _invoke(callbacks, "summary.final_summary", {"content": "不得暂存"})
+
+    host = _TerminalCallbackHost(sequence)
+    service = DshSummaryService(
+        host_getter=lambda: cast("Any", host),
+        history_provider_factory=lambda *_args: provider,
+        admission_checker=_checker,
+    )
+    with pytest.raises(SummaryAdmissionDeniedError):
+        await _generate(service)
+
+
 async def test_terminal_history_failure_propagates() -> None:
     provider = _FakeProvider()
     provider.failure = RuntimeError("platform failed")

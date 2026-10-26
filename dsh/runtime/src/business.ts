@@ -21,9 +21,9 @@ import { TaskMutationGate, TaskMutationConflict } from './gate.js'
 import {
   assertCallbackName,
   assertJsonValue,
+  callbackDataLimit,
   deepFreezeJson,
   isPlainObject,
-  MAX_CALLBACK_DATA_BYTES,
   MAX_PROMPT_CHARS,
   MAX_RESULT_BYTES,
   type AdmissionPurpose,
@@ -71,8 +71,17 @@ const AgentConfig: z<Config> = z.object({
 
 export const Config = AgentConfig
 
+export interface CallbackRequestOptions {
+  /** Trusted per-callback reply ceiling recorded before transport. */
+  readonly maxResultBytes?: number
+}
+
 export interface CallbackTransport {
-  requestCallback(payload: CallbackPayload, signal: AbortSignal): Promise<JsonValue>
+  requestCallback(
+    payload: CallbackPayload,
+    signal: AbortSignal,
+    options?: CallbackRequestOptions,
+  ): Promise<JsonValue>
 }
 
 export class TaskFailure extends Error {
@@ -241,7 +250,7 @@ export default class KomariAgentRuntime extends Service {
     assertCallbackName(name)
     if (!isPlainObject(data)) throw new TaskFailure('invalid_callback_data')
     assertJsonValue(data)
-    if (Buffer.byteLength(JSON.stringify(data), 'utf8') > MAX_CALLBACK_DATA_BYTES) {
+    if (Buffer.byteLength(JSON.stringify(data), 'utf8') > callbackDataLimit(name, task.kind)) {
       throw new TaskFailure('callback_data_too_large')
     }
     try {
@@ -508,6 +517,7 @@ export default class KomariAgentRuntime extends Service {
           data,
         },
         task.controller.signal,
+        { maxResultBytes: callbackDataLimit(name, task.kind) },
       )
     } catch (error) {
       if (task.cancelled || task.controller.signal.aborted) throw new TaskFailure('cancelled')

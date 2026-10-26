@@ -1,5 +1,5 @@
 export { default as KomariAgentRuntime, Config, FIXED_RETRY_POLICY, TaskFailure } from './business.js'
-export type { AgentBinding, CallbackTransport } from './business.js'
+export type { AgentBinding, CallbackRequestOptions, CallbackTransport } from './business.js'
 export * from './protocol.js'
 export { bootstrapProfile, CallbackDispatcher, HostBootError, PROFILE_BUNDLE, startHost } from './host.js'
 export { DshManagementService, ManagementError, AGENT_SETTINGS_NS, LLM_SETTINGS_NS } from './management.js'
