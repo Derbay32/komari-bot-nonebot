@@ -1,0 +1,22 @@
+{
+  "name": "@komari-bot/dsh-runtime-bundle",
+  "version": "0.1.0",
+  "private": true,
+  "description": "komari-bot allowlisted Cordis composition",
+  "type": "module",
+  "engines": {
+    "node": ">=24.9.0"
+  },
+  "files": [
+    "cordis.patch.yml"
+  ],
+  "exports": {
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

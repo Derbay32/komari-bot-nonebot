@@ -1,0 +1,4 @@
+# The leaf config included by app-boot. All composition rows arrive as bundle
+# and profile patches above this empty root, which keeps the shipped allowlist
+# versioned with the bundle while the operator patch stays writable.
+[]
