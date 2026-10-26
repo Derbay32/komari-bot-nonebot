@@ -297,4 +297,3 @@ export function renderChatTaskInput(data: ChatTaskData): string {
   lines.push('</komari_chat_task>')
   return lines.join('\n')
 }
-
