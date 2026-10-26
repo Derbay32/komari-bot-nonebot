@@ -12,6 +12,9 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
 from .types import (
+    MAX_CONTROL_ARGS_BYTES,
+    MAX_CONTROL_RESULT_BYTES,
+    AgentControlRequest,
     AgentProtocolError,
     AgentTaskRequest,
     JsonValue,
@@ -56,6 +59,14 @@ def encode_frame(kind: str, frame_id: str, payload: Mapping[str, JsonValue]) -> 
 def encode_request(request_id: str, request: AgentTaskRequest) -> bytes:
     """Serialize one trusted task request."""
     return encode_frame("request", request_id, request.to_protocol())
+
+
+def encode_control(control_id: str, request: AgentControlRequest) -> bytes:
+    """Serialize one trusted management operation; no arbitrary paths or strings."""
+    payload = request.to_protocol()
+    if len(json_payload(payload)) > MAX_CONTROL_ARGS_BYTES:
+        raise AgentProtocolError("control_args_too_large")
+    return encode_frame("control", control_id, payload)
 
 
 def encode_callback_result_success(callback_id: str, result: JsonValue) -> bytes:
@@ -138,7 +149,18 @@ class CallbackFrame:
     data: Mapping[str, JsonValue]
 
 
-type ServerFrame = ReadyFrame | ResultFrame | CallbackFrame
+@dataclass(frozen=True, slots=True)
+class ControlResultFrame:
+    """Terminal outcome of one management operation, correlated separately."""
+
+    control_id: str
+    ok: bool
+    result: Mapping[str, JsonValue] | None
+    error_code: str | None
+    error_message: str | None
+
+
+type ServerFrame = ReadyFrame | ResultFrame | CallbackFrame | ControlResultFrame
 
 
 def _exact_keys(value: Mapping[str, Any], keys: tuple[str, ...], code: str) -> None:
@@ -230,6 +252,45 @@ def _parse_callback(callback_id: str, payload: Mapping[str, Any]) -> CallbackFra
     )
 
 
+def _parse_control_result(control_id: str, payload: Mapping[str, Any]) -> ControlResultFrame:
+    ok = payload.get("ok")
+    if not isinstance(ok, bool):
+        raise AgentProtocolError("invalid_control_result")
+    if ok:
+        _exact_keys(payload, ("ok", "result"), "invalid_control_result")
+        result = payload["result"]
+        if not isinstance(result, dict):
+            raise AgentProtocolError("invalid_control_result")
+        validate_json_value(result)
+        if len(json_payload(result)) > MAX_CONTROL_RESULT_BYTES:
+            raise AgentProtocolError("control_result_too_large")
+        return ControlResultFrame(
+            control_id=control_id,
+            ok=True,
+            result=result,
+            error_code=None,
+            error_message=None,
+        )
+    _exact_keys(payload, ("ok", "error"), "invalid_control_result")
+    error = payload["error"]
+    if not isinstance(error, dict):
+        raise AgentProtocolError("invalid_error_payload")
+    _exact_keys(error, ("code", "message"), "invalid_error_payload")
+    code = error["code"]
+    message = error["message"]
+    if not isinstance(code, str) or not validate_error_code(code):
+        raise AgentProtocolError("invalid_error_code")
+    if not isinstance(message, str) or len(message) > MAX_ERROR_MESSAGE_LENGTH:
+        raise AgentProtocolError("invalid_error_message")
+    return ControlResultFrame(
+        control_id=control_id,
+        ok=False,
+        result=None,
+        error_code=code,
+        error_message=message,
+    )
+
+
 def decode_server_frame(line: bytes) -> ServerFrame:
     """Parse one JSON line from the child; closed kinds only."""
     try:
@@ -255,6 +316,8 @@ def decode_server_frame(line: bytes) -> ServerFrame:
             return _parse_result(frame_id, payload)
         case "callback":
             return _parse_callback(frame_id, payload)
+        case "control_result":
+            return _parse_control_result(frame_id, payload)
         case _:
             raise AgentProtocolError("unknown_frame_kind")
 
@@ -263,6 +326,7 @@ __all__ = [
     "MAX_FRAME_BYTES",
     "PROTOCOL_VERSION",
     "CallbackFrame",
+    "ControlResultFrame",
     "ReadyFrame",
     "ResultFrame",
     "ServerFrame",
@@ -270,6 +334,7 @@ __all__ = [
     "encode_callback_result_error",
     "encode_callback_result_success",
     "encode_cancel",
+    "encode_control",
     "encode_frame",
     "encode_request",
     "encode_shutdown",

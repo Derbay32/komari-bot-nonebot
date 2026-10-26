@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 from .protocol import (
     MAX_FRAME_BYTES,
     CallbackFrame,
+    ControlResultFrame,
     ReadyFrame,
     ResultFrame,
     ServerFrame,
@@ -28,6 +29,7 @@ from .protocol import (
     encode_callback_result_error,
     encode_callback_result_success,
     encode_cancel,
+    encode_control,
     encode_request,
     encode_shutdown,
     read_frame,
@@ -36,11 +38,15 @@ from .types import (
     MAX_CALLBACK_DATA_BYTES,
     AgentCallbackHandler,
     AgentCallbackRequest,
+    AgentControlError,
+    AgentControlRequest,
+    AgentControlResult,
     AgentHostUnavailableError,
     AgentProtocolError,
     AgentTaskError,
     AgentTaskRequest,
     AgentTaskResult,
+    ControlOperation,
     HostReadiness,
     HostState,
     JsonValue,
@@ -52,6 +58,7 @@ from .types import (
 
 DEFAULT_STARTUP_TIMEOUT: Final = 30.0
 DEFAULT_CLOSE_TIMEOUT: Final = 10.0
+DEFAULT_CONTROL_TIMEOUT: Final = 30.0
 CANCEL_DRAIN_TIMEOUT: Final = 5.0
 TERMINATE_TIMEOUT: Final = 2.0
 _MAX_TOMBSTONES: Final = 256
@@ -93,6 +100,7 @@ class AgentHost:
         entry_script: Path | None = None,
         startup_timeout: float = DEFAULT_STARTUP_TIMEOUT,
         close_timeout: float = DEFAULT_CLOSE_TIMEOUT,
+        control_timeout: float = DEFAULT_CONTROL_TIMEOUT,
         log: logging.Logger | None = None,
     ) -> None:
         root = (runtime_root or PROJECT_ROOT / "dsh").resolve()
@@ -104,6 +112,7 @@ class AgentHost:
         self.entry_script = entry_script or root / "runtime" / "dist" / "main.js"
         self.startup_timeout = startup_timeout
         self.close_timeout = close_timeout
+        self.control_timeout = control_timeout
         self._log = log or _logger
         self._lifecycle_lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
@@ -114,6 +123,9 @@ class AgentHost:
         self._stderr_task: asyncio.Task[None] | None = None
         self._ready_future: asyncio.Future[ReadyFrame] | None = None
         self._requests: dict[str, _RequestState] = {}
+        self._controls: dict[str, asyncio.Future[Mapping[str, JsonValue]]] = {}
+        self._control_tombstones: deque[str] = deque()
+        self._control_tombstone_set: set[str] = set()
         self._all_callback_tasks: set[asyncio.Task[None]] = set()
         self._detached_sends: set[asyncio.Task[None]] = set()
         self._tombstones: deque[str] = deque()
@@ -242,6 +254,45 @@ class AgentHost:
             if primary_error is not None and not future.done():
                 future.cancel()
 
+    async def control(
+        self,
+        operation: ControlOperation,
+        args: Mapping[str, JsonValue],
+        *,
+        wait_seconds: float | None = None,
+    ) -> AgentControlResult:
+        """Run one bounded management operation on the private child pipe.
+
+        A timeout is an explicit unavailable failure: the caller must not retry
+        the write and a late reply is discarded through the control tombstone.
+        """
+        if self._state is not HostState.READY:
+            raise AgentHostUnavailableError("host_unavailable")
+        request = AgentControlRequest(operation=operation, args=args)
+        control_id = f"ctl-{uuid.uuid4().hex}"
+        future: asyncio.Future[Mapping[str, JsonValue]] = (
+            asyncio.get_running_loop().create_future()
+        )
+        self._controls[control_id] = future
+        try:
+            timeout = self.control_timeout if wait_seconds is None else wait_seconds
+            async with asyncio.timeout(timeout):
+                await self._send(encode_control(control_id, request))
+                value = await asyncio.shield(future)
+            return AgentControlResult(value=value)
+        except TimeoutError as exc:
+            if not future.done():
+                future.cancel()
+            self._tombstone_control(control_id)
+            raise AgentHostUnavailableError("control_timeout") from exc
+        except asyncio.CancelledError:
+            if not future.done():
+                future.cancel()
+            self._tombstone_control(control_id)
+            raise
+        finally:
+            self._controls.pop(control_id, None)
+
     async def close(self) -> None:
         """Cancel own tasks, drain boundedly, then terminate/kill only if needed."""
         async with self._lifecycle_lock:
@@ -322,6 +373,8 @@ class AgentHost:
                 self._dispatch_result(frame)
             case CallbackFrame():
                 self._spawn_callback(frame)
+            case ControlResultFrame():
+                self._dispatch_control_result(frame)
 
     def _dispatch_ready(self, frame: ReadyFrame) -> None:
         future = self._ready_future
@@ -348,6 +401,45 @@ class AgentHost:
             return
         if not state.future.done():
             state.future.set_exception(AgentTaskError(frame.error_code or "internal_error", frame.error_message or ""))
+
+    def _dispatch_control_result(self, frame: ControlResultFrame) -> None:
+        future = self._controls.get(frame.control_id)
+        if future is None:
+            if self._consume_control_tombstone(frame.control_id):
+                return
+            raise AgentProtocolError("unknown_control_id")
+        if future.done():
+            return
+        if frame.ok:
+            result = frame.result or {}
+            self._update_readiness_from_control(result)
+            future.set_result(result)
+            return
+        future.set_exception(
+            AgentControlError(
+                frame.error_code or "unavailable",
+                frame.error_message or "The management operation failed.",
+            ),
+        )
+
+    def _update_readiness_from_control(self, result: Mapping[str, JsonValue]) -> None:
+        if self._state is not HostState.READY:
+            return
+        raw_bindings = result.get("bindings")
+        if not isinstance(raw_bindings, dict) or set(raw_bindings) != {"chat", "summary"}:
+            return
+        bindings: dict[TaskKind, bool] = {}
+        for kind in TaskKind:
+            value = raw_bindings.get(kind.value)
+            if not isinstance(value, bool):
+                return
+            bindings[kind] = value
+        state = (
+            ReadinessState.READY
+            if all(bindings.values())
+            else ReadinessState.UNCONFIGURED_READY
+        )
+        self._readiness = HostReadiness(state=state, bindings=bindings)
 
     def _spawn_callback(self, frame: CallbackFrame) -> None:
         state = self._requests.get(frame.request_id)
@@ -485,6 +577,9 @@ class AgentHost:
             if not state.future.done():
                 state.future.set_exception(AgentHostUnavailableError(code))
             self._resolve_drain(state)
+        for future in list(self._controls.values()):
+            if not future.done():
+                future.set_exception(AgentHostUnavailableError(code))
 
     async def _mark_unavailable(self, code: str) -> None:
         self._fail_ready(code)
@@ -538,6 +633,21 @@ class AgentHost:
         self._tombstone_set.discard(request_id)
         with contextlib.suppress(ValueError):
             self._tombstones.remove(request_id)
+        return True
+
+    def _tombstone_control(self, control_id: str) -> None:
+        self._control_tombstones.append(control_id)
+        self._control_tombstone_set.add(control_id)
+        while len(self._control_tombstones) > _MAX_TOMBSTONES:
+            removed = self._control_tombstones.popleft()
+            self._control_tombstone_set.discard(removed)
+
+    def _consume_control_tombstone(self, control_id: str) -> bool:
+        if control_id not in self._control_tombstone_set:
+            return False
+        self._control_tombstone_set.discard(control_id)
+        with contextlib.suppress(ValueError):
+            self._control_tombstones.remove(control_id)
         return True
 
 

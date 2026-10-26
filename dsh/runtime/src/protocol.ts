@@ -2,9 +2,9 @@
  * Versioned newline-delimited JSON envelopes for the private Python <-> Node
  * pipe. The protocol owns no listening socket and no model-visible methods.
  *
- * Closed kinds: ready, request/result, callback/callback_result, cancel,
- * shutdown. Unknown kinds, malformed frames, mismatched IDs, and oversized
- * frames fail closed.
+ * Closed kinds: ready, request/result, callback/callback_result, control/
+ * control_result, cancel, shutdown. Unknown kinds, malformed frames, mismatched
+ * IDs, and oversized frames fail closed.
  */
 
 export const PROTOCOL_VERSION = 1
@@ -19,6 +19,9 @@ export const MAX_ERROR_MESSAGE_LENGTH = 200
 export const MAX_REASONING_EFFORT_LENGTH = 32
 export const MAX_PROMPT_CHARS = 128 * 1024
 export const MAX_PENDING_CALLBACKS = 16
+export const MAX_CONTROL_ARGS_BYTES = 64 * 1024
+export const MAX_CONTROL_RESULT_BYTES = 512 * 1024
+const CONTROL_OP_PATTERN = /^[a-z][a-z0-9_.-]{0,63}$/
 
 export type JsonPrimitive = string | number | boolean | null
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue }
@@ -83,6 +86,11 @@ export interface CallbackResultErrorPayload {
   }
 }
 
+export interface ControlRequestPayload {
+  readonly op: string
+  readonly args: { readonly [key: string]: JsonValue }
+}
+
 export interface CancelPayload {
   readonly reason: string
 }
@@ -94,6 +102,7 @@ export interface ShutdownPayload {
 export type ClientFrame =
   | { readonly v: 1; readonly kind: 'request'; readonly id: string; readonly payload: TaskRequestPayload }
   | { readonly v: 1; readonly kind: 'callback_result'; readonly id: string; readonly payload: CallbackResultSuccessPayload | CallbackResultErrorPayload }
+  | { readonly v: 1; readonly kind: 'control'; readonly id: string; readonly payload: ControlRequestPayload }
   | { readonly v: 1; readonly kind: 'cancel'; readonly id: string; readonly payload: CancelPayload }
   | { readonly v: 1; readonly kind: 'shutdown'; readonly id: string; readonly payload: ShutdownPayload }
 
@@ -102,6 +111,7 @@ export type ServerFrame =
   | { readonly v: 1; readonly kind: 'result'; readonly id: string; readonly payload: ResultSuccessPayload | ResultErrorPayload }
   | { readonly v: 1; readonly kind: 'callback'; readonly id: string; readonly payload: CallbackPayload }
   | { readonly v: 1; readonly kind: 'callback_result'; readonly id: string; readonly payload: CallbackResultSuccessPayload | CallbackResultErrorPayload }
+  | { readonly v: 1; readonly kind: 'control_result'; readonly id: string; readonly payload: ResultSuccessPayload | ResultErrorPayload }
 
 export class ProtocolError extends Error {
   readonly code: string
@@ -224,6 +234,20 @@ export function parseTaskRequest(payload: unknown): TaskRequestPayload {
   })
 }
 
+export function parseControlRequest(payload: unknown): ControlRequestPayload {
+  if (!isPlainObject(payload)) throw new ProtocolError('invalid_control_payload')
+  assertExactKeys(payload, ['op', 'args'], 'invalid_control_payload')
+  const op = payload.op
+  if (typeof op !== 'string' || !CONTROL_OP_PATTERN.test(op)) throw new ProtocolError('invalid_control_op')
+  if (!isPlainObject(payload.args)) throw new ProtocolError('invalid_control_args')
+  assertJsonValue(payload.args)
+  const serialized = JSON.stringify(payload.args)
+  if (Buffer.byteLength(serialized, 'utf8') > MAX_CONTROL_ARGS_BYTES) {
+    throw new ProtocolError('control_args_too_large')
+  }
+  return Object.freeze({ op, args: deepFreezeJson(payload.args) })
+}
+
 export function parseCallbackResult(payload: unknown): CallbackResultSuccessPayload | CallbackResultErrorPayload {
   if (!isPlainObject(payload)) throw new ProtocolError('invalid_callback_result')
   if (payload.ok === true) {
@@ -258,6 +282,8 @@ export function parseClientFrame(line: string): ClientFrame {
       return Object.freeze({ v: 1 as const, kind: 'request' as const, id, payload: parseTaskRequest(parsed.payload) })
     case 'callback_result':
       return Object.freeze({ v: 1 as const, kind: 'callback_result' as const, id, payload: parseCallbackResult(parsed.payload) })
+    case 'control':
+      return Object.freeze({ v: 1 as const, kind: 'control' as const, id, payload: parseControlRequest(parsed.payload) })
     case 'cancel': {
       if (!isPlainObject(parsed.payload)) throw new ProtocolError('invalid_cancel_payload')
       assertExactKeys(parsed.payload, ['reason'], 'invalid_cancel_payload')
@@ -304,6 +330,19 @@ export function resultErrorFrame(id: string, code: string, message: string): Ser
 
 export function callbackFrame(id: string, payload: CallbackPayload): ServerFrame {
   return Object.freeze({ v: 1 as const, kind: 'callback' as const, id, payload })
+}
+
+export function controlResultSuccessFrame(id: string, result: { readonly [key: string]: JsonValue }): ServerFrame {
+  return Object.freeze({ v: 1 as const, kind: 'control_result' as const, id, payload: Object.freeze({ ok: true as const, result }) })
+}
+
+export function controlResultErrorFrame(id: string, code: string, message: string): ServerFrame {
+  return Object.freeze({
+    v: 1 as const,
+    kind: 'control_result' as const,
+    id,
+    payload: Object.freeze({ ok: false as const, error: Object.freeze({ code, message }) }),
+  })
 }
 
 export function callbackResultSuccessFrame(id: string, result: JsonValue): ServerFrame {

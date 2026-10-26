@@ -253,6 +253,7 @@ export default class KomariAgentRuntime extends Service {
             name: PERSONA_PREFIX_SECTION,
             order: 0,
             text: live.prompt,
+            interpolate: false,
           })
         },
       })
@@ -293,8 +294,8 @@ export default class KomariAgentRuntime extends Service {
 
   private async createLiveTask(requestId: string, request: TaskRequestPayload): Promise<LiveTask> {
     const binding = this.resolveBinding(request.kind)
-    const prompt = (binding.prompt ?? '').trim()
-    if (prompt.length === 0) throw new TaskFailure('binding_unconfigured')
+    const prompt = binding.prompt ?? ''
+    if (prompt.trim().length === 0) throw new TaskFailure('binding_unconfigured')
     if (prompt.length > MAX_PROMPT_CHARS) throw new TaskFailure('invalid_binding')
     const provider = (binding.provider ?? '').trim()
     const model = (binding.model ?? '').trim()

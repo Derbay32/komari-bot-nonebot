@@ -24,6 +24,7 @@ import {
   type TaskKind,
 } from './protocol.js'
 import KomariAgentRuntime, { TaskFailure, type CallbackTransport } from './business.js'
+import { DshManagementService } from './management.js'
 import { installSanitizedStderr } from './logging.js'
 
 export const PROFILE_BUNDLE = '@komari-bot/dsh-runtime-bundle'
@@ -52,6 +53,12 @@ export interface StartHostOptions {
   readonly baseConfig: string
   /** Private harness home. Never the operator's ~/.dsh. */
   readonly dshHome: string
+  /**
+   * Directory holding the home-level patch and harness-home files. It defaults
+   * to a child of dshHome so the writable profile patch is never also read as
+   * a higher-priority home patch; credentials keep resolving against dshHome.
+   */
+  readonly configHome?: string
   /** Test-only trusted composition patches. Production passes none. */
   readonly extraPatches?: readonly PatchOptions[]
   /** Protocol frame sink; callback frames travel through it. */
@@ -61,6 +68,7 @@ export interface StartHostOptions {
 export interface HostRuntime {
   readonly ctx: Context
   readonly service: KomariAgentRuntime
+  readonly management: DshManagementService
   readonly bindings: Readonly<Record<TaskKind, boolean>>
   readonly callbacks: CallbackDispatcher
   close(): Promise<void>
@@ -214,9 +222,12 @@ export async function startHost(options: StartHostOptions): Promise<HostRuntime>
     patchPath: join(options.profileDir, PROFILE_PATCH),
     installAnchor: options.installAnchor,
     cwd: process.cwd(),
-    home: options.dshHome,
+    home: options.configHome ?? join(options.dshHome, '.home'),
     startedBundles: profile.layers.map((layer) => layer.packageName),
-    overlays: [],
+    // Constructor-only fixture rows are trusted test composition, never
+    // protocol input. Keeping them as overlays makes a settings-triggered
+    // reload compose the same test composition instead of dropping its tools.
+    overlays: [...(options.extraPatches ?? [])],
     telemetryDisabledEnv: '1',
   }
   let ctx: Context
@@ -236,10 +247,12 @@ export async function startHost(options: StartHostOptions): Promise<HostRuntime>
     if (service === undefined) throw new HostBootError('composition_incomplete')
     const callbacks = new CallbackDispatcher(options.sendFrame)
     service.attachCallbackTransport(callbacks)
+    const management = new DshManagementService(ctx, service)
     let closed = false
     return {
       ctx,
       service,
+      management,
       bindings: service.bindingStatus(),
       callbacks,
       close: async () => {

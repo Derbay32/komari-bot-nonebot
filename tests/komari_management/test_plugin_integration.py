@@ -151,6 +151,9 @@ async def test_nonebot_fastapi_driver_exposes_docs_and_management_routes(
     assert "/api/v2/komari-search/provider-descriptors" in schema["paths"]
     assert "/api/v2/komari-management-config/resources" in schema["paths"]
     assert "/api/v2/komari-management-prompt/resources" in schema["paths"]
+    assert "/api/v2/komari-agent/providers" in schema["paths"]
+    assert "/api/v2/komari-agent/bindings/{kind}" in schema["paths"]
+    assert "/api/v2/komari-agent/prompts/{kind}" in schema["paths"]
     assert "/api/v2/komari-user-bans/bans" in schema["paths"]
     assert "/api/v2/reply-fulfillments/fulfillments" in schema["paths"]
     assert "/api/v2/character-bindings/repair/diagnose" in schema["paths"]
@@ -167,6 +170,7 @@ async def test_nonebot_fastapi_driver_exposes_docs_and_management_routes(
         "komari-search",
         "komari-management-config",
         "komari-management-prompt",
+        "komari-agent",
         "komari-user-bans",
         "reply-fulfillments",
         "character-binding-repair",
@@ -306,6 +310,7 @@ def test_production_loader_carries_real_roulette_symbols(
     components = real_management_loader.load_components()
 
     assert "komari_roulette" in real_management_loader.required_plugins
+    assert "komari_agent" in real_management_loader.required_plugins
     assert "komari_memory" not in real_management_loader.required_plugins
     assert (
         components.register_roulette_management_api

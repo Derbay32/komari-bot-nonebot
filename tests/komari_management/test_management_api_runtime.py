@@ -211,6 +211,11 @@ async def test_register_management_api_for_fastapi_driver(app: App) -> None:
     assert "/api/v2/komari-search/provider-descriptors" in schema["paths"]
     assert "/api/v2/komari-management-config/resources" in schema["paths"]
     assert "/api/v2/komari-management-prompt/resources" in schema["paths"]
+    assert "/api/v2/komari-agent/providers" in schema["paths"]
+    assert "/api/v2/komari-agent/providers/{provider}" in schema["paths"]
+    assert "/api/v2/komari-agent/providers/{provider}/credential" in schema["paths"]
+    assert "/api/v2/komari-agent/bindings/{kind}" in schema["paths"]
+    assert "/api/v2/komari-agent/prompts/{kind}" in schema["paths"]
     assert "/api/v2/komari-announce/groups" in schema["paths"]
     assert "/api/v2/komari-announce/maintenance" in schema["paths"]
     assert "/api/v2/komari-decision/health" in schema["paths"]
@@ -234,6 +239,7 @@ async def test_register_management_api_for_fastapi_driver(app: App) -> None:
         "/api/v2/komari-search, "
         "/api/v2/komari-management-config, /api/v2/komari-management-prompt, "
         "/api/v2/komari-announce, "
+        "/api/v2/komari-agent, "
         "/api/v2/komari-user-bans, /api/v2/group-admission, /api/v2/reply-fulfillments"
     )
     assert logger.info_messages[-1] == (
