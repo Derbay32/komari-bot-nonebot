@@ -35,7 +35,6 @@ from .protocol import (
     read_frame,
 )
 from .types import (
-    MAX_CALLBACK_DATA_BYTES,
     AgentCallbackHandler,
     AgentCallbackRequest,
     AgentControlError,
@@ -52,6 +51,7 @@ from .types import (
     JsonValue,
     ReadinessState,
     TaskKind,
+    callback_data_limit,
     json_payload,
     validate_json_value,
 )
@@ -480,7 +480,7 @@ class AgentHost:
             except (TypeError, ValueError):
                 await self._send(encode_callback_result_error(frame.callback_id, "callback_failed"))
                 return
-            if len(encoded) > MAX_CALLBACK_DATA_BYTES:
+            if len(encoded) > callback_data_limit(frame.name, state.request.kind):
                 await self._send(encode_callback_result_error(frame.callback_id, "callback_failed"))
                 return
             await self._send(encode_callback_result_success(frame.callback_id, result))

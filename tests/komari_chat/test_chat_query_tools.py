@@ -8,7 +8,12 @@ from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
-from komari_bot.agent import AgentCallbackRequest
+from komari_bot.agent import (
+    AgentCallbackRequest,
+    AgentTaskBudget,
+    AgentTaskRequest,
+    TaskKind,
+)
 from komari_bot.plugins.komari_chat.services.chat_query_tools import (
     ChatQueryAdmissionError,
     ChatQueryTools,
@@ -34,7 +39,16 @@ def _request(name: str, data: Mapping[str, object]) -> AgentCallbackRequest:
     return AgentCallbackRequest(
         name=name,
         data=cast("Any", dict(data)),
-        task=cast("Any", SimpleNamespace()),
+        task=AgentTaskRequest(
+            task_id="query-tool-test",
+            kind=TaskKind.CHAT,
+            task_data={},
+            budget=AgentTaskBudget(
+                max_rounds=1,
+                max_tool_calls_per_round=1,
+                max_total_tool_calls=1,
+            ),
+        ),
     )
 
 

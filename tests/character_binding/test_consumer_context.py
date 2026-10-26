@@ -174,8 +174,8 @@ def test_prompt_builder_passes_canonical_context_to_binding_lookup(
 async def test_summary_history_resolves_each_name_with_group_scope(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    planner = importlib.import_module(
-        "komari_bot.plugins.group_history_summary.planner_service"
+    history_tools = importlib.import_module(
+        "komari_bot.plugins.group_history_summary.history_tools"
     )
     binding = _StrictScopedBinding(
         {
@@ -183,8 +183,8 @@ async def test_summary_history_resolves_each_name_with_group_scope(
             ("200000", "1047195267"): "群二角色",
         }
     )
-    monkeypatch.setattr(planner, "character_binding", binding)
-    monkeypatch.setattr(planner, "ensure_effect_admitted", lambda **_kwargs: None)
+    monkeypatch.setattr(history_tools, "character_binding", binding)
+    monkeypatch.setattr(history_tools, "ensure_effect_admitted", lambda **_kwargs: None)
 
     class _HistoryBot:
         async def call_api(self, _api: str, **_kwargs: object) -> object:
@@ -210,13 +210,13 @@ async def test_summary_history_resolves_each_name_with_group_scope(
             }
 
     bot = _HistoryBot()
-    first = await planner._fetch_history_window(
+    first = await history_tools.fetch_history_window(
         bot=cast("Any", bot),
         group_id="114514",
         count=2,
         batch_size=2,
     )
-    second = await planner._fetch_history_window(
+    second = await history_tools.fetch_history_window(
         bot=cast("Any", bot),
         group_id="200000",
         count=2,

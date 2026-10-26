@@ -183,7 +183,13 @@ export interface TestProfile {
 export function writeTestProfile(
   root: string,
   baseURL: string,
-  options: { readonly prompt?: string; readonly compaction?: boolean; readonly fixturePresets?: boolean } = {},
+  options: {
+    readonly prompt?: string
+    readonly summaryPrompt?: string
+    readonly compaction?: boolean
+    readonly fixturePresets?: boolean
+    readonly contextWindow?: number
+  } = {},
 ): TestProfile {
   const dataDir = join(root, 'data')
   const profileDir = join(dataDir, 'dsh')
@@ -204,7 +210,7 @@ export function writeTestProfile(
     '        apiKeyEnv: FIXTURE_KEY',
     '        models:',
     '          - id: fixture-model',
-    '            contextWindow: 8192',
+    `            contextWindow: ${options.contextWindow ?? 8192}`,
     '            maxTokens: 128',
     '        retryPolicy:',
     '          mode: normal',
@@ -223,7 +229,7 @@ export function writeTestProfile(
     '    summary:',
     '      provider: fixture',
     '      model: fixture-model',
-    '      prompt: "You summarize fixtures."',
+    `      prompt: ${JSON.stringify(options.summaryPrompt ?? 'You summarize fixtures.')}`,
   ]
   if (options.fixturePresets === true) {
     lines.push(
@@ -304,6 +310,165 @@ export function minimalChatTaskData(overrides: {
       visible_users: [],
       max_favorability_delta: 3,
     },
+  }
+}
+
+export function minimalSummaryTaskData(overrides: { readonly request?: string } = {}): { [key: string]: JsonValue } {
+  return {
+    schema: 1,
+    request: {
+      source_type: 'group_history',
+      source_id: 'group-summary-test',
+      trust_level: 'untrusted',
+      content: overrides.request ?? '总结最近消息',
+    },
+    limits: {
+      default_count: 30,
+      min_count: 10,
+      max_count: 200,
+      scan_limit: 300,
+    },
+  }
+}
+
+export interface SummaryHistoryRow {
+  readonly message_id: string | null
+  readonly reply_to_message_id: string | null
+  readonly timestamp: number
+  readonly user_id: string
+  readonly nickname: string
+  readonly is_bot: boolean
+  readonly source_type: 'group_history'
+  readonly source_id: string
+  readonly trust_level: 'untrusted'
+  readonly content: string
+}
+
+export function summaryHistoryRow(index: number, overrides: Partial<SummaryHistoryRow> = {}): SummaryHistoryRow {
+  return {
+    message_id: `m-${index}`,
+    reply_to_message_id: null,
+    timestamp: index,
+    user_id: `u-${index}`,
+    nickname: `用户${index}`,
+    is_bot: false,
+    source_type: 'group_history',
+    source_id: 'recent_group_messages',
+    trust_level: 'untrusted',
+    content: `消息${index}`,
+    ...overrides,
+  }
+}
+
+export interface SummaryFetchCall {
+  readonly name: string
+  readonly data: Record<string, unknown>
+}
+
+export class SummaryCallbackSimulator {
+  rows: SummaryHistoryRow[] = []
+  pageSize = 64
+  generation = 0
+  read = false
+  completed = false
+  resultText: string | undefined
+  readonly fetchCalls: SummaryFetchCall[] = []
+  readonly pageCalls: Array<{ readonly generation: number; readonly offset: number }> = []
+  readonly finalCalls: Array<Record<string, unknown>> = []
+
+  submit(name: string, data: Record<string, unknown>): Record<string, unknown> {
+    if (name === 'summary.fetch_recent' || name === 'summary.fetch_user' || name === 'summary.fetch_topic') {
+      this.fetchCalls.push({ name, data })
+      this.generation += 1
+      this.read = true
+      const source = name === 'summary.fetch_recent'
+        ? 'recent_group_messages'
+        : name === 'summary.fetch_user'
+          ? 'messages_by_user'
+          : 'messages_by_topic'
+      return {
+        generation: this.generation,
+        source,
+        matched_count: this.rows.length,
+        selected_count: this.rows.length,
+        filters: data,
+        history_fetch: null,
+        first_page_offset: 0,
+      }
+    }
+    if (name === 'summary.history_page') {
+      const generation = data.generation
+      const offset = data.offset
+      if (generation !== this.generation || typeof offset !== 'number') {
+        throw new Error('stale summary page generation')
+      }
+      this.pageCalls.push({ generation: this.generation, offset })
+      const rows = this.rows.slice(offset, offset + this.pageSize)
+      const next = offset + rows.length < this.rows.length ? offset + rows.length : null
+      return {
+        generation: this.generation,
+        offset,
+        next_offset: next,
+        total: this.rows.length,
+        rows,
+      }
+    }
+    if (name === 'summary.final_summary') {
+      this.finalCalls.push(data)
+      if (this.completed) {
+        return { accepted: false, code: 'already_completed', missing: [], result: { summary_text: this.resultText } }
+      }
+      if (!this.read) {
+        return { accepted: false, code: 'history_required', missing: ['history_read', 'final_summary'], result: null }
+      }
+      const content = data.content
+      if (Object.keys(data).length !== 1 || typeof content !== 'string' || content.trim().length === 0) {
+        return { accepted: false, code: 'invalid_content', missing: ['final_summary'], result: null }
+      }
+      this.resultText = content.trim()
+      this.completed = true
+      return { accepted: true, code: null, missing: [], result: { summary_text: this.resultText } }
+    }
+    throw new Error(`unexpected summary callback ${name}`)
+  }
+}
+
+export interface SummarySendFrameOptions {
+  readonly admission?: boolean | (() => boolean)
+  readonly failFinalCallback?: boolean
+  readonly onCallback?: (name: string) => void
+}
+
+export function summarySendFrame(
+  runtimeRef: { current?: Awaited<ReturnType<typeof import('../dist/host.js').startHost>> },
+  simulator: SummaryCallbackSimulator,
+  options: SummarySendFrameOptions = {},
+): (frame: { kind: string; id: string; payload?: unknown }) => Promise<void> {
+  return async (frame) => {
+    if (frame.kind !== 'callback') return
+    const payload = frame.payload as { name: string; data: Record<string, unknown> }
+    options.onCallback?.(payload.name)
+    if (payload.name === 'admission') {
+      const allow = typeof options.admission === 'function' ? options.admission() : (options.admission ?? true)
+      runtimeRef.current?.callbacks.handleResult(frame.id, { ok: true, result: { allow } })
+      return
+    }
+    if (payload.name === 'summary.final_summary' && options.failFinalCallback === true) {
+      runtimeRef.current?.callbacks.handleResult(frame.id, {
+        ok: false,
+        error: { code: 'callback_failed', message: 'simulated summary callback failure' },
+      })
+      return
+    }
+    try {
+      const receipt = simulator.submit(payload.name, payload.data)
+      runtimeRef.current?.callbacks.handleResult(frame.id, { ok: true, result: receipt as unknown as import('../dist/protocol.js').JsonValue })
+    } catch (error) {
+      runtimeRef.current?.callbacks.handleResult(frame.id, {
+        ok: false,
+        error: { code: 'callback_failed', message: error instanceof Error ? error.message : 'summary simulator failed' },
+      })
+    }
   }
 }
 

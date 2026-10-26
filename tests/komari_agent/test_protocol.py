@@ -7,10 +7,12 @@ import json
 import pytest
 
 from komari_bot.agent import (
+    AgentCallbackRequest,
     AgentProtocolError,
     AgentTaskBudget,
     AgentTaskRequest,
     TaskKind,
+    callback_data_limit,
 )
 from komari_bot.agent.protocol import (
     ReadyFrame,
@@ -18,6 +20,11 @@ from komari_bot.agent.protocol import (
     encode_callback_result_error,
     encode_frame,
     encode_request,
+)
+from komari_bot.agent.types import (
+    MAX_CALLBACK_DATA_BYTES,
+    MAX_FINAL_SUMMARY_CALLBACK_BYTES,
+    MAX_RESULT_BYTES,
 )
 
 
@@ -97,3 +104,47 @@ def test_callback_error_is_sanitized_to_a_stable_code() -> None:
     parsed = json.loads(encoded)
     assert parsed["payload"]["error"]["code"] == "callback_failed"
     assert "Not a Safe Code" not in encoded.decode()
+
+
+def _task_for_kind(kind: TaskKind) -> AgentTaskRequest:
+    return AgentTaskRequest(
+        task_id=f"task-{kind.value}",
+        kind=kind,
+        task_data={"schema": 1},
+        budget=AgentTaskBudget(max_rounds=3, max_tool_calls_per_round=4, max_total_tool_calls=8),
+    )
+
+
+def test_named_final_summary_callback_ceiling_is_bounded_and_kind_scoped() -> None:
+    assert MAX_FINAL_SUMMARY_CALLBACK_BYTES == MAX_RESULT_BYTES + 1024
+    assert callback_data_limit("summary.final_summary", TaskKind.SUMMARY) == MAX_FINAL_SUMMARY_CALLBACK_BYTES
+    assert callback_data_limit("summary.final_summary", TaskKind.CHAT) == MAX_CALLBACK_DATA_BYTES
+    assert callback_data_limit("summary.history_page", TaskKind.SUMMARY) == MAX_CALLBACK_DATA_BYTES
+    assert callback_data_limit("chat.submit_final_response", TaskKind.CHAT) == MAX_CALLBACK_DATA_BYTES
+
+
+def test_callback_request_data_uses_the_trusted_named_ceiling() -> None:
+    summary_task = _task_for_kind(TaskKind.SUMMARY)
+    chat_task = _task_for_kind(TaskKind.CHAT)
+    larger_than_generic = "x" * (MAX_CALLBACK_DATA_BYTES + 1)
+
+    accepted = AgentCallbackRequest(
+        name="summary.final_summary",
+        data={"content": larger_than_generic},
+        task=summary_task,
+    )
+    assert len(str(accepted.data["content"])) == MAX_CALLBACK_DATA_BYTES + 1
+
+    with pytest.raises(ValueError):
+        AgentCallbackRequest(
+            name="summary.final_summary",
+            data={"content": "x" * (MAX_FINAL_SUMMARY_CALLBACK_BYTES + 1)},
+            task=summary_task,
+        )
+
+    with pytest.raises(ValueError):
+        AgentCallbackRequest(
+            name="chat.submit_final_response",
+            data={"content": larger_than_generic},
+            task=chat_task,
+        )

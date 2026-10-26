@@ -93,7 +93,9 @@
       config:
         id: summary
         name: Summary
-        plugins: []
+        plugins:
+          - id: komari-summary-preset
+            name: '@komari-bot/dsh-runtime/summary'
 
     # --- project runtime -------------------------------------------------
     # This row id is the settings namespace `komari-agent`. Its chat and

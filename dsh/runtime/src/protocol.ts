@@ -15,6 +15,8 @@ export const MAX_CALLBACK_NAME_LENGTH = 64
 export const MAX_TASK_DATA_BYTES = 512 * 1024
 export const MAX_CALLBACK_DATA_BYTES = 256 * 1024
 export const MAX_RESULT_BYTES = 512 * 1024
+/** Trusted final-summary callback ceiling: result envelope plus receipt bytes. */
+export const MAX_FINAL_SUMMARY_CALLBACK_BYTES = MAX_RESULT_BYTES + 1024
 export const MAX_ERROR_MESSAGE_LENGTH = 200
 export const MAX_REASONING_EFFORT_LENGTH = 32
 export const MAX_PROMPT_CHARS = 128 * 1024
@@ -28,6 +30,16 @@ export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue
 
 export type TaskKind = 'chat' | 'summary'
 export type AdmissionPurpose = 'conversation' | 'compaction' | 'session-title'
+
+/**
+ * The per-callback envelope ceiling, derived only from the trusted task kind
+ * and fixed callback name. No wire or model field can raise it.
+ */
+export function callbackDataLimit(name: string, kind: TaskKind): number {
+  return kind === 'summary' && name === 'summary.final_summary'
+    ? MAX_FINAL_SUMMARY_CALLBACK_BYTES
+    : MAX_CALLBACK_DATA_BYTES
+}
 
 export interface TaskBudget {
   /** Frozen upper bound for model rounds in one task. */
@@ -248,13 +260,16 @@ export function parseControlRequest(payload: unknown): ControlRequestPayload {
   return Object.freeze({ op, args: deepFreezeJson(payload.args) })
 }
 
-export function parseCallbackResult(payload: unknown): CallbackResultSuccessPayload | CallbackResultErrorPayload {
+export function parseCallbackResult(
+  payload: unknown,
+  maxBytes = MAX_CALLBACK_DATA_BYTES,
+): CallbackResultSuccessPayload | CallbackResultErrorPayload {
   if (!isPlainObject(payload)) throw new ProtocolError('invalid_callback_result')
   if (payload.ok === true) {
     assertExactKeys(payload, ['ok', 'result'], 'invalid_callback_result')
     assertJsonValue(payload.result)
     const serialized = JSON.stringify(payload.result)
-    if (Buffer.byteLength(serialized, 'utf8') > MAX_CALLBACK_DATA_BYTES) throw new ProtocolError('callback_result_too_large')
+    if (Buffer.byteLength(serialized, 'utf8') > maxBytes) throw new ProtocolError('callback_result_too_large')
     return Object.freeze({ ok: true, result: deepFreezeJson(payload.result) })
   }
   if (payload.ok === false) {
@@ -281,7 +296,15 @@ export function parseClientFrame(line: string): ClientFrame {
     case 'request':
       return Object.freeze({ v: 1 as const, kind: 'request' as const, id, payload: parseTaskRequest(parsed.payload) })
     case 'callback_result':
-      return Object.freeze({ v: 1 as const, kind: 'callback_result' as const, id, payload: parseCallbackResult(parsed.payload) })
+      // The transport envelope admits at most the largest named-callback
+      // ceiling; the dispatcher later enforces the originating callback's
+      // recorded limit before resolving it.
+      return Object.freeze({
+        v: 1 as const,
+        kind: 'callback_result' as const,
+        id,
+        payload: parseCallbackResult(parsed.payload, MAX_FINAL_SUMMARY_CALLBACK_BYTES),
+      })
     case 'control':
       return Object.freeze({ v: 1 as const, kind: 'control' as const, id, payload: parseControlRequest(parsed.payload) })
     case 'cancel': {

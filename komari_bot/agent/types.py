@@ -15,6 +15,10 @@ MAX_CALLBACK_NAME_LENGTH: Final = 64
 MAX_TASK_DATA_BYTES: Final = 512 * 1024
 MAX_CALLBACK_DATA_BYTES: Final = 256 * 1024
 MAX_RESULT_BYTES: Final = 512 * 1024
+# The final summary callback carries the same trusted business text as the
+# task result plus its small completion receipt envelope.
+MAX_FINAL_SUMMARY_CALLBACK_BYTES: Final = MAX_RESULT_BYTES + 1024
+_FINAL_SUMMARY_CALLBACK_NAME: Final = "summary.final_summary"
 MAX_CONTROL_ARGS_BYTES: Final = 64 * 1024
 MAX_CONTROL_RESULT_BYTES: Final = 512 * 1024
 MAX_BUDGET_VALUE: Final = 1000
@@ -31,6 +35,13 @@ class TaskKind(StrEnum):
 
     CHAT = "chat"
     SUMMARY = "summary"
+
+
+def callback_data_limit(name: str, kind: TaskKind) -> int:
+    """The trusted per-callback envelope ceiling, derived only from kind/name."""
+    if kind is TaskKind.SUMMARY and name == _FINAL_SUMMARY_CALLBACK_NAME:
+        return MAX_FINAL_SUMMARY_CALLBACK_BYTES
+    return MAX_CALLBACK_DATA_BYTES
 
 
 class ControlOperation(StrEnum):
@@ -241,7 +252,10 @@ class AgentCallbackRequest:
         if _CALLBACK_NAME_PATTERN.fullmatch(self.name) is None:
             msg = "callback name must match the protocol identifier pattern"
             raise ValueError(msg)
-        copied = copy_json_object(self.data, max_bytes=MAX_CALLBACK_DATA_BYTES)
+        copied = copy_json_object(
+            self.data,
+            max_bytes=callback_data_limit(self.name, self.task.kind),
+        )
         object.__setattr__(self, "data", copied)
 
 
@@ -304,6 +318,7 @@ __all__ = [
     "MAX_CALLBACK_NAME_LENGTH",
     "MAX_CONTROL_ARGS_BYTES",
     "MAX_CONTROL_RESULT_BYTES",
+    "MAX_FINAL_SUMMARY_CALLBACK_BYTES",
     "MAX_RESULT_BYTES",
     "MAX_TASK_DATA_BYTES",
     "MAX_TASK_ID_LENGTH",
@@ -325,6 +340,7 @@ __all__ = [
     "JsonValue",
     "ReadinessState",
     "TaskKind",
+    "callback_data_limit",
     "copy_json_object",
     "json_payload",
     "validate_error_code",
