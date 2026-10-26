@@ -232,7 +232,7 @@ def _wire_native_core(
         return (
             generate_result
             if generate_result is not None
-            else llm_service_module.ReplyResult(
+            else import_module("komari_bot.plugins.komari_chat.services.chat_result").ReplyResult(
                 content="回复内容",
                 favorability_delta=0,
                 favorability_reason="无变化",

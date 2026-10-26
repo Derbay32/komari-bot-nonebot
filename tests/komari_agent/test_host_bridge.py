@@ -14,6 +14,7 @@ from komari_bot.agent import (
     AgentCallbackHandler,
     AgentCallbackRequest,
     AgentHostUnavailableError,
+    AgentTaskBudget,
     AgentTaskError,
     AgentTaskRequest,
     JsonValue,
@@ -29,6 +30,7 @@ from tests.komari_agent.dsh_test_support import (
     ToolCallResponse,
     Usage,
     allowed_profile_files,
+    chat_task_data,
     default_budget,
     host_for,
     running_dsh,
@@ -38,12 +40,17 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
-def _task(task_id: str = "task-1", message: str = "hello") -> AgentTaskRequest:
+def _task(
+    task_id: str = "task-1",
+    message: str = "hello",
+    *,
+    budget: AgentTaskBudget | None = None,
+) -> AgentTaskRequest:
     return AgentTaskRequest(
         task_id=task_id,
         kind=TaskKind.CHAT,
-        task_data={"message": message},
-        budget=default_budget(),
+        task_data=chat_task_data(message),
+        budget=budget or default_budget(),
     )
 
 
@@ -85,10 +92,9 @@ async def test_task_completes_through_business_callback(tmp_path: Path) -> None:
         assert set(request.tool_names) == {"fixture_complete", "fixture_followup", "fixture_update_prompt"}
         assert request.system_text == "You are a fixture."
         assert len(request.user_texts) == 1
-        assert json.loads(request.user_texts[0]) == {
-            "task_kind": "chat",
-            "task_data": {"message": "hello"},
-        }
+        assert request.user_texts[0].startswith('<komari_chat_task schema="1">')
+        assert "<current_message>" in request.user_texts[0]
+        assert '"content":"hello"' in request.user_texts[0]
         assert not any(name in {"bash", "read", "write", "edit", "run_code"} for name in request.tool_names)
 
     assert allowed_profile_files(tmp_path / "data") == {
@@ -312,17 +318,27 @@ async def test_retry_policy_mismatch_is_rejected_without_provider_io(tmp_path: P
         assert server.requests == []
 
 
-async def test_production_composition_exposes_no_business_tools(tmp_path: Path) -> None:
+async def test_production_composition_exposes_only_chat_preset_tools(tmp_path: Path) -> None:
+    budget = AgentTaskBudget(
+        max_rounds=1,
+        max_tool_calls_per_round=2,
+        max_total_tool_calls=2,
+    )
     async with running_dsh(
         tmp_path,
         responses=(TextResponse("plain text"),),
         entry_script=MAIN_HOST_SCRIPT,
     ) as (host, server):
         with pytest.raises(AgentTaskError) as exc_info:
-            await host.execute(_task(), _callbacks([]))
-        assert exc_info.value.code == "incomplete_result"
+            await host.execute(_task(budget=budget), _callbacks([]))
+        assert exc_info.value.code == "budget_exhausted"
         assert len(server.requests) == 1
-        assert server.requests[0].tools == []
+        assert set(server.requests[0].tool_names) == {
+            "final_response",
+            "record_favorability_delta",
+        }
+        assert len(server.requests[0].user_texts) == 1
+        assert "<komari_chat_task" in server.requests[0].user_texts[0]
 
 
 async def test_close_fails_running_task_and_closes_process(tmp_path: Path) -> None:

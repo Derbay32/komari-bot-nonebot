@@ -212,7 +212,7 @@ def _wire_generate_core(
 
     async def _fake_generate_with_tools(**kwargs: object) -> Any:
         generate_kwargs.update(kwargs)
-        return llm_service_module.ReplyResult(
+        return import_module("komari_bot.plugins.komari_chat.services.chat_result").ReplyResult(
             content="回复内容",
             favorability_delta=0,
             favorability_reason="无变化",
@@ -494,7 +494,7 @@ def test_delegated_mode_quoted_images_first_stable_indexes(
 
     async def _fake_generate_with_tools(**kwargs: object) -> Any:
         generate_kwargs.update(kwargs)
-        return llm_service_module.ReplyResult(
+        return import_module("komari_bot.plugins.komari_chat.services.chat_result").ReplyResult(
             content="回复内容",
             favorability_delta=0,
             favorability_reason="无变化",
@@ -799,7 +799,7 @@ def test_generate_core_freezes_image_policy_snapshot_across_tasks(
 
     async def _fake_generate_with_tools(**kwargs: object) -> Any:
         generate_calls.append(kwargs)
-        return llm_service_module.ReplyResult(
+        return import_module("komari_bot.plugins.komari_chat.services.chat_result").ReplyResult(
             content="回复内容",
             favorability_delta=0,
             favorability_reason="无变化",

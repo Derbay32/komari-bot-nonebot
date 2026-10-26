@@ -84,7 +84,9 @@
       config:
         id: chat
         name: Chat
-        plugins: []
+        plugins:
+          - id: komari-chat-preset
+            name: '@komari-bot/dsh-runtime/chat-preset'
 
     - id: preset-summary
       name: '@deepseek-ai/dsh-agent-preset'

@@ -21,8 +21,8 @@ from komari_bot.plugins.llm_provider.base_client import build_assistant_message
 
 from .admission_gate import effect_business_admitted
 from .agent_budget import AgentBudgetLedger, AgentExecutionBudget
+from .chat_result import ReplyResult as _ReplyResult
 from .image_reading_session import (
-    ImageFailureSummary,
     ImageUnderstandingFailureError,
 )
 
@@ -246,27 +246,6 @@ _CANONICAL_TOOLS = {
 
 
 @dataclass(frozen=True)
-class ReplyResult:
-    """聊天回复正文与本次生成同步取得的运行时事实。
-
-    ``hindsight_target_fingerprint``（TSK-195）：由 ``_generate_reply_core``
-    从实际打开的任务记忆会话标注的内部字段，默认 ``None``；模型工具参数
-    永远不得提供该字段，只有生成包装层可以写入。
-
-    ``image_failure_summary``（TSK-196）：任务成功但存在图片失败时附带的
-    安全聚合摘要（``ImageFailureSummary``，无 URL/base64/正文/视觉描述）；
-    只在消息处理器的通知边界经本地窄 mapper 投影为 onebot
-    ``ImageFailureDiagnostic`` 并提交一次 SUPERUSER 图片汇总卡。
-    """
-
-    content: str
-    favorability_delta: int | None = None
-    favorability_reason: str | None = None
-    hindsight_target_fingerprint: str | None = None
-    image_failure_summary: ImageFailureSummary | None = None
-
-
-@dataclass(frozen=True)
 class _BusinessToolExecution:
     """业务工具执行结果及其完整日志数据。"""
 
@@ -352,13 +331,13 @@ def _parse_reply_result(
     *,
     favorability_delta: int | None = None,
     favorability_reason: str | None = None,
-) -> ReplyResult:
+) -> _ReplyResult:
     """从 final_response 工具参数构造回复结果。"""
     content_raw = parsed.get("content")
     if not isinstance(content_raw, str) or not content_raw.strip():
         raise ValueError(_MISSING_FINAL_CONTENT_ERROR)
 
-    return ReplyResult(
+    return _ReplyResult(
         content=content_raw.strip(),
         favorability_delta=favorability_delta,
         favorability_reason=favorability_reason,
@@ -708,7 +687,7 @@ async def generate_reply(
     system_prompt: str = "",
     request_trace_id: str | None = None,
     agent_budget: AgentExecutionBudget | None = None,
-) -> ReplyResult:
+) -> _ReplyResult:
     """生成回复（使用 OpenAI messages 格式，带单请求瞬时重试，支持多模态）。
 
     Args:
@@ -935,7 +914,7 @@ async def _execute_tool_loop(
     caller_group_id: str | None = None,
     caller_is_superuser: bool = False,
     max_favorability_delta: int = 5,
-) -> ReplyResult:
+) -> _ReplyResult:
     """执行多轮工具调用循环，直到模型调用 final_response。
 
     TSK-194/ADR-0010：主循环恒使用聊天模型与 chat 槽位（含原生模式
@@ -973,7 +952,7 @@ async def _execute_tool_loop(
         # 安静丢弃本轮结果，不进入 provider、不落任何待恢复补执行状态、
         # 不复活；一次裁决只授权本轮的这一个不可分效果。
         if not effect_business_admitted(group_id=group_id):
-            return ReplyResult(content="")
+            return _ReplyResult(content="")
         # TSK-192 / ADR-0010：主工具循环恒使用聊天模型与 chat 槽位；
         # read_image 工具的视觉子调用（vision_service）才使用 vision
         # 模型与槽位，不再因存在 read_image 工具而切换整个循环。
@@ -1257,7 +1236,7 @@ async def generate_reply_with_tools(
     caller_is_superuser: bool = False,
     max_favorability_delta: int = 5,
     agent_budget: AgentExecutionBudget | None = None,
-) -> ReplyResult:
+) -> _ReplyResult:
     """通过工具调用模式生成回复，调用方显式指定启用工具列表。
 
     Note:

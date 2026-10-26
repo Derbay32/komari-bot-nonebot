@@ -379,6 +379,15 @@ class _DummyDecisionPlugin:
     pass
 
 
+class _DummyAgentPlugin:
+    """require("komari_agent") load declaration for handler imports."""
+
+    @staticmethod
+    def get_agent_host() -> object:
+        msg = "tests must inject a DSH chat service or host"
+        raise RuntimeError(msg)
+
+
 class _DummyGroupAdmissionPlugin:
     """require("group_admission") 只作加载声明，返回值不承载业务符号。
 
@@ -411,6 +420,7 @@ _REQUIRE_REGISTRY: dict[str, object] = {
     "character_binding": _DummyCharacterBindingPlugin(),
     "komari_search": _DummySearchPlugin(),
     "komari_decision": _DummyDecisionPlugin(),
+    "komari_agent": _DummyAgentPlugin(),
     "komari_chat": _DummyChatPlugin(),
     "group_history_summary": _DummyGroupHistorySummaryPlugin(),
 }

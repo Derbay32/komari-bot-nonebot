@@ -645,7 +645,7 @@ async def test_process_message_success_with_image_failures_notifies_once(
     )
 
     summary = _image_summary()
-    reply_result = message_handler_module.ReplyResult(
+    reply_result = import_module("komari_bot.plugins.komari_chat.services.chat_result").ReplyResult(
         content="回复内容",
         favorability_delta=0,
         favorability_reason="无变化",

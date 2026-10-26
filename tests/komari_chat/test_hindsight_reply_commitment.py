@@ -205,7 +205,7 @@ def _pending_reply(
         reply=reply_content,
         reply_to_message_id="message-1",
         message=message,
-        reply_result=handler_module.ReplyResult(
+        reply_result=import_module("komari_bot.plugins.komari_chat.services.chat_result").ReplyResult(
             content=reply_content,
             favorability_delta=1,
             favorability_reason="正常互动",
@@ -831,7 +831,7 @@ async def test_generation_wrapper_annotates_the_actual_session_fingerprint(
     handler.hindsight_memory = memory
 
     async def _generated(_self: object, **_kwargs: object) -> object:
-        return handler_module.ReplyResult(content="收到啦")
+        return import_module("komari_bot.plugins.komari_chat.services.chat_result").ReplyResult(content="收到啦")
 
     monkeypatch.setattr(
         handler_module.MessageHandler,
@@ -933,7 +933,7 @@ async def test_attempt_reply_requires_wrapper_fingerprint_before_pending_reply(
     handler = _attempt_handler(
         monkeypatch,
         handler_module,
-        generated=handler_module.ReplyResult(
+        generated=import_module("komari_bot.plugins.komari_chat.services.chat_result").ReplyResult(
             content="回复正文",
             favorability_delta=1,
             favorability_reason="正常互动",
@@ -976,7 +976,7 @@ async def test_attempt_reply_copies_wrapper_fingerprint_into_pending_reply(
     handler = _attempt_handler(
         monkeypatch,
         handler_module,
-        generated=handler_module.ReplyResult(
+        generated=import_module("komari_bot.plugins.komari_chat.services.chat_result").ReplyResult(
             content="回复正文",
             favorability_delta=1,
             favorability_reason="正常互动",
@@ -1030,40 +1030,18 @@ async def test_debug_reply_runs_recall_only_and_never_retains_or_fulfills(
     handler.redis = _EmptyRedis()
     handler.hindsight_memory = memory
     handler.reply_fulfillment = _ForbiddenFulfillment()
-    handler.query_rewrite = SimpleNamespace(
-        rewrite_query=lambda current_query, **_kwargs: asyncio.sleep(
-            0, result=current_query
-        )
-    )
 
-    async def _prompt(**_kwargs: object) -> list[dict[str, object]]:
-        return []
+    class _ChatService:
+        async def generate(self, **_kwargs: object) -> object:
+            return import_module(
+                "komari_bot.plugins.komari_chat.services.chat_result"
+            ).ReplyResult(
+                content="调试回复",
+                favorability_delta=0,
+                favorability_reason="无变化",
+            )
 
-    async def _generate(**_kwargs: object) -> object:
-        return handler_module.ReplyResult(
-            content="调试回复",
-            favorability_delta=0,
-            favorability_reason="无变化",
-        )
-
-    monkeypatch.setattr(handler_module, "build_prompt", _prompt)
-    monkeypatch.setattr(handler_module, "generate_reply_with_tools", _generate)
-    monkeypatch.setattr(
-        handler_module,
-        "user_data_plugin",
-        SimpleNamespace(
-            get_user_favorability=_favorability,
-            get_config=lambda: SimpleNamespace(max_favorability_delta_per_reply=5),
-        ),
-    )
-    monkeypatch.setattr(
-        handler_module,
-        "komari_search_plugin",
-        SimpleNamespace(
-            is_search_available=lambda **_kwargs: False,
-            is_fetch_available=lambda **_kwargs: False,
-        ),
-    )
+    handler.dsh_chat = _ChatService()
     monkeypatch.setattr(handler_module, "get_config", _handler_config)
     monkeypatch.setattr(
         handler_module,
@@ -1079,7 +1057,6 @@ async def test_debug_reply_runs_recall_only_and_never_retains_or_fulfills(
     )
 
     assert result.reply == "调试回复"
-    assert memory.recall_calls == ["你好"]
     assert all(not session.retain_calls for session in memory.sessions)
     assert not hasattr(result, "interaction_history")
 

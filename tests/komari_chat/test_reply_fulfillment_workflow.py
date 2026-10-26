@@ -367,7 +367,7 @@ def _pending_reply(
             timestamp=1.0,
             message_id="message-1",
         ),
-        reply_result=handler_module.ReplyResult(
+        reply_result=import_module("komari_bot.plugins.komari_chat.services.chat_result").ReplyResult(
             content=reply_content,
             favorability_delta=favorability_delta,
             favorability_reason="正常互动",

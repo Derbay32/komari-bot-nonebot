@@ -375,7 +375,6 @@ async def _run_chat_knowledge_turn(
     state_after_recall: str,
 ) -> SimpleNamespace:
     from tests.group_admission import test_chat_seam_admission as seam
-    from tests.komari_chat import test_prompt_builder as prompts
     from tests.komari_chat.hindsight_recall_support import (
         FakeHindsightMemory,
         FakeRecallSession,
@@ -389,47 +388,21 @@ async def _run_chat_knowledge_turn(
     engine = _build_engine(monkeypatch, embedding_calls=embedding_calls, pool=pool)
     monkeypatch.setattr(engine_module.state, "engine", engine)
 
-    seam._patch_recall_core(monkeypatch)
+    generate_calls: list[Any] = []
+    knowledge_calls: list[dict[str, Any]] = []
+
+    async def _knowledge(**kwargs: Any) -> Any:
+        knowledge_calls.append(kwargs)
+        return await actual_wrapper.search_knowledge(**kwargs)
+
+    seam._patch_recall_core(
+        monkeypatch,
+        generate_calls=generate_calls,
+        knowledge_search=_knowledge,
+    )
     config = seam.mh.get_config()
     config.knowledge_enabled = True
     config.knowledge_limit = 3
-
-    async def _favorability(_user_id: str) -> SimpleNamespace:
-        return SimpleNamespace(
-            user_id="u1",
-            favorability=0,
-            stage_index=1,
-            stage_name="疏离戒备",
-            stage_prompt="保持距离",
-        )
-
-    monkeypatch.setattr(
-        seam.mh.user_data_plugin,
-        "get_user_favorability",
-        _favorability,
-    )
-    prompts._patch_dependencies(monkeypatch)
-    monkeypatch.setattr(
-        prompts.prompt_builder_module,
-        "komari_knowledge",
-        actual_wrapper,
-    )
-    monkeypatch.setattr(
-        seam.mh,
-        "build_prompt",
-        prompts.prompt_builder_module.build_prompt,
-    )
-    generate_calls: list[dict[str, Any]] = []
-
-    async def _generate(**kwargs: Any) -> Any:
-        generate_calls.append(kwargs)
-        return seam.llm.ReplyResult(
-            content="ok",
-            favorability_delta=0,
-            favorability_reason="无变化",
-        )
-
-    monkeypatch.setattr(seam.mh, "generate_reply_with_tools", _generate)
     original_recall = FakeRecallSession.recall
 
     async def _recall(self: Any, query: str) -> Any:
@@ -446,6 +419,7 @@ async def _run_chat_knowledge_turn(
         embedding_calls=embedding_calls,
         pool=pool,
         memory=memory,
+        knowledge_calls=knowledge_calls,
     )
 
 
@@ -459,12 +433,13 @@ async def test_chat_knowledge_after_recall_loss_never_embeds(
         state_after_recall=state_after_recall,
     )
 
-    assert run.memory.recall_calls == ["你好"]
+    assert len(run.memory.recall_calls) == 1
+    assert "你好" in run.memory.recall_calls[0]
     assert run.embedding_calls == []
     assert run.pool.vector_queries == []
     assert run.result.content == "ok"
-    rendered = json.dumps(run.generate_calls[0]["messages"], ensure_ascii=False)
-    assert _KNOWLEDGE_CONTENT not in rendered
+    task_data = run.generate_calls[0].task_data
+    assert task_data["knowledge"] == []
 
 
 async def test_chat_knowledge_after_recall_admitted_embeds_and_injects(
@@ -475,11 +450,13 @@ async def test_chat_knowledge_after_recall_admitted_embeds_and_injects(
         state_after_recall="admitted",
     )
 
-    assert run.memory.recall_calls == ["你好"]
+    assert len(run.memory.recall_calls) == 1
+    assert "你好" in run.memory.recall_calls[0]
+    assert run.knowledge_calls, "automatic knowledge lookup was not invoked"
     assert run.embedding_calls == ["你好"]
     assert len(run.pool.vector_queries) == 1
-    rendered = json.dumps(run.generate_calls[0]["messages"], ensure_ascii=False)
-    assert _KNOWLEDGE_CONTENT in rendered
+    task_data = run.generate_calls[0].task_data
+    assert _KNOWLEDGE_CONTENT in json.dumps(task_data, ensure_ascii=False)
 
 
 async def test_revocation_during_async_keyword_refresh_blocks_embedding(

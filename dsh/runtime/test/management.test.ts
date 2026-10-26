@@ -6,7 +6,7 @@ import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { startHost } from '../dist/host.js'
 import type { JsonValue } from '../dist/protocol.js'
-import { fixturePatches, startModelEndpoint } from './support.js'
+import { fixturePatches, minimalChatTaskData, startModelEndpoint } from './support.js'
 
 const DSH_PACKAGE = fileURLToPath(new URL('../../package.json', import.meta.url))
 const DSH_BASE_CONFIG = fileURLToPath(new URL('../../compose/cordis.yml', import.meta.url))
@@ -508,7 +508,7 @@ test('task admission waits for an idle connection mutation to settle', async () 
     const task = runtime.service.runTask('idle-request', {
       task_id: 'idle-task',
       kind: 'chat',
-      task_data: { message: 'hello' },
+      task_data: minimalChatTaskData({ text: 'hello' }),
       budget: { max_rounds: 3, max_tool_calls_per_round: 4, max_total_tool_calls: 8 },
     })
     await new Promise((resolve) => setTimeout(resolve, 100))

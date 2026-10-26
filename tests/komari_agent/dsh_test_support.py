@@ -397,6 +397,41 @@ def write_profile(
     return profile
 
 
+def chat_task_data(text: str = "hello") -> dict[str, Any]:
+    """Return the closed TSK-203 chat envelope used by real-runtime tests."""
+    return {
+        "schema": 1,
+        "current": {
+            "source_type": "conversation_history",
+            "source_id": "m-current",
+            "trust_level": "untrusted",
+            "content": text,
+            "message_id": "m-current",
+            "group_id": "g-1",
+            "user_id": "u-1",
+            "user_nickname": "Tester",
+            "timestamp": 1.0,
+            "is_bot": False,
+        },
+        "recent": [],
+        "quote": None,
+        "memory": [],
+        "knowledge": [],
+        "uid_knowledge": [],
+        "facts": {
+            "bot_nickname": "Fixture",
+            "current_favorability": {
+                "value": 0,
+                "stage_index": 0,
+                "stage_name": "neutral",
+                "stage_prompt": "Neutral.",
+            },
+            "visible_users": [],
+            "max_favorability_delta": 3,
+        },
+    }
+
+
 def host_for(data_dir: Path, *, entry_script: Path = TEST_HOST_SCRIPT, startup_timeout: float = 30.0) -> AgentHost:
     """Build the production host against a test entry script and private data dir."""
     if not entry_script.is_file():
@@ -478,6 +513,7 @@ __all__: list[str] = [
     "ToolCallResponse",
     "Usage",
     "allowed_profile_files",
+    "chat_task_data",
     "default_budget",
     "host_for",
     "running_dsh",
