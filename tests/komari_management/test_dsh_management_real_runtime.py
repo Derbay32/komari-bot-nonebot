@@ -29,6 +29,7 @@ from komari_bot.plugins.komari_management.dsh_api import (
 from tests.komari_agent.dsh_test_support import (
     ScriptedModelServer,
     ToolCallResponse,
+    chat_task_data,
     host_for,
 )
 
@@ -113,7 +114,7 @@ def _task(task_id: str = "management-task") -> AgentTaskRequest:
     return AgentTaskRequest(
         task_id=task_id,
         kind=TaskKind.CHAT,
-        task_data={"message": "manage me"},
+        task_data=chat_task_data("manage me"),
         budget=AgentTaskBudget(
             max_rounds=3,
             max_tool_calls_per_round=4,

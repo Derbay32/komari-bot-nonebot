@@ -64,6 +64,45 @@ async def _no_sleep(_seconds: float) -> Any:
 async def _fake_build_prompt(**_kwargs: object) -> list[dict[str, object]]:
     return [{"role": "user", "content": "test"}]
 
+class _FakeDshChat:
+    """Trusted generation boundary double for budget hand-off assertions."""
+
+    def __init__(self, content: str = "预算测试回复") -> None:
+        self.content = content
+        self.calls: list[dict[str, object]] = []
+        self.error: BaseException | None = None
+
+    async def generate(self, **kwargs: object) -> object:
+        self.calls.append(kwargs)
+        if self.error is not None:
+            raise self.error
+        return import_module(
+            "komari_bot.plugins.komari_chat.services.chat_result"
+        ).ReplyResult(
+            content=self.content,
+            favorability_delta=0,
+            favorability_reason="预算测试",
+        )
+
+
+def _wire_dsh_handler(
+    monkeypatch: pytest.MonkeyPatch,
+    config: SimpleNamespace,
+) -> tuple[Any, _FakeDshChat]:
+    handler = message_handler_module.MessageHandler.__new__(
+        message_handler_module.MessageHandler
+    )
+    handler.redis = _FakeRedis()
+    handler.hindsight_memory = FakeHindsightMemory()
+    handler._reaction_tasks = set()
+    service = _FakeDshChat()
+    handler.dsh_chat = service
+    monkeypatch.setattr(message_handler_module, "get_config", lambda: config)
+    monkeypatch.setattr(message_handler_module, "get_context_config", lambda: config)
+    return handler, service
+
+
+
 
 def _tool_call(
     name: str,
@@ -353,13 +392,13 @@ def test_simple_reply_entry_uses_configured_budget_without_whole_task_retry(
     assert len(provider.completion_calls) == 2
 
 
-def test_normal_entry_uses_configured_budget(monkeypatch: pytest.MonkeyPatch) -> None:
-    """普通回复入口（_attempt_reply）使用配置轮次，不再有调用点封顶 5。"""
+def test_normal_entry_passes_frozen_config_to_shared_dsh_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     config = _build_chat_config_stub(agent_max_rounds=2, agent_max_total_tool_calls=8)
-    provider = _ScriptedProvider([_completion() for _ in range(5)])
-    handler, _search = _wire_handler(monkeypatch, config, provider)
+    handler, service = _wire_dsh_handler(monkeypatch, config)
 
-    _pending, _stored, failure = asyncio.run(
+    pending, _stored, failure = asyncio.run(
         handler._attempt_reply(
             bot_self_id="bot-1",
             adapter_name="OneBot V11",
@@ -376,29 +415,33 @@ def test_normal_entry_uses_configured_budget(monkeypatch: pytest.MonkeyPatch) ->
         )
     )
 
-    assert failure is not None
-    assert failure.error_type == "RuntimeError"
-    assert len(provider.completion_calls) == 2
+    assert failure is None
+    assert pending is not None
+    assert pending.reply == "预算测试回复"
+    assert len(service.calls) == 1
+    assert service.calls[0]["config"] is config
+    assert service.calls[0]["request_trace_id"] == "chat-msg-1"
 
-
-def test_debug_entry_uses_configured_budget(monkeypatch: pytest.MonkeyPatch) -> None:
-    """debug 无副作用入口（generate_debug_reply）使用配置轮次，不再有调用点封顶 5。"""
+def test_debug_entry_passes_frozen_config_to_shared_dsh_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     config = _build_chat_config_stub(agent_max_rounds=2, agent_max_total_tool_calls=8)
-    provider = _ScriptedProvider([_completion() for _ in range(5)])
-    handler, _search = _wire_handler(monkeypatch, config, provider)
+    handler, service = _wire_dsh_handler(monkeypatch, config)
 
-    with pytest.raises(RuntimeError, match="最大轮数"):
-        asyncio.run(
-            handler.generate_debug_reply(
-                group_id="group-1",
-                user_id="user-1",
-                user_nickname="测试用户",
-                content="测试预算",
-            )
+    result = asyncio.run(
+        handler.generate_debug_reply(
+            group_id="group-1",
+            user_id="user-1",
+            user_nickname="测试用户",
+            content="测试预算",
+            request_trace_id="debug-budget-1",
         )
+    )
 
-    assert len(provider.completion_calls) == 2
-
+    assert result.reply == "预算测试回复"
+    assert len(service.calls) == 1
+    assert service.calls[0]["config"] is config
+    assert service.calls[0]["request_trace_id"] == "debug-budget-1"
 
 def test_next_task_receives_updated_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     """任务之间配置变更只影响下一任务：同一入口第二次运行使用新轮次。"""
@@ -430,131 +473,43 @@ def test_next_task_receives_updated_budget(monkeypatch: pytest.MonkeyPatch) -> N
     assert len(provider2.completion_calls) == 3
 
 
-def test_debug_entry_freezes_budget_snapshot_across_rounds(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """任务内冻结：debug 入口中途 mutate 配置，当前任务仍按任务开始快照执行。
-
-    使用旧实现无法达到的值：per_round=6（旧常量 4 会拒绝 6 连搜）；
-    任务执行中把三项预算改为合法最小值（2/1/2），冻结实现仍完成后续轮次。
-    """
+def test_chat_task_budget_freezes_values_before_rounds() -> None:
+    service_module = import_module(
+        "komari_bot.plugins.komari_chat.services.dsh_chat_service"
+    )
     config = _build_chat_config_stub(
         agent_max_rounds=8,
         agent_max_tool_calls_per_round=6,
         agent_max_total_tool_calls=30,
     )
-    provider = _ScriptedProvider(
-        [
-            _search_completion("a", "b", "c", "d", "e", "f"),
-            _completion(
-                _tool_call(
-                    "record_favorability_delta",
-                    '{"delta":0,"reason":"冻结测试"}',
-                    {"delta": 0, "reason": "冻结测试"},
-                    call_id="call-favor-freeze",
-                )
-            ),
-            _search_completion("g", "h", "i", "j"),
-            _final_response_completion(),
-        ]
+    frozen = service_module.ChatTaskBudget.from_config(config)
+    config.agent_max_rounds = 2
+    config.agent_max_tool_calls_per_round = 1
+    config.agent_max_total_tool_calls = 2
+
+    assert frozen.to_agent_budget().to_protocol() == {
+        "max_rounds": 8,
+        "max_tool_calls_per_round": 6,
+        "max_total_tool_calls": 30,
+    }
+
+def test_chat_task_budget_rejects_non_integer_or_nonpositive_values() -> None:
+    service_module = import_module(
+        "komari_bot.plugins.komari_chat.services.dsh_chat_service"
     )
-    handler, search = _wire_handler(monkeypatch, config, provider)
-    original_search_web = search.search_web
-
-    async def _mutating_search_web(query: str, **kwargs: object) -> str:
-        # 模拟任务执行期间运维把预算改成合法最小值（经公开 search_web 工具 seam 触发）
-        config.agent_max_rounds = 2
-        config.agent_max_tool_calls_per_round = 1
-        config.agent_max_total_tool_calls = 2
-        return await original_search_web(query, **kwargs)
-
-    monkeypatch.setattr(
-        llm_service_module.komari_search,
-        "search_web",
-        _mutating_search_web,
-    )
-
-    result = asyncio.run(
-        handler.generate_debug_reply(
-            group_id="group-1",
-            user_id="user-1",
-            user_nickname="测试用户",
-            content="冻结预算测试",
+    for values in (
+        (0, 1, 2),
+        (True, 1, 2),
+        (2, 1.5, 2),
+        (2, 1, 1_001),
+    ):
+        config = SimpleNamespace(
+            agent_max_rounds=values[0],
+            agent_max_tool_calls_per_round=values[1],
+            agent_max_total_tool_calls=values[2],
         )
-    )
-
-    assert result.reply == "预算测试回复"
-    # 6 + 4 连搜全部执行：per_round=6/总预算 30 在任务开始时冻结；
-    # 若中途重读配置，后续批次会被新预算整批拒绝
-    assert len(search.queries) == 10
-
-
-def test_normal_entry_freezes_budget_snapshot_across_rounds(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """普通回复入口（_attempt_reply）任务内冻结预算：中途变更不影响当前任务。"""
-    config = _build_chat_config_stub(
-        agent_max_rounds=3,
-        agent_max_tool_calls_per_round=4,
-        agent_max_total_tool_calls=4,
-    )
-    provider = _ScriptedProvider(
-        [
-            _search_completion("a"),
-            _completion(
-                _tool_call(
-                    "record_favorability_delta",
-                    '{"delta":0,"reason":"冻结测试"}',
-                    {"delta": 0, "reason": "冻结测试"},
-                    call_id="call-favor-normal-freeze",
-                )
-            ),
-            _final_response_completion(),
-        ]
-    )
-    handler, search = _wire_handler(monkeypatch, config, provider)
-    original_search_web = search.search_web
-
-    async def _mutating_search_web(query: str, **kwargs: object) -> str:
-        # 第一轮执行期间把预算改为合法最小值（2/1/2 仍在 Schema 边界内）
-        config.agent_max_rounds = 2
-        config.agent_max_tool_calls_per_round = 1
-        config.agent_max_total_tool_calls = 2
-        return await original_search_web(query, **kwargs)
-
-    monkeypatch.setattr(
-        llm_service_module.komari_search,
-        "search_web",
-        _mutating_search_web,
-    )
-
-    pending, _stored, failure = asyncio.run(
-        handler._attempt_reply(
-            bot_self_id="bot-1",
-            adapter_name="OneBot V11",
-            message=_make_message(),
-            reply_to_message_id="msg-1",
-            image_urls=None,
-            reply_context=None,
-            reply_context_requested=False,
-            reply_context_refetched=False,
-            force_reply=True,
-            reason="platform_summon",
-            recall_session=fake_recall_session(handler.hindsight_memory),
-            store_current=True,
-        )
-    )
-
-    assert failure is None
-    assert pending is not None
-    assert pending.reply == "预算测试回复"
-    assert search.queries == ["a"]
-    # 变更后的 2/1/2 若在任务内被重读，后续轮次会被整批拒绝或提前终止
-    assert len(provider.completion_calls) == 3
-
-
-# ── 预算计数：全部工具调用计入总量，超量整批拒绝（AC5 / AC7 / AC10） ──
-
+        with pytest.raises(service_module.ChatTaskBudgetError):
+            service_module.ChatTaskBudget.from_config(config)
 
 def test_total_budget_rejects_whole_batch_before_any_tool_execution(
     monkeypatch: pytest.MonkeyPatch,
@@ -1020,48 +975,19 @@ def _template_loader(template: dict[str, str]) -> Any:
 
 
 @pytest.mark.parametrize("entry", ["normal", "debug"])
-def test_prompt_guided_normal_and_debug_entries_match_simple_entry(
+def test_normal_and_debug_entries_share_one_chat_generation_service(
     monkeypatch: pytest.MonkeyPatch,
     entry: str,
 ) -> None:
-    """TSK-193 AC3：普通 / debug 与简单入口的 prompt_guided 语义一致。"""
-    config = _build_chat_config_stub(agent_tool_call_mode="prompt_guided")
-    # handler 工具集含 record_favorability_delta：先记录好感度再 final_response
-    provider = _ScriptedProvider(
-        [
-            _completion(
-                _tool_call(
-                    "record_favorability_delta",
-                    '{"delta":0,"reason":"TSK193约束模式"}',
-                    {"delta": 0, "reason": "TSK193约束模式"},
-                    call_id="call-favor-tsk193",
-                )
-            ),
-            _final_response_completion(),
-        ]
-    )
-    handler, _search = _wire_handler(monkeypatch, config, provider)
-    template = _marker_template()
-    marker = template["tool_call_instruction"]
-    monkeypatch.setattr(
-        prompt_builder_module,
-        "get_template",
-        _template_loader(template),
-    )
-    monkeypatch.setattr(
-        message_handler_module,
-        "build_prompt",
-        _prompt_builder_wrapper,
-    )
-    monkeypatch.setattr(message_handler_module, "user_data_plugin", _RichUserData())
-
+    config = _build_chat_config_stub()
+    handler, service = _wire_dsh_handler(monkeypatch, config)
     if entry == "debug":
         result = asyncio.run(
             handler.generate_debug_reply(
                 group_id="group-1",
                 user_id="user-1",
                 user_nickname="测试用户",
-                content="测试约束模式",
+                content="测试共享入口",
             )
         )
         assert result.reply == "预算测试回复"
@@ -1084,19 +1010,7 @@ def test_prompt_guided_normal_and_debug_entries_match_simple_entry(
         )
         assert failure is None
         assert pending is not None
-        assert pending.reply == "预算测试回复"
-
-    call = provider.completion_calls[0]
-    assert "tool_choice" not in call, f"{entry} 入口 prompt_guided 不得发送 tool_choice"
-    rendered = "\n".join(
-        str(message.get("content", "")) for message in call["messages"]
-    )
-    assert marker in rendered, f"{entry} 入口请求 messages 必须包含 marker"
-
-
-async def _prompt_builder_wrapper(**kwargs: Any) -> list[dict[str, object]]:
-    return await prompt_builder_module.build_prompt(**kwargs)
-
+    assert len(service.calls) == 1
 
 def test_tool_call_mode_frozen_at_task_start_and_applies_next_task(
     monkeypatch: pytest.MonkeyPatch,
@@ -1199,20 +1113,12 @@ def test_required_thinking_provider_rejection_fails_clearly_without_fallback(
         assert call["model"] == "chat-model"
 
 
-def test_handler_reports_incompatible_provider_rejection_as_reply_failure(
+def test_handler_reports_dsh_task_failure_as_reply_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """TSK-193 AC5：消息处理公开失败 seam 走既有 ReplyFailureInfo 边界。
-
-    不重新铺整条群内错误 / SUPERUSER 通知 fixture（已有 test_error_notify
-    覆盖该边界），只断言失败诊断信息与请求不可变。
-    """
-    config = _build_chat_config_stub(
-        agent_tool_call_mode="required",
-        llm_thinking_mode_chat=True,
-    )
-    provider = _RejectingProvider()
-    handler, _search = _wire_handler(monkeypatch, config, provider)
+    config = _build_chat_config_stub()
+    handler, service = _wire_dsh_handler(monkeypatch, config)
+    service.error = RuntimeError("callback_failed")
 
     pending, _stored, failure = asyncio.run(
         handler._attempt_reply(
@@ -1235,14 +1141,7 @@ def test_handler_reports_incompatible_provider_rejection_as_reply_failure(
     assert failure is not None
     assert failure.stage == "generate"
     assert failure.error_type == "RuntimeError"
-    for call in provider.completion_calls:
-        assert call["tool_choice"] == "required"
-        assert call["thinking_mode"] is True
-        assert call["model"] == "chat-model"
-
-
-# ── TSK-193 修订：from_config 严格 no-fallback 契约 ─────────────────────
-
+    assert "callback_failed" in (failure.summary or "")
 
 def test_from_config_missing_tool_call_mode_raises() -> None:
     """运行时配置快照缺少 tool_call_mode 必须 RuntimeError，不得回退隐藏默认。

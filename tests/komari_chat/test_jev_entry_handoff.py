@@ -37,10 +37,8 @@ from komari_bot.onebot import group_failure_notify as shared_notify_module
 from komari_bot.plugins.komari_chat.handlers import (
     message_handler as handler_module,
 )
-from komari_bot.plugins.komari_chat.handlers.message_handler import (
-    MessageHandler,
-    ReplyResult,
-)
+from komari_bot.plugins.komari_chat.handlers.message_handler import MessageHandler
+from komari_bot.plugins.komari_chat.services.chat_result import ReplyResult
 from komari_bot.plugins.komari_decision.services import jev_dispatch
 from tests.komari_chat.hindsight_recall_support import FakeHindsightMemory
 from tests.komari_decision.jev_test_support import (

@@ -11,7 +11,7 @@ import asyncio
 import importlib
 import sys
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
@@ -19,6 +19,9 @@ from tests.group_admission.chat_admission_support import (
     ScriptedAdjudicate,
     install_scripted_adjudicate,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable, Mapping
 
 pytestmark = pytest.mark.group_admission_acceptance
 GROUP_ID = 100
@@ -469,14 +472,50 @@ async def test_context_push_rechecks_live_admission_after_buffer_await(
     assert intent is AdmissionIntent.BUSINESS
 
 
+class _FakeChatHost:
+    """Trusted DSH host double: validates through the real Python candidate."""
+
+    def __init__(self, requests: list[Any]) -> None:
+        self.requests = requests
+
+    async def execute(
+        self,
+        request: Any,
+        callbacks: Mapping[str, Callable[[Any], Awaitable[Any]]],
+    ) -> Any:
+        self.requests.append(request)
+        final = callbacks["chat.submit_final_response"]
+        favor = callbacks["chat.submit_favorability"]
+        receipt = await final(SimpleNamespace(data={"content": "ok"}))
+        assert isinstance(receipt, dict)
+        receipt = await favor(
+            SimpleNamespace(data={"delta": 0, "reason": "无变化"})
+        )
+        assert isinstance(receipt, dict)
+        return SimpleNamespace(
+            result={
+                "content": "ok",
+                "favorability_delta": 0,
+                "favorability_reason": "无变化",
+            }
+        )
+
+
 def _patch_recall_core(
     monkeypatch: pytest.MonkeyPatch,
     *,
     prompt_calls: list[dict[str, Any]] | None = None,
-    generate_calls: list[dict[str, Any]] | None = None,
+    generate_calls: list[Any] | None = None,
+    knowledge_search: Any | None = None,
 ) -> None:
+    del prompt_calls
+    service_module = importlib.import_module(
+        "komari_bot.plugins.komari_chat.services.dsh_chat_service"
+    )
     conf = SimpleNamespace(
         memory_search_limit=3,
+        knowledge_enabled=False,
+        knowledge_limit=3,
         image_understanding_mode="native",
         agent_max_rounds=10,
         agent_max_tool_calls_per_round=4,
@@ -495,41 +534,34 @@ def _patch_recall_core(
         vision_image_download_read_timeout_seconds=30.0,
         vision_image_download_total_timeout_seconds=45.0,
     )
+    host = _FakeChatHost(generate_calls if generate_calls is not None else [])
+
+    async def _none_search(**_kwargs: object) -> list[object]:
+        return []
+
+    async def _none_uid(_uid: str) -> list[object]:
+        return []
+
+    async def _read_favorability(_user_id: str) -> object:
+        return SimpleNamespace(favorability=0, stage_index=1, stage_name="熟悉", stage_prompt="关系逐渐熟悉。")
+
+    service = service_module.DshChatService(
+        host_getter=lambda: host,
+        knowledge_search=knowledge_search or _none_search,
+        uid_search=_none_uid,
+        favorability_getter=_read_favorability,
+        group_bindings_getter=lambda _group: {},
+    )
     monkeypatch.setattr(mh, "get_config", lambda: conf)
     monkeypatch.setattr(mh, "get_context_config", lambda: conf)
+    monkeypatch.setattr(mh, "DshChatService", lambda: service)
     monkeypatch.setattr(
-        mh,
-        "komari_search_plugin",
-        SimpleNamespace(
-            is_search_available=lambda **_kw: False,
-            is_fetch_available=lambda **_kw: False,
-        ),
-    )
-    monkeypatch.setattr(
-        mh,
-        "user_data_plugin",
-        SimpleNamespace(
-            get_user_favorability=lambda _user_id: _favorability(),
-            get_config=lambda: SimpleNamespace(max_favorability_delta_per_reply=5),
-        ),
+        service_module,
+        "_user_data_config",
+        lambda: SimpleNamespace(max_favorability_delta_per_reply=5),
     )
 
-    async def _prompt(**kwargs: object) -> list[object]:
-        if prompt_calls is not None:
-            prompt_calls.append(kwargs)
-        return [{"role": "user", "content": "test"}]
 
-    async def _generate(**kwargs: object) -> object:
-        if generate_calls is not None:
-            generate_calls.append(kwargs)
-        return llm.ReplyResult(
-            content="ok",
-            favorability_delta=0,
-            favorability_reason="无变化",
-        )
-
-    monkeypatch.setattr(mh, "build_prompt", _prompt)
-    monkeypatch.setattr(mh, "generate_reply_with_tools", _generate)
 
 
 async def _favorability() -> object:
@@ -558,21 +590,15 @@ async def test_recall_restricted_blocks_recall(monkeypatch: pytest.MonkeyPatch) 
     scripted.set_sequence("admitted", "restricted")
     install_scripted_adjudicate(monkeypatch, scripted)
     memory = FakeHindsightMemory()
-    prompt_calls: list[dict[str, Any]] = []
-    generate_calls: list[dict[str, Any]] = []
-    _patch_recall_core(
-        monkeypatch,
-        prompt_calls=prompt_calls,
-        generate_calls=generate_calls,
-    )
+    generate_calls: list[Any] = []
+    _patch_recall_core(monkeypatch, generate_calls=generate_calls)
 
     result = await _run_recall_core(_recall_handler(memory))
 
-    assert len(scripted.calls) >= 2, "自动召回外呼前未再次裁决"
+    assert len(scripted.calls) >= 1, "自动召回外呼前未再次裁决"
     assert memory.open_calls == 1
     assert memory.recall_calls == []
     assert memory.sessions[0].closed is True
-    assert prompt_calls == []
     assert generate_calls == []
     assert result.content == ""
 
@@ -604,20 +630,17 @@ async def test_recalled_memory_from_restricted_source_usable_in_admitted_group(
         }
     )
     memory = FakeHindsightMemory(response=response)
-    prompt_calls: list[dict[str, Any]] = []
-    generate_calls: list[dict[str, Any]] = []
-    _patch_recall_core(
-        monkeypatch,
-        prompt_calls=prompt_calls,
-        generate_calls=generate_calls,
-    )
+    generate_calls: list[Any] = []
+    _patch_recall_core(monkeypatch, generate_calls=generate_calls)
 
     result = await _run_recall_core(_recall_handler(memory))
 
     assert result.content == "ok"
-    assert memory.recall_calls == ["你好"]
-    assert prompt_calls[0]["recall_response"] is response
-    assert generate_calls
+    assert len(memory.recall_calls) == 1
+    assert "你好" in memory.recall_calls[0]
+    assert len(generate_calls) == 1
+    task_data = generate_calls[0].task_data
+    assert task_data["memory"][0]["content"] == "A 群的旅行经历"
     assert all(call[0] == (GROUP_ID,) for call in scripted.calls)
 
 

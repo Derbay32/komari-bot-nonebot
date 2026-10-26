@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import dataclasses
 import inspect
+from importlib import import_module
 
 from komari_bot.context.redis_store import MessageSchema
 from komari_bot.plugins.komari_chat.handlers import message_handler
@@ -89,7 +90,7 @@ def test_pending_reply_round_trips_fulfillment_id_value() -> None:
             timestamp=1.0,
             message_id="message-1",
         ),
-        reply_result=message_handler.ReplyResult(
+        reply_result=import_module("komari_bot.plugins.komari_chat.services.chat_result").ReplyResult(
             content="回复正文",
             favorability_delta=1,
             favorability_reason="正常互动",

@@ -15,6 +15,7 @@ import type { GenerateOptions, LlmResolvedModelInfo, RetryPolicyConfig, StreamCh
 import { createUserMessage, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import { PERSONA_PREFIX_SECTION } from '@deepseek-ai/dsh-system-prompt'
+import { decodeChatTaskData, renderChatTaskInput } from './chat-input.js'
 import { TaskMutationGate, TaskMutationConflict } from './gate.js'
 import {
   assertCallbackName,
@@ -31,6 +32,7 @@ import {
   type TaskKind,
   type TaskRequestPayload,
 } from './protocol.js'
+import { SharedTaskPolicy, type TaskPolicyFailure } from './task-policy.js'
 
 const FIXED_RETRY_CODES = ['RATE_LIMIT', 'TIMEOUT', 'TRANSPORT'] as const
 
@@ -100,6 +102,8 @@ interface LiveTask {
   cancelled: boolean
   result: { readonly [key: string]: JsonValue } | undefined
   failureCode: string | undefined
+  terminalFailure: TaskPolicyFailure | undefined
+  policy: SharedTaskPolicy | undefined
   handle: AgentHandle | undefined
 }
 
@@ -145,6 +149,10 @@ export default class KomariAgentRuntime extends Service {
       const task = this.liveBySession.get(payload.agent.id)
       if (task === undefined || task.cancelled) return
       task.failureCode = payload.error instanceof LlmError ? payload.error.code : 'UNKNOWN'
+    })
+    ctx.on('session/event', (session, event) => {
+      const task = this.liveBySession.get(session.id)
+      task?.policy?.observeSessionEvent(event)
     })
     ctx.effect(
       () => () => {
@@ -193,11 +201,31 @@ export default class KomariAgentRuntime extends Service {
     if (task === undefined) throw new TaskFailure('unknown_task')
     if (task.cancelled) throw new TaskFailure('cancelled')
     if (task.result !== undefined) throw new TaskFailure('result_already_completed')
+    if (this.taskIsTerminal(task)) throw new TaskFailure('task_terminal')
     if (!isPlainObject(result)) throw new TaskFailure('invalid_result')
     assertJsonValue(result)
     const serialized = JSON.stringify(result)
     if (Buffer.byteLength(serialized, 'utf8') > MAX_RESULT_BYTES) throw new TaskFailure('result_too_large')
     task.result = deepFreezeJson(result)
+    task.policy?.markCompleted()
+  }
+
+  /**
+   * Register the preset-owned missing-requirement names for turn-stopping
+   * steering. The policy stores only the callback, never business contents.
+   */
+  registerCompletionCheck(agent: Agent, checker: () => readonly string[]): void {
+    const task = this.taskForAgent(agent)
+    if (task === undefined) throw new TaskFailure('unknown_task')
+    if (task.policy === undefined) throw new TaskFailure('task_policy_missing')
+    task.policy.registerMissingRequirements(checker)
+  }
+
+  /** Mark a malformed or failed callback path terminal from trusted preset code. */
+  failTask(agent: Agent, code: TaskPolicyFailure): void {
+    const task = this.taskForAgent(agent)
+    if (task === undefined) throw new TaskFailure('unknown_task')
+    this.markTerminal(task, code)
   }
 
   /**
@@ -215,7 +243,14 @@ export default class KomariAgentRuntime extends Service {
     if (Buffer.byteLength(JSON.stringify(data), 'utf8') > MAX_CALLBACK_DATA_BYTES) {
       throw new TaskFailure('callback_data_too_large')
     }
-    return this.invokeCallback(task, name, data)
+    try {
+      return await this.invokeCallback(task, name, data)
+    } catch (error) {
+      if (error instanceof TaskFailure && error.code === 'callback_failed') {
+        this.markTerminal(task, 'callback_failed')
+      }
+      throw error
+    }
   }
 
   cancelTask(requestId: string): boolean {
@@ -258,6 +293,14 @@ export default class KomariAgentRuntime extends Service {
         },
       })
       live.handle = handle
+      const policy = new SharedTaskPolicy({
+        budget: live.budget,
+        isComplete: () => live.result !== undefined,
+        isTerminal: () => this.taskIsTerminal(live),
+        recordTerminalFailure: (code) => this.markTerminal(live, code),
+      })
+      policy.attach(handle.agent.ctx)
+      live.policy = policy
       if (live.cancelled) {
         handle.agent.cancel({ kind: 'user' })
         throw new TaskFailure('cancelled')
@@ -270,8 +313,10 @@ export default class KomariAgentRuntime extends Service {
       // drain window. Cancellation and process shutdown own their deadlines.
       await handle.agent.whenIdle()
       if (live.cancelled) throw new TaskFailure('cancelled')
-      if (live.result !== undefined) return live.result
+      // An already-recorded terminal failure always wins over a late result.
+      if (live.terminalFailure !== undefined) throw new TaskFailure(live.terminalFailure)
       if (live.failureCode !== undefined) throw new TaskFailure('agent_error', live.failureCode)
+      if (live.result !== undefined) return live.result
       throw new TaskFailure('incomplete_result')
     } catch (error) {
       throw this.translateFailure(error)
@@ -343,6 +388,8 @@ export default class KomariAgentRuntime extends Service {
       cancelled: false,
       result: undefined,
       failureCode: undefined,
+      terminalFailure: undefined,
+      policy: undefined,
       handle: undefined,
     }
   }
@@ -359,10 +406,31 @@ export default class KomariAgentRuntime extends Service {
   }
 
   private renderTaskInput(request: TaskRequestPayload): string {
+    if (request.kind === 'chat') {
+      try {
+        return renderChatTaskInput(decodeChatTaskData(request.task_data))
+      } catch {
+        throw new TaskFailure('invalid_task_data')
+      }
+    }
     return JSON.stringify({
       task_kind: request.kind,
       task_data: request.task_data,
     })
+  }
+
+  private taskIsTerminal(task: LiveTask): boolean {
+    return task.cancelled || task.terminalFailure !== undefined || task.failureCode !== undefined
+  }
+
+  private markTerminal(task: LiveTask, code: TaskPolicyFailure): void {
+    if (task.terminalFailure !== undefined) return
+    task.terminalFailure = code
+    try {
+      task.handle?.agent.cancel({ kind: 'user' })
+    } catch {
+      // The failure code still owns the terminal outcome.
+    }
   }
 
   private admittedStream(options: GenerateOptions, next: () => AsyncIterable<StreamChunk>): AsyncIterable<StreamChunk> {
@@ -373,6 +441,9 @@ export default class KomariAgentRuntime extends Service {
     }
     if (task.cancelled || task.controller.signal.aborted) {
       throw new LlmError('task admission denied: task is cancelled', 'ABORTED')
+    }
+    if (task.result !== undefined || task.terminalFailure !== undefined || task.failureCode !== undefined) {
+      throw new LlmError('task admission denied: task is not active', 'ADMISSION_DENIED')
     }
     const purpose: AdmissionPurpose = options.purpose === 'compaction'
       ? 'compaction'
@@ -412,6 +483,9 @@ export default class KomariAgentRuntime extends Service {
     } catch (error) {
       if (error instanceof TaskFailure && error.code === 'cancelled') {
         throw new LlmError('task admission denied: task is cancelled', 'ABORTED')
+      }
+      if (error instanceof TaskFailure && error.code === 'callback_failed') {
+        this.markTerminal(task, 'callback_failed')
       }
       throw new LlmError('task admission denied', 'ADMISSION_DENIED')
     }

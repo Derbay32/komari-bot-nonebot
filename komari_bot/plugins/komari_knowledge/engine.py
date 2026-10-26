@@ -339,6 +339,7 @@ class KnowledgeEngine:
         query_vec: list[float] | None = None,
         *,
         embedding_guard: Callable[[], bool] | None = None,
+        raw_query: bool = False,
     ) -> list[SearchResult]:
         """
         混合检索：关键词 + 向量。
@@ -349,19 +350,21 @@ class KnowledgeEngine:
             query_vec: 预先计算好的查询特征向量，若提供则跳过模型推理
             embedding_guard: 仅在需要即时生成查询向量时调用；返回 False 或
                 抛出普通异常时跳过向量层，不发起 embedding 或向量查询。
+            raw_query: 为 True 时跳过旧查询改写规则，仅使用调用方原文；默认
+                为 False，保持独立调用方的既有语义。
 
         Returns:
             检索结果列表，按相关性排序
         """
         if not query or not query.strip():
             return []
-        raw_query = query
+        original_input = query
         query = normalize_required_text(
             query,
             label="查询文本",
             budget=QUERY_TEXT_BUDGET,
         )
-        if query != raw_query:
+        if query != original_input:
             query_vec = None
 
         if self._pool is None:
@@ -377,26 +380,27 @@ class KnowledgeEngine:
         if limit <= 0:
             return []
 
-        # 应用查询重写
+        # 应用查询重写；自动聊天原文查询明确跳过这一历史规则。
         original_query = query
-        query = self._rewrite_query(query)
-        validate_text_budget(
-            query,
-            label="改写后查询文本",
-            budget=QUERY_TEXT_BUDGET,
-        )
-
-        if query != original_query:
-            state.logger.info(
-                "[Komari Knowledge] 查询已重写: "
-                f"original_chars={len(original_query)} rewritten_chars={len(query)} "
-                f"query_hash={_query_fingerprint(query)}"
+        if not raw_query:
+            query = self._rewrite_query(query)
+            validate_text_budget(
+                query,
+                label="改写后查询文本",
+                budget=QUERY_TEXT_BUDGET,
             )
-            if query_vec is not None:
-                state.logger.debug(
-                    "[Komari Knowledge] 查询文本已改写，丢弃预生成向量并使用新查询重算"
+
+            if query != original_query:
+                state.logger.info(
+                    "[Komari Knowledge] 查询已重写: "
+                    f"original_chars={len(original_query)} rewritten_chars={len(query)} "
+                    f"query_hash={_query_fingerprint(query)}"
                 )
-                query_vec = None
+                if query_vec is not None:
+                    state.logger.debug(
+                        "[Komari Knowledge] 查询文本已改写，丢弃预生成向量并使用新查询重算"
+                    )
+                    query_vec = None
 
         results: list[SearchResult] = []
         seen_ids: set[int] = set()

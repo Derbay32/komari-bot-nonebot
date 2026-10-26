@@ -349,7 +349,7 @@ def _wire_native_core(
 
     async def _fake_generate(**kwargs: object) -> Any:
         generate_kwargs.update(kwargs)
-        return llm_service_module.ReplyResult(
+        return import_module("komari_bot.plugins.komari_chat.services.chat_result").ReplyResult(
             content="回复内容",
             favorability_delta=0,
             favorability_reason="无变化",

@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { startHost } from '../dist/host.js'
-import { startModelEndpoint, writeTestProfile } from './support.js'
+import { minimalChatTaskData, startModelEndpoint, writeTestProfile } from './support.js'
 
 const DSH_PACKAGE = fileURLToPath(new URL('../../package.json', import.meta.url))
 const DSH_BASE_CONFIG = fileURLToPath(new URL('../../compose/cordis.yml', import.meta.url))
@@ -50,7 +50,7 @@ for (const mode of ['reject', 'hang'] as const) {
       const request = {
         task_id: 'release-task',
         kind: 'chat' as const,
-        task_data: { message: 'hello' },
+        task_data: minimalChatTaskData({ text: 'hello' }),
         budget: { max_rounds: 3, max_tool_calls_per_round: 4, max_total_tool_calls: 8 },
       }
       await assert.rejects(runtime.service.runTask('release-request', request), { message: 'release_failed' })

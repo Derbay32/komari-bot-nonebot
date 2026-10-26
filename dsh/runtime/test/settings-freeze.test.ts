@@ -6,7 +6,7 @@ import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { startHost } from '../dist/host.js'
 import type { JsonValue } from '../dist/protocol.js'
-import { startModelEndpoint, writeTestProfile } from './support.js'
+import { minimalChatTaskData, startModelEndpoint, writeTestProfile } from './support.js'
 
 const DSH_PACKAGE = fileURLToPath(new URL('../../package.json', import.meta.url))
 const DSH_BASE_CONFIG = fileURLToPath(new URL('../../compose/cordis.yml', import.meta.url))
@@ -49,7 +49,7 @@ test('binding and prompt edits during a task do not affect its frozen snapshot',
     const first = await runtime.service.runTask('req-1', {
       task_id: 'task-1',
       kind: 'chat',
-      task_data: { message: 'first' },
+      task_data: minimalChatTaskData({ text: 'first' }),
       budget,
     })
     assert.deepEqual(first, { ok: true, value: 'frozen' })
@@ -62,7 +62,7 @@ test('binding and prompt edits during a task do not affect its frozen snapshot',
     const second = await runtime.service.runTask('req-2', {
       task_id: 'task-2',
       kind: 'chat',
-      task_data: { message: 'second' },
+      task_data: minimalChatTaskData({ text: 'second' }),
       budget,
     })
     assert.deepEqual(second, { ok: true, value: 'new-task' })

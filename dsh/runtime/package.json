@@ -10,10 +10,12 @@
   "exports": {
     ".": "./dist/index.js",
     "./business": "./dist/business.js",
+    "./chat-preset": "./dist/chat-preset.js",
     "./fixture": "./dist/fixture.js",
     "./host": "./dist/host.js",
     "./main": "./dist/main.js",
     "./package.json": "./package.json",
+    "./race-fixture": "./dist/race-fixture.js",
     "./protocol": "./dist/protocol.js",
     "./test-main": "./dist/test-main.js"
   },

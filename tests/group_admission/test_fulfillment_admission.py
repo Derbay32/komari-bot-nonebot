@@ -46,7 +46,7 @@ def _pending(fid: str) -> tuple[Any, fas.ReservationHandoff]:
             timestamp=1.0,
             message_id="msg1",
         ),
-        reply_result=mh.ReplyResult(
+        reply_result=importlib.import_module("komari_bot.plugins.komari_chat.services.chat_result").ReplyResult(
             content="回复正文", favorability_delta=1, favorability_reason="互动"
         ),
         force_reply=False,

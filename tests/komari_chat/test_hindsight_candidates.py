@@ -12,6 +12,7 @@ import json
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from importlib import import_module
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -30,7 +31,6 @@ from komari_bot.decision.jev import (
     EventIdentity,
 )
 from komari_bot.plugins.komari_chat.handlers import message_handler as mh
-from komari_bot.plugins.komari_chat.services import llm_service as llm
 from komari_bot.plugins.komari_memory.services import hindsight_service
 from komari_bot.plugins.komari_memory.services.hindsight_service import (
     HindsightMemoryService,
@@ -233,6 +233,27 @@ def _chat_config(**overrides: Any) -> SimpleNamespace:
     return SimpleNamespace(**values)
 
 
+class _FakeDshGeneration:
+    """Trusted generation seam double; does not rebuild DSH business logic."""
+
+    def __init__(self, calls: list[dict[str, Any]]) -> None:
+        self.calls = calls
+        self.error: BaseException | None = None
+        self.result = import_module(
+            "komari_bot.plugins.komari_chat.services.chat_result"
+        ).ReplyResult(
+            content="回复正文",
+            favorability_delta=0,
+            favorability_reason="测试",
+        )
+
+    async def generate(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
 def _wire_entry(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -242,45 +263,27 @@ def _wire_entry(
 ) -> SimpleNamespace:
     chat_config = config or _chat_config()
     generate_calls = generate_calls if generate_calls is not None else []
-    prompt_calls = prompt_calls if prompt_calls is not None else []
+    # Prompt assembly now belongs to the DSH preset. Handler-level tests
+    # observe the task data passed to the generation service instead.
+    prompt_calls = generate_calls
 
-    async def _prompt(**kwargs: Any) -> list[dict[str, Any]]:
-        prompt_calls.append(kwargs)
-        return [{"role": "user", "content": "test"}]
+    service = _FakeDshGeneration(generate_calls)
 
-    async def _generate(**kwargs: Any) -> Any:
-        generate_calls.append(kwargs)
-        return llm.ReplyResult(
-            content="回复正文",
-            favorability_delta=0,
-            favorability_reason="测试",
-        )
+    def _service_factory() -> _FakeDshGeneration:
+        return service
 
     async def _not_superuser(_bot: object, _event: object) -> bool:
         return False
 
     monkeypatch.setattr(mh, "get_config", lambda: chat_config)
     monkeypatch.setattr(mh, "get_context_config", lambda: chat_config)
-    monkeypatch.setattr(mh, "build_prompt", _prompt)
-    monkeypatch.setattr(mh, "generate_reply_with_tools", _generate)
-    monkeypatch.setattr(
-        mh,
-        "user_data_plugin",
-        _UserData(),
-    )
-    monkeypatch.setattr(
-        mh,
-        "komari_search_plugin",
-        SimpleNamespace(
-            is_search_available=lambda **_kw: False,
-            is_fetch_available=lambda **_kw: False,
-        ),
-    )
+    monkeypatch.setattr(mh, "DshChatService", _service_factory)
     monkeypatch.setattr(mh, "SUPERUSER", _not_superuser)
     return SimpleNamespace(
         config=chat_config,
         generate_calls=generate_calls,
         prompt_calls=prompt_calls,
+        service=service,
     )
 
 
@@ -738,7 +741,7 @@ async def test_chat_candidate_submits_before_generation_and_reuses_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     order: list[str] = []
-    _wire_entry(monkeypatch)
+    wired = _wire_entry(monkeypatch)
     memory = FakeHindsightMemory()
 
     async def _retain(
@@ -749,14 +752,14 @@ async def test_chat_candidate_submits_before_generation_and_reuses_session(
         order.append("retain")
 
     memory.retain_handler = _retain
-    original_generate = mh.generate_reply_with_tools
+    service = wired.service
 
     async def _generate(**kwargs: Any) -> Any:
         order.append("generate")
         assert kwargs["recall_session"] is memory.sessions[0]
-        return await original_generate(**kwargs)
+        return await _FakeDshGeneration([]).generate(**kwargs)
 
-    monkeypatch.setattr(mh, "generate_reply_with_tools", _generate)
+    service.generate = _generate  # type: ignore[method-assign]
     redis = _Redis()
     handler = _handler(memory, redis=redis)
     dispatch = _ScriptedDispatch(_request(), _result(route="chat", force_reply=True))
@@ -767,7 +770,6 @@ async def test_chat_candidate_submits_before_generation_and_reuses_session(
     assert order == ["retain", "generate"]
     assert len(memory.sessions) == 1
     assert memory.sessions[0].closed is True
-    assert memory.sessions[0].recall_calls == ["改写后的查询"]
     assert len(memory.retain_calls) == 1
     assert len(redis.pushed) == 1
     assert dispatch.claim_routes == ["chat"]
@@ -793,7 +795,7 @@ async def test_prompt_recent_context_excludes_current_trigger_message(
     pending = await _run(handler, dispatch)
 
     assert pending is not None
-    recent = wired.prompt_calls[0]["recent_messages"]
+    recent = wired.generate_calls[0]["recent_messages"]
     assert [message.message_id for message in recent] == ["old-1"]
     assert len(redis.pushed) == 1
     assert redis.pushed[0].message_id == MESSAGE_ID
@@ -1193,7 +1195,6 @@ async def test_debug_recall_opens_session_but_never_retains(
 
     assert result.reply == "回复正文"
     assert memory.open_calls == 1
-    assert memory.recall_calls == ["改写后的查询"]
     assert memory.retain_calls == []
 
 
@@ -1470,13 +1471,13 @@ async def test_real_service_keeps_one_config_snapshot_across_candidate_and_recal
     async def _generate(**kwargs: Any) -> Any:
         session = kwargs["recall_session"]
         await session.recall("tool recall")
-        return llm.ReplyResult(
+        return import_module("komari_bot.plugins.komari_chat.services.chat_result").ReplyResult(
             content="回复正文",
             favorability_delta=0,
             favorability_reason="测试",
         )
 
-    monkeypatch.setattr(mh, "generate_reply_with_tools", _generate)
+    wired.service.generate = _generate  # type: ignore[method-assign]
     dispatch = _ScriptedDispatch(_request(), _result(route="chat", force_reply=True))
 
     pending = await _run(handler, dispatch)
