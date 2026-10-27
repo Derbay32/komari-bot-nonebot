@@ -163,7 +163,7 @@ class _Lane:
         self.revoked: set[str] = set()
         self.tasks: list[asyncio.Task[Any]] = []
         self.server = ScriptedModelServer(self.respond)
-        self.sentinel = root / "logs" / "agent_runs" / "historical.jsonl"
+        self.sentinel = root / "logs" / "agent_run_logger" / "historical.jsonl"
         self.sentinel.parent.mkdir(parents=True)
         self.sentinel.write_bytes(b'{"historical":"leave unchanged"}\n')
         self.original = self.sentinel.read_bytes()
