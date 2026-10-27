@@ -791,31 +791,24 @@ async def test_missing_hindsight_service_fails_safe_without_parent_loss() -> Non
 def test_final_response_accepts_content_only_and_never_takes_model_fingerprint() -> (
     None
 ):
-    llm = import_module("komari_bot.plugins.komari_chat.services.llm_service")
+    from komari_bot.plugins.komari_chat.services.chat_candidate import ChatCandidate
 
-    parameters = llm.FINAL_RESPONSE_TOOL["function"]["parameters"]
-    assert set(parameters["properties"]) == {"content"}
-    assert parameters["required"] == ["content"]
-
-    parsed = llm._parse_reply_result(
-        {
-            "content": "  你好  ",
-            "hindsight_target_fingerprint": "f" * 64,
-            "interaction_history": {
-                "event": "发言",
-                "result": "回复",
-                "emotion": "平静",
-            },
-        }
-    )
-    assert parsed.content == "你好"
-    assert parsed.hindsight_target_fingerprint is None
-    assert parsed.favorability_delta is None
-
-    with pytest.raises(ValueError):
-        llm._parse_reply_result({})
-    with pytest.raises(ValueError):
-        llm._parse_reply_result({"content": "   "})
+    candidate = ChatCandidate(max_favorability_delta=3)
+    assert not candidate.submit_final_response({}).accepted
+    assert not candidate.submit_final_response({"content": "   "}).accepted
+    assert not candidate.submit_final_response({
+        "content": "你好", "hindsight_target_fingerprint": "f" * 64,
+    }).accepted
+    assert not candidate.submit_final_response({
+        "content": "你好", "interaction_history": {"event": "发言"},
+    }).accepted
+    assert candidate.submit_final_response({"content": "  你好  "}).accepted
+    receipt = candidate.submit_favorability({"delta": 0, "reason": "无变化"})
+    assert receipt.result == {
+        "content": "你好", "favorability_delta": 0, "favorability_reason": "无变化",
+    }
+    assert receipt.result is not None
+    assert "hindsight_target_fingerprint" not in receipt.result
 
 
 async def test_generation_wrapper_annotates_the_actual_session_fingerprint(

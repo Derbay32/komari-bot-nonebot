@@ -79,10 +79,8 @@ def test_tool_fetch_page_effect_registered() -> None:
     assert case.sink_kind == "komari_search_http"
 
 
-def test_vision_completion_effect_registered() -> None:
-    case = _require_chat_effect("group_admission.effect.chat.vision_completion")
-    _assert_row_stable(case)
-    assert case.sink_kind == "vision_llm_round"
+def test_delegated_vision_effect_is_retired() -> None:
+    assert "group_admission.effect.chat.vision_completion" not in _manifest_index()
 
 
 def test_image_download_effect_registered() -> None:

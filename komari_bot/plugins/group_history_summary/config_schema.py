@@ -1,13 +1,11 @@
 """群聊历史总结插件配置。"""
 
-from typing import Any, ClassVar, Self
+from typing import ClassVar, Self
 
-from pydantic import BaseModel, field_validator, model_validator
-from sqlalchemy import Column, String
+from pydantic import BaseModel, model_validator
 from sqlalchemy.dialects.postgresql import JSONB
 
 from komari_bot.config.typed_config import Field, TypedConfigModel, typed_model_config
-from komari_bot.llm.llm_protocol import RequestApi
 
 
 class LayoutParamsSchema(BaseModel):
@@ -98,81 +96,11 @@ class DynamicConfigSchema(TypedConfigModel, table=True):
     summary_default_count: int = Field(
         default=50, ge=1, le=200, description="LLM 未指定时的默认总结条数"
     )
-    summary_planning_model: str = Field(
-        default="deepseek-chat", description="总结规划阶段模型"
-    )
-    summary_planning_max_tokens: int = Field(
-        default=800, ge=128, le=8192, description="总结规划阶段最大 tokens"
-    )
     summary_planning_round_limit: int = Field(
         default=3, ge=1, le=6, description="总结规划工具循环上限"
     )
-    summary_planning_request_api: RequestApi = Field(
-        default="chat_completions",
-        sa_column=Column(
-            String(32), nullable=False, default="chat_completions"
-        ),
-        description=(
-            "总结规划阶段请求 API：chat_completions=OpenAI Chat Completions，"
-            "responses=OpenAI Responses。修改后从下一个业务任务开始生效。"
-        ),
-    )
-    summary_planning_stream_enabled: bool = Field(
-        default=False,
-        description=(
-            "总结规划阶段是否启用流式传输（仅在网关内部聚合，业务插件无感知）。"
-            "修改后从下一个业务任务开始生效。"
-        ),
-    )
-    summary_planning_thinking_mode: bool = Field(
-        default=False,
-        description="群聊总结规划阶段模型是否处于思考模式。语义同 komari_chat.llm_thinking_mode_chat。",
-    )
-    summary_planning_reasoning_effort: str = Field(
-        default="",
-        description="群聊总结规划阶段模型思考强度。语义同 komari_chat.llm_reasoning_effort_chat。",
-    )
     summary_tool_scan_limit: int = Field(
         default=300, ge=10, le=500, description="总结工具本地扫描历史硬上限"
-    )
-
-    summary_model: str = Field(default="deepseek-chat", description="总结模型")
-    summary_temperature: float = Field(
-        default=0.4, ge=0.0, le=2.0, description="总结温度参数"
-    )
-    summary_max_tokens: int = Field(
-        default=1200, ge=128, le=8192, description="总结最大 tokens"
-    )
-    summary_request_api: RequestApi = Field(
-        default="chat_completions",
-        sa_column=Column(
-            String(32), nullable=False, default="chat_completions"
-        ),
-        description="总结执行阶段请求 API。语义同 summary_planning_request_api。",
-    )
-    summary_stream_enabled: bool = Field(
-        default=False,
-        description="总结执行阶段是否启用流式传输。语义同 summary_planning_stream_enabled。",
-    )
-    summary_thinking_mode: bool = Field(
-        default=False,
-        description="群聊总结执行模型是否处于思考模式。语义同 komari_chat.llm_thinking_mode_chat。",
-    )
-    summary_reasoning_effort: str = Field(
-        default="",
-        description="群聊总结执行模型思考强度。语义同 komari_chat.llm_reasoning_effort_chat。",
-    )
-    assistant_prefill_enabled: bool = Field(
-        default=False,
-        description="是否启用旧版 assistant 预填充消息（memory_ack 与 cot_prefix）",
-    )
-    dsv4_roleplay_instruct_mode: str = Field(
-        default="auto",
-        description=(
-            "DeepSeek V4 角色扮演思考指令注入模式："
-            "disabled=关闭，auto=仅 deepseek-v4 模型注入角色沉浸指令，"
-            "inner_os=强制角色沉浸，no_inner_os=强制纯分析"
-        ),
     )
 
     layout_params: LayoutParamsSchema = Field(
@@ -195,12 +123,3 @@ class DynamicConfigSchema(TypedConfigModel, table=True):
             msg = "summary_tool_scan_limit 不能小于 max_summary_count"
             raise ValueError(msg)
         return self
-
-    @field_validator("dsv4_roleplay_instruct_mode", mode="before")
-    @classmethod
-    def normalize_dsv4_roleplay_instruct_mode(cls, value: Any) -> str:
-        """规范化 DeepSeek V4 角色扮演指令注入模式。"""
-        normalized = str(value or "auto").strip().lower()
-        if normalized not in {"disabled", "auto", "inner_os", "no_inner_os"}:
-            return "auto"
-        return normalized

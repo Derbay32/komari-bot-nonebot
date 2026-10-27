@@ -503,7 +503,5 @@ def test_management_registers_decision_prompt_resource(
     assert RESOURCE_ID in prompt_resources
     assert prompt_resources[RESOURCE_ID].display_name == DISPLAY_NAME
     assert set(prompt_resources) == {
-        "komari_chat",
-        "group_history_summary",
         "komari_decision",
     }

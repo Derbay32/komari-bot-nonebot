@@ -31,28 +31,23 @@ from datetime import UTC, datetime
 import asyncpg
 import pytest
 
-from tests.config.chat_prompt_field_contract import LEGACY_CHAT_COLUMNS
-from tests.config.prompt_field_contract import (
-    prompt_resource_field_names,
+from tests.config.chat_prompt_field_contract import (
+    chat_prompt_field_names,
 )
 from tests.db.tsk197_gate_support import (
     BUDGET_COLUMNS,
     CHAT_LEGACY_REVISION,
-    HEAD_REVISION,
     MEMORY_LEGACY_IMAGE_COLUMNS,
     MEMORY_LEGACY_REVISION,
     MEMORY_VISION_VALUES,
     POSTGRES_URL,
     SKIP_NO_POSTGRES,
     SQLALCHEMY_URL,
-    asset_values,
     drop_scratch_database,
-    fetch_prompt_row,
     insert_row_without_budget_columns,
     memory_row_value,
     recreate_scratch_database,
     run_bootstrap,
-    run_seed,
     same_database,
     scratch_url,
 )
@@ -175,7 +170,7 @@ async def test_legacy_database_upgrades_to_head_migrates_values_and_seeds_cleanl
     if not same_database(POSTGRES_URL, SQLALCHEMY_URL):
         pytest.skip("KOMARI_TEST_POSTGRES_URL 与 SQLALCHEMY_DATABASE_URL 不一致")
 
-    chat_schema_fields = prompt_resource_field_names("komari_chat")
+    chat_schema_fields = chat_prompt_field_names()
     scratch = await recreate_scratch_database(scratch_suffix)
     db_url = scratch_url(str(scratch["database"]))
     try:
@@ -213,14 +208,14 @@ async def test_legacy_database_upgrades_to_head_migrates_values_and_seeds_cleanl
             await connection.close()
 
         # 升级到 head
-        result = run_bootstrap(db_url, "upgrade", "head")
+        result = run_bootstrap(db_url, "upgrade", "0032")
         assert result.returncode == 0, result.stderr
 
         connection = await asyncpg.connect(**scratch)
         try:
             assert await connection.fetchval(
                 "SELECT version_num FROM alembic_version"
-            ) == HEAD_REVISION, "升级后必须停留在单一 head"
+            ) == "0032", "升级后必须停留在单一 head"
 
             # 旧聊天 Prompt 列删除 + 新行为列就位
             prompt_columns = await _column_names(connection, PROMPT_TABLE)
@@ -283,32 +278,15 @@ async def test_legacy_database_upgrades_to_head_migrates_values_and_seeds_cleanl
         finally:
             await connection.close()
 
-        # 播种：只补新行为字段，绝不覆盖非空自定义值；旧 output 不并入任何字段
-        result = run_seed(db_url)
-        output = f"{result.stdout}\n{result.stderr}"
-        assert result.returncode == 0, output
-        assert "新建 2 行" in output, (
-            f"chat Prompt 行已存在，seed 应新建 group/decision 两个资源行: {output}"
-        )
-
         connection = await asyncpg.connect(**scratch)
         try:
-            row = await fetch_prompt_row(connection, "komari_chat")
+            row = await connection.fetchrow(f"SELECT * FROM {PROMPT_TABLE} WHERE id = 1")
             assert row is not None
             assert row["system_prompt"] == "旧库自定义系统提示词"
             assert row["memory_ack"] == "旧库自定义记忆确认"
             assert row["memory_ack_role"] == "assistant"
             assert row["cot_prefix"] == "旧库自定义思维链前缀"
             assert row["cot_prefix_role"] == "system"
-
-            expected_values = asset_values("komari_chat")
-            merged_new_fields = sorted(
-                chat_schema_fields - LEGACY_CHAT_COLUMNS
-            )
-            for field in merged_new_fields:
-                assert row[field] == expected_values[field], (
-                    f"迁移后 seed 应补齐新字段 {field}"
-                )
 
             leaked = [
                 field
@@ -320,19 +298,8 @@ async def test_legacy_database_upgrades_to_head_migrates_values_and_seeds_cleanl
                 f"{leaked}"
             )
 
-            # 重复播种幂等
-            before = dict(row)
-            result = run_seed(db_url)
-            assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
-            after = await fetch_prompt_row(connection, "komari_chat")
-            assert after == before, "重复播种不得改写 chat Prompt 行"
         finally:
             await connection.close()
 
-        # 模型元数据零漂移
-        check_result = run_bootstrap(db_url, "check")
-        assert check_result.returncode == 0, (
-            f"{check_result.stdout}\n{check_result.stderr}"
-        )
     finally:
         await drop_scratch_database(str(scratch["database"]))

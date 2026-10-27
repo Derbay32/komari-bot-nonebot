@@ -140,8 +140,8 @@ def _build_components() -> ManagementApiComponents:
         ),
         prompt_resources=(
             make_managed_prompt_resource(
-                "komari_chat",
-                prompt_display_name("komari_chat"),
+                "komari_decision",
+                prompt_display_name("komari_decision"),
             ),
         ),
     )
@@ -347,7 +347,7 @@ async def test_read_only_credential_cannot_mutate_any_management_resource(
                 json={"value": False},
             ),
             await client.patch(
-                "/api/v2/komari-management-prompt/resources/komari_chat/fields/system_prompt",
+                "/api/v2/komari-management-prompt/resources/komari_decision/fields/role_description",
                 headers=headers,
                 json={"value": "测试"},
             ),

@@ -1,11 +1,7 @@
-"""Prompt 强类型表 Schema 契约测试。
+"""Jev Prompt 强类型表与通用 Prompt 存储元数据契约。
 
-TSK-191：Prompt 资源（chat / group history summary，以及独立的判定资源）
-全部以 PostgreSQL 为运行时真源，字段集合由强类型 Schema 决定；它们都不再
-定义 Python 长文本 ``DEFAULTS``（AC2），旧的默认机制与临时兼容分支被物理
-删除（AC8：``ManagedPromptResource`` 不再有 ``defaults`` 字段、
-``PromptTemplateLoader`` 构造不再接受 ``defaults`` 参数）。因此本文件不再
-import 任何 ``DEFAULTS`` 符号，字段集一律直接派生自 Schema。
+聊天与总结提示词归 DSH；Jev 保留 PostgreSQL 单行资源。
+字段白名单与严格校验仍由 Schema 定义，Python 不提供默认正文。
 """
 
 from __future__ import annotations
@@ -25,12 +21,6 @@ from komari_bot.config.typed_config import (
     ensure_typed_prompt_model,
     load_all_typed_config_models,
 )
-from komari_bot.plugins.group_history_summary.prompt_schema import (
-    GroupHistorySummaryPromptSchema,
-)
-from komari_bot.plugins.komari_chat.prompt_schema import (
-    KomariChatPromptSchema,
-)
 from komari_bot.plugins.komari_decision.prompt_schema import KomariDecisionPromptSchema
 
 #: 每项 (resource_id, 表名, 模型)。
@@ -39,23 +29,12 @@ RESOURCE_MODELS: tuple[
     ...,
 ] = (
     ("komari_decision", "komari_prompt_komari_decision", KomariDecisionPromptSchema),
-    (
-        "komari_chat",
-        "komari_prompt_komari_chat",
-        KomariChatPromptSchema,
-    ),
-    (
-        "group_history_summary",
-        "komari_prompt_group_history_summary",
-        GroupHistorySummaryPromptSchema,
-    ),
+
 )
 
 #: Prompt Schema 所在模块（TSK-191 断言 `DEFAULTS` 不再存在）。
 PROMPT_SCHEMA_MODULE_NAMES: tuple[str, ...] = (
     "komari_bot.plugins.komari_decision.prompt_schema",
-    "komari_bot.plugins.komari_chat.prompt_schema",
-    "komari_bot.plugins.group_history_summary.prompt_schema",
 )
 
 INTERNAL_STORAGE_FIELDS = {"id", "revision", "updated_at"}
@@ -76,11 +55,11 @@ def test_prompt_models_register_in_prompt_registry_by_resource_id() -> None:
         assert issubclass(model_cls, TypedPromptModel)
         assert ensure_typed_prompt_model(resource_id) is model_cls
 
-    # group_history_summary 同时存在配置表与 Prompt 表，两个注册表互不干扰
-    assert "group_history_summary" in TYPED_CONFIG_MODEL_REGISTRY
+    # komari_decision 同时存在配置表与 Prompt 表，两个注册表互不干扰
+    assert "komari_decision" in TYPED_CONFIG_MODEL_REGISTRY
     assert (
-        TYPED_CONFIG_MODEL_REGISTRY["group_history_summary"]
-        is not TYPED_PROMPT_MODEL_REGISTRY["group_history_summary"]
+        TYPED_CONFIG_MODEL_REGISTRY["komari_decision"]
+        is not TYPED_PROMPT_MODEL_REGISTRY["komari_decision"]
     )
 
 
@@ -90,9 +69,9 @@ def test_load_all_typed_models_covers_config_and_prompt_schemas() -> None:
     assert total == len(TYPED_CONFIG_MODEL_REGISTRY) + len(TYPED_PROMPT_MODEL_REGISTRY)
     # TSK-279 新增 komari_roulette 配置资源；TSK-192 phase A 新增
     # komari_context 配置资源（迁移 0026）。
-    # TSK-200 起 agent_run_logger 配置资源随插件退役（18 → 17）。
-    assert len(TYPED_CONFIG_MODEL_REGISTRY) == 17
-    assert len(TYPED_PROMPT_MODEL_REGISTRY) == 3
+    # TSK-200/207 分别退役日志与模型网关配置资源（18 → 16）。
+    assert len(TYPED_CONFIG_MODEL_REGISTRY) == 16
+    assert len(TYPED_PROMPT_MODEL_REGISTRY) == 1
 
 
 def test_every_prompt_resource_is_a_distinct_typed_table() -> None:
@@ -102,8 +81,6 @@ def test_every_prompt_resource_is_a_distinct_typed_table() -> None:
     }
     assert table_names == {
         "komari_prompt_komari_decision",
-        "komari_prompt_komari_chat",
-        "komari_prompt_group_history_summary",
     }
     assert table_names <= set(SQLModel.metadata.tables)
 
@@ -154,7 +131,7 @@ def test_storage_metadata_is_hidden_from_model_dump() -> None:
 
 def test_prompt_model_keeps_strict_constructor_validation() -> None:
     with pytest.raises(ValidationError):
-        KomariChatPromptSchema(system_prompt=123)  # pyright: ignore[reportArgumentType]
+        KomariDecisionPromptSchema(role_description=123)  # pyright: ignore[reportArgumentType]
 
 
 def test_each_prompt_resource_schema_defines_distinct_public_fields() -> None:
@@ -163,27 +140,3 @@ def test_each_prompt_resource_schema_defines_distinct_public_fields() -> None:
         _public_fields(model_cls) for _rid, _tbl, model_cls in RESOURCE_MODELS
     ]
     assert len({frozenset(fields) for fields in field_sets}) == len(RESOURCE_MODELS)
-
-
-def test_komari_chat_schema_replaces_output_instruction_with_behavior_fields() -> None:
-    """AC2：聊天 Prompt Schema 删除 output_instruction，新增独立行为字段。
-
-    精确点名字段（tool_call_instruction / image_read_instruction）按名称
-    断言；其余职责只断言存在互不相同的独立字段（见 oracle 模块）。
-    """
-    from tests.config.chat_prompt_field_contract import (
-        REMOVED_FIELD,
-        REQUIRED_EXACT_FIELDS,
-        chat_prompt_field_names,
-        resolve_behavior_field_names,
-    )
-
-    public_fields = chat_prompt_field_names()
-
-    assert REMOVED_FIELD not in public_fields
-    assert set(REQUIRED_EXACT_FIELDS) <= public_fields
-
-    resolved: dict[str, str] = resolve_behavior_field_names(public_fields)
-    assert set(resolved.values()).isdisjoint(REQUIRED_EXACT_FIELDS), (
-        "工具调用/图片读取职责之外的独立字段不得与精确点名字段复用"
-    )

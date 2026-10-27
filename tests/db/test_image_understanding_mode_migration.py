@@ -422,7 +422,7 @@ async def test_image_columns_migrate_memory_to_chat_and_downgrade_cleanly() -> N
         finally:
             await conn.close()
 
-        result = _run_bootstrap(scratch_url, "upgrade", "head")
+        result = _run_bootstrap(scratch_url, "upgrade", "0032")
         assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
         conn = await asyncpg.connect(**scratch)
         try:
@@ -452,6 +452,9 @@ async def test_image_columns_migrate_memory_to_chat_and_downgrade_cleanly() -> N
             await conn.close()
 
         # 回到 head 后模型元数据与迁移链零漂移
+        # 历史图片迁移断言完成后，再验证当前 head 的元数据。
+        upgraded = _run_bootstrap(scratch_url, "upgrade", "head")
+        assert upgraded.returncode == 0, upgraded.stderr
         check_result = _run_bootstrap(scratch_url, "check")
         assert check_result.returncode == 0, (
             f"{check_result.stdout}\n{check_result.stderr}"
@@ -471,7 +474,7 @@ async def test_image_columns_defaults_and_checks_at_head() -> None:
     scratch = await _recreate_scratch_database()
     scratch_url = _scratch_url(str(scratch["database"]))
     try:
-        result = _run_bootstrap(scratch_url, "upgrade", "head")
+        result = _run_bootstrap(scratch_url, "upgrade", "0032")
         assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
         conn = await asyncpg.connect(**scratch)
         try:
@@ -512,6 +515,9 @@ async def test_image_columns_defaults_and_checks_at_head() -> None:
         finally:
             await conn.close()
 
+        # 历史图片迁移断言完成后，再验证当前 head 的元数据。
+        upgraded = _run_bootstrap(scratch_url, "upgrade", "head")
+        assert upgraded.returncode == 0, upgraded.stderr
         check_result = _run_bootstrap(scratch_url, "check")
         assert check_result.returncode == 0, (
             f"{check_result.stdout}\n{check_result.stderr}"

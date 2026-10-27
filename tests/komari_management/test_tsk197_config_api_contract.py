@@ -44,8 +44,6 @@ NEW_CHAT_CONFIG_FIELDS: set[str] = {
     "agent_max_rounds",
     "agent_max_tool_calls_per_round",
     "agent_max_total_tool_calls",
-    "agent_tool_call_mode",
-    "image_understanding_mode",
     "vision_image_download_max_count",
     "vision_image_download_max_bytes",
     "vision_image_download_total_max_bytes",
@@ -58,6 +56,8 @@ NEW_CHAT_CONFIG_FIELDS: set[str] = {
 
 #: 协调式破坏升级后必须从管理面消失的旧字段。
 REMOVED_CHAT_CONFIG_FIELDS: set[str] = {
+    "agent_tool_call_mode",
+    "image_understanding_mode",
     "memory_search_limit",  # 无调用方的死配置（0031 退役）
     "vision_tool_enabled",  # 旧图片开关（TSK-194 已删）
     "output_instruction",  # 旧聊天 Prompt 输出协议（TSK-190 已删）
@@ -145,8 +145,6 @@ async def test_config_api_exposes_only_new_chat_contract_fields(
     assert "memory_search_limit" not in detail_payload["field_metadata"]
     assert "memory_search_limit" not in detail_payload["field_states"]
     # 新字段以数据库默认值出现在详情中
-    assert values["agent_tool_call_mode"] == "required"
-    assert values["image_understanding_mode"] == "delegated"
     assert values["agent_max_rounds"] == 10
     assert values["agent_max_tool_calls_per_round"] == 4
     assert values["agent_max_total_tool_calls"] == 20

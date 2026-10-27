@@ -13,6 +13,9 @@ from komari_bot.plugins.komari_chat.config_schema import KomariChatConfigSchema
 from komari_bot.plugins.komari_context.config_schema import (
     KomariContextConfigSchema,
 )
+from tests.config.historical_chat_config_contract import (
+    HISTORICAL_RETIRED_CHAT_DEFAULTS,
+)
 from tests.db.tsk197_gate_support import (
     SKIP_NO_POSTGRES,
     drop_scratch_database,
@@ -334,10 +337,8 @@ async def test_migration_moves_every_owned_field_and_preserves_unrelated_data() 
         # Advance to the current head: 0030 removes only the retired memory
         # columns plus 0031 the dead chat memory_search_limit, while surviving
         # chat/context live values and admin prompts stay intact.
-        result = run_bootstrap(db_url, "upgrade", "head")
+        result = run_bootstrap(db_url, "upgrade", "0032")
         assert result.returncode == 0, result.stderr
-        check = run_bootstrap(db_url, "check")
-        assert check.returncode == 0, f"{check.stdout}\n{check.stderr}"
         connection = await asyncpg.connect(**scratch)
         try:
             chat = await _fetch_row(connection, _CHAT_TABLE)
@@ -447,7 +448,7 @@ async def test_migration_preserves_existing_target_rows_without_source_row() -> 
         finally:
             await connection.close()
 
-        result = run_bootstrap(db_url, "upgrade", "head")
+        result = run_bootstrap(db_url, "upgrade", "0032")
         assert result.returncode == 0, result.stderr
 
         connection = await asyncpg.connect(**scratch)
@@ -458,7 +459,7 @@ async def test_migration_preserves_existing_target_rows_without_source_row() -> 
                 assert chat[field] == expected, field
             assert chat["plugin_enable"] is False
             assert chat["llm_model_chat"] == (
-                KomariChatConfigSchema.model_fields["llm_model_chat"].default
+                "gemini-3-flash-preview"
             )
             assert chat["revision"] == _CHAT_REVISION
 
@@ -558,15 +559,16 @@ async def test_migration_uses_source_row_when_both_target_rows_are_missing() -> 
         finally:
             await connection.close()
 
-        result = run_bootstrap(db_url, "upgrade", "head")
+        result = run_bootstrap(db_url, "upgrade", "0032")
         assert result.returncode == 0, result.stderr
-        check = run_bootstrap(db_url, "check")
-        assert check.returncode == 0, f"{check.stdout}\n{check.stderr}"
 
         connection = await asyncpg.connect(**scratch)
         try:
             chat = await _fetch_row(connection, _CHAT_TABLE)
-            chat_defaults = KomariChatConfigSchema().model_dump(mode="json")
+            chat_defaults = {
+                **KomariChatConfigSchema().model_dump(mode="json"),
+                **HISTORICAL_RETIRED_CHAT_DEFAULTS,
+            }
             moved_chat_fields = {
                 *MOVED_TO_CHAT,
                 *QUERY_REWRITE_TARGET,

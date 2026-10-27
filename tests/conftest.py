@@ -82,7 +82,6 @@ def _ensure_package_shim(plugin_name: str) -> None:
 _ensure_package_shim("komari_context")
 _ensure_package_shim("komari_memory")
 _ensure_package_shim("komari_knowledge")
-_ensure_package_shim("llm_provider")
 _ensure_package_shim("komari_management")
 _ensure_package_shim("character_binding")
 _ensure_package_shim("komari_chat")
@@ -125,37 +124,6 @@ class _DummyConfigManagerPlugin:
         del name, schema, env_config_schema
         return _DummyConfigManager()
 
-
-class _DummyLLMProvider:
-    @staticmethod
-    async def generate_text(**_kwargs: object) -> str:
-        return "<content>有效的模糊化测试内容</content>"
-
-    @staticmethod
-    async def generate_text_with_messages(**_kwargs: object) -> str:
-        return "<content>有效的模糊化测试内容</content>"
-
-    @staticmethod
-    async def generate_messages_completion(**_kwargs: object) -> object:
-        return SimpleNamespace(
-            content="规划完成",
-            tool_calls=[],
-            finish_reason="stop",
-            duration_ms=100.0,
-            usage=None,
-            reasoning_content=None,
-        )
-
-    @staticmethod
-    async def generate_completion(**_kwargs: object) -> object:
-        return SimpleNamespace(
-            content="重写后查询",
-            tool_calls=[],
-            finish_reason="stop",
-            duration_ms=50.0,
-            usage=None,
-            reasoning_content=None,
-        )
 
 
 class _DummyUserDataPlugin:
@@ -410,7 +378,6 @@ _REQUIRE_REGISTRY: dict[str, object] = {
     "config_manager": _DummyConfigManagerPlugin(),
     "group_admission": _DummyGroupAdmissionPlugin(),
     "nonebot_plugin_apscheduler": _DummyApschedulerPlugin(),
-    "llm_provider": _DummyLLMProvider(),
     "embedding_provider": _DummyEmbeddingPlugin(),
     "user_data": _DummyUserDataPlugin(),
     "user_ban": _DummyUserBanPlugin(),
@@ -566,15 +533,6 @@ _inject_package_exports(
         "ReplyFulfillmentOpsValidationError": (
             _DummyChatPlugin.ReplyFulfillmentOpsValidationError
         ),
-    },
-)
-_inject_package_exports(
-    "llm_provider",
-    {
-        "generate_text": _DummyLLMProvider.generate_text,
-        "generate_text_with_messages": _DummyLLMProvider.generate_text_with_messages,
-        "generate_messages_completion": _DummyLLMProvider.generate_messages_completion,
-        "generate_completion": _DummyLLMProvider.generate_completion,
     },
 )
 

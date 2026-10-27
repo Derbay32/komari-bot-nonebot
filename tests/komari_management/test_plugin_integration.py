@@ -102,8 +102,8 @@ def _build_components() -> ManagementApiComponents:
         ),
         prompt_resources=(
             make_managed_prompt_resource(
-                "komari_chat",
-                prompt_display_name("komari_chat"),
+                "komari_decision",
+                prompt_display_name("komari_decision"),
             ),
         ),
     )

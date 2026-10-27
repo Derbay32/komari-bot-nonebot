@@ -263,6 +263,75 @@ test('bare text and missing components steer within the same task', async () => 
   assert.ok(result.requests[1]?.body.messages?.some((message) => message.role === 'user'))
 })
 
+test('configured twenty-round budget completes on request twenty without a twenty-first request', async () => {
+  const result = await runChat([
+    ...Array.from({ length: 19 }, (_, index): ModelResponse => ({
+      kind: 'text',
+      text: `ordinary nonterminal response ${index + 1}`,
+    })),
+    {
+      kind: 'tools',
+      calls: [
+        { name: 'final_response', args: { content: 'completed on round twenty' }, id: 'round-20-final' },
+        { name: 'record_favorability_delta', args: { delta: 1, reason: 'round twenty' }, id: 'round-20-favor' },
+      ],
+    },
+  ], {
+    budget: { max_rounds: 20, max_tool_calls_per_round: 2, max_total_tool_calls: 2 },
+  })
+
+  assert.deepEqual(result.result, {
+    content: 'completed on round twenty',
+    favorability_delta: 1,
+    favorability_reason: 'round twenty',
+  })
+  assert.equal(result.requests.length, 20)
+  assert.deepEqual(result.simulator.submissions.map((submission) => submission.name), [
+    'chat.submit_final_response',
+    'chat.submit_favorability',
+  ])
+})
+
+test('configured eight-call batch delivers every ordered distinct search query before completion', async () => {
+  const queries = ['query-one', 'query-two', 'query-three', 'query-four', 'query-five', 'query-six', 'query-seven', 'query-eight']
+  const received: Array<Record<string, unknown>> = []
+  const result = await runChat([
+    {
+      kind: 'tools',
+      calls: queries.map((query, index) => ({
+        name: 'search_web',
+        args: { query },
+        id: `batch-search-${index + 1}`,
+      })),
+    },
+    {
+      kind: 'tools',
+      calls: [
+        { name: 'final_response', args: { content: 'completed after eight searches' }, id: 'batch-final' },
+        { name: 'record_favorability_delta', args: { delta: 0, reason: 'eight searches' }, id: 'batch-favor' },
+      ],
+    },
+  ], {
+    budget: { max_rounds: 3, max_tool_calls_per_round: 8, max_total_tool_calls: 10 },
+    onSearchWeb: (data) => {
+      received.push({ ...data })
+      return {
+        ok: true,
+        result: { source_type: 'web', items: [], truncated: false, omitted_items: 0 },
+      }
+    },
+  })
+
+  assert.deepEqual(received, queries.map((query) => ({ query })))
+  assert.equal(result.callbackNames.filter((name) => name === 'chat.search_web').length, 8)
+  assert.deepEqual(result.result, {
+    content: 'completed after eight searches',
+    favorability_delta: 0,
+    favorability_reason: 'eight searches',
+  })
+  assert.equal(result.requests.length, 2)
+})
+
 test('per-round overflow rejects the entire batch and allows correction', async () => {
   const result = await runChat([
     {
