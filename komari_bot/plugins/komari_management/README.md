@@ -10,18 +10,65 @@ Komari Management 统一把配置、提示词、维护公告以及各业务插�
 - OpenAPI JSON：由 `FASTAPI_OPENAPI_URL` 配置，项目建议值为 `/api/openapi.json`
 - API Base URL：使用机器人后端的 HTTP Origin，例如 `https://bot.example.com`
 
-当前接口版本为 v2.0，所有业务路由统一使用 `/api/v2/<plugin>`。这是破坏性升级，旧版路由与兼容入口均不再注册，请一次性更新前端 Base URL 和 Agent Run 日志权限名。
+当前接口版本为 v2.0，所有业务路由统一使用 `/api/v2/<plugin>`。这是破坏性升级，旧版路由与兼容入口均不再注册，前端必须一次性更新 Base URL。
 
 Swagger/OpenAPI 文档本身可以公开访问，但下列业务接口全部需要 Bearer Token。
 
-后端只在以下条件都满足时注册管理 API：
+### 管理 API 启动配置
 
-1. `komari_management.plugin_enable=true`；
-2. 至少存在一条有效的 `api_credentials`；
-3. NoneBot2 使用 FastAPI Driver；
-4. 前端 Origin 已加入 `api_allowed_origins`，跨域访问时需要完整匹配协议、主机和端口。
+管理插件自身的全部配置只从 NoneBot dotenv／进程环境变量读取。
+管理插件不再读取 PostgreSQL 中的自身配置。
+所有变量使用 `KOMARI_MANAGEMENT_` 前缀。
+进程环境变量覆盖同名 dotenv 值。
+修改任意自身配置后必须重启后端。
+其他插件仍通过管理 API 读写 PostgreSQL 动态配置。
 
-`api_allowed_origins` 是启动时配置，修改后需要重启后端。CORS 已允许所有请求方法和请求头，但不会替代 Bearer 鉴权。
+| 环境变量 | 默认值 | 用途 |
+| --- | --- | --- |
+| `KOMARI_MANAGEMENT_PLUGIN_ENABLE` | `false` | 启用管理 API |
+| `KOMARI_MANAGEMENT_API_CREDENTIALS` | `[]` | 具名凭据 JSON 数组 |
+| `KOMARI_MANAGEMENT_API_ALLOWED_ORIGINS` | `[]` | 前端 Origin JSON 数组 |
+| `KOMARI_MANAGEMENT_ANNOUNCE_STATUS_PAGE_URL` | `https://your.status.page/url/here` | 维护通知状态页 |
+| `KOMARI_MANAGEMENT_ANNOUNCE_MAX_GROUP_COUNT` | `20` | 单次通知群数上限 |
+| `KOMARI_MANAGEMENT_ANNOUNCE_SEND_INTERVAL_SECONDS` | `1.0` | 逐群发送间隔秒数 |
+| `KOMARI_MANAGEMENT_ANNOUNCE_REQUEST_COOLDOWN_SECONDS` | `30.0` | 通知请求冷却秒数 |
+
+后端注册管理 API 需要满足 3 个条件：
+
+- `KOMARI_MANAGEMENT_PLUGIN_ENABLE=true`。
+- `KOMARI_MANAGEMENT_API_CREDENTIALS` 至少包含 1 条格式有效的凭据。
+- NoneBot2 使用 FastAPI Driver。
+
+凭据必须尚未到达 `revoked_at`，才能通过请求鉴权。
+浏览器跨域访问还需要配置 `KOMARI_MANAGEMENT_API_ALLOWED_ORIGINS`。
+Origin 必须匹配协议、主机和端口。
+CORS 不替代 Bearer 鉴权。
+
+### 首次配置
+
+警告：Token 是秘密值，禁止提交包含真实凭据的环境文件。
+
+1. 生成随机 Token：`python -c "import secrets; print(secrets.token_urlsafe(32))"`。预期输出随机字符串，检查输出长度不小于 16 个字符。
+2. 写入部署使用的私有 dotenv 文件。按下例替换 Token 与前端地址，检查凭据值是 JSON 数组。
+
+   ```dotenv
+   KOMARI_MANAGEMENT_PLUGIN_ENABLE=true
+   KOMARI_MANAGEMENT_API_CREDENTIALS='[{"credential_id":"dashboard","token":"<random-token>","permissions":["*"],"revoked_at":null}]'
+   KOMARI_MANAGEMENT_API_ALLOWED_ORIGINS=["https://admin.example.com"]
+   ```
+
+3. 重启后端。预期管理 API 注册成功，检查日志出现“管理 API 已注册”。
+4. 使用 Token 请求 `GET /api/v2/komari-management-config/resources`。预期返回 `200`，检查列表中存在其他插件配置且没有 `komari_management`。
+
+### 存量部署升级
+
+警告：迁移 `0034` 永久删除 `komari_management_config`。
+容器 prestart 会自动执行迁移。
+升级前必须在私有部署配置中准备全部 `KOMARI_MANAGEMENT_*` 值。
+迁移不导出凭据，也不写入 dotenv。
+升级后不提供数据库配置回退。
+公告业务表继续保留。
+生产凭据转移、迁移与重启需要单独授权。
 
 ## 2. 公共请求约定
 
@@ -42,22 +89,29 @@ Authorization: Bearer <management-token>
 
 具名凭据支持精确权限、资源通配符（例如 `config:*`）和全局通配符 `*`。写权限自动包含同资源的读权限；`announce:send` 自动包含 `announce:read`，`reply_fulfillment:manage` 自动包含 `reply_fulfillment:read`。
 
-推荐先配置一个供管理后台使用的全权限凭据：
+`KOMARI_MANAGEMENT_API_CREDENTIALS` 接受下列 JSON 数组结构：
 
 ```json
-{
-  "api_credentials": [
-    {
-      "credential_id": "management-dashboard",
-      "token": "replace-with-a-strong-random-token",
-      "permissions": ["*"],
-      "revoked_at": null
-    }
-  ]
-}
+[
+  {
+    "credential_id": "management-dashboard",
+    "token": "<random-token>",
+    "permissions": ["config:read", "config:write"],
+    "revoked_at": null
+  }
+]
 ```
 
-Token 必须为 16～512 个无空格可打印 ASCII 字符，并至少包含 8 个不同字符。升级前仍使用旧单 Token 字段的部署必须先迁移；新版本不会读取该字段，启动时若在遗留配置中发现旧权限名（如 `llm_logs:read`）会记录警告提示改为 `agent_run_logs:read`。
+`<random-token>` 是占位符，必须替换为生成的随机 Token。
+Token 必须为 16 至 512 个无空格可打印 ASCII 字符。
+Token 至少包含 8 种不同字符。
+数组最多包含 32 条凭据。
+凭据标识与 Token 分别保持唯一。
+`revoked_at` 非空时必须包含时区。
+轮换 Token 或修改权限后必须重启后端。
+已加载的 `revoked_at` 到期后自动拒绝请求，无需重启。
+旧单 Token 配置不生效。
+已退役的日志权限不再授予能力。
 
 | 功能 | 读权限 | 写权限 |
 | --- | --- | --- |
@@ -67,7 +121,6 @@ Token 必须为 16～512 个无空格可打印 ASCII 字符，并至少包含 8 
 | 知识库 | `knowledge:read` | `knowledge:write` |
 | 帮助库 | `help:read` | `help:write` |
 | 记忆库 | `memory:read` | `memory:write` |
-| Agent Run 日志 | `agent_run_logs:read` | 无写接口 |
 | 搜索提供者描述 | `search:read` | 无写接口 |
 | 用户封禁 | `user_ban:read` | `user_ban:write` |
 | 回复履约对账 | `reply_fulfillment:read` | `reply_fulfillment:manage` |
@@ -180,11 +233,15 @@ Base path：`/api/v2/komari-management-config`
 | `PATCH` | `/resources/{resource_id}/fields/{field_name}` | `config:write` | 更新单个字段 |
 | `POST` | `/resources/{resource_id}/reload` | `config:write` | 从 PostgreSQL 重载资源 |
 
+管理插件自身不在资源列表中。
+访问 `/resources/komari_management` 返回 `404`。
+
 当前资源 ID：
 
 ```text
-komari_management
+komari_context
 komari_memory
+komari_chat
 komari_knowledge
 komari_help
 embedding_provider
@@ -192,6 +249,7 @@ group_history_summary
 komari_decision
 komari_sentry
 sr
+komari_roulette
 user_data
 ```
 
@@ -275,7 +333,7 @@ type ConfigResourceMetadata = {
 - `apply_mode=restart` 表示必须重启进程，`restart_required=true`；
 - `secret=true` 的值始终返回 `"******"`，包括 `values`、`configured_value` 和可展示的 `effective_value`；
 - 不得把 `"******"` 当成真实值回写。秘密字段应使用空白密码框，仅在用户明确输入新值时提交；
-- `api_credentials` 整个字段都按秘密值处理。编辑它时需要让操作者重新输入完整替换值，不能从 GET 响应恢复 Token。
+- 管理凭据不属于动态配置资源。前端禁止通过配置 API 读取或编辑启动凭据。
 
 ## 4. Prompt 编辑页面
 
@@ -287,6 +345,9 @@ Base path：`/api/v2/komari-management-prompt`
 | `GET` | `/resources/{resource_id}` | `prompt:read` | 获取字段值和 revision |
 | `PUT` | `/resources/{resource_id}` | `prompt:write` | 整份替换 Prompt 字段对象 |
 | `PATCH` | `/resources/{resource_id}/fields/{field_name}` | `prompt:write` | 更新单个 Prompt 字段 |
+
+管理插件自身不在资源列表中。
+访问 `/resources/komari_management` 返回 `404`。
 
 当前资源 ID：
 

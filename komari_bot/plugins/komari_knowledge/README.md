@@ -100,7 +100,7 @@ poetry run python scripts/migrate_embeddings.py --apply --target knowledge --tar
 只有在以下条件都满足时才会挂载管理接口：
 
 - `komari_management.plugin_enable = true`
-- `komari_management.api_credentials` 至少包含一条有效具名凭据
+- `KOMARI_MANAGEMENT_API_CREDENTIALS` 至少包含一条有效具名凭据
 - 当前 NoneBot 驱动是 FastAPI
 
 ### 鉴权
@@ -258,7 +258,7 @@ for item in results:
 检查：
 
 - `komari_management.plugin_enable` 是否为 `true`
-- `komari_management.api_credentials` 是否至少包含一条有效凭据
+- `KOMARI_MANAGEMENT_API_CREDENTIALS` 是否至少包含一条有效凭据
 - `.env` / `env.example` 中的驱动是否仍为 `DRIVER=~fastapi`
 
 ### 数据库连接未配置
