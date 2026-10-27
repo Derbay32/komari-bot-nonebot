@@ -65,7 +65,6 @@ _MODEL_ID_PATTERN = re.compile(r"^[^\s\u0000-\u001f\u007f]{1,128}$")
 _THINKING_LEVELS = frozenset({"off", "minimal", "low", "medium", "high", "xhigh", "max"})
 _INPUT_MODALITIES = frozenset({"text", "image"})
 _MAX_TIMEOUT_MS = 2_147_483_647
-_MAX_CREDENTIAL_CHARS = 12_000
 
 _SAFE_MESSAGES: dict[str, str] = {
     "invalid_request": "The management request is invalid.",
@@ -670,8 +669,12 @@ def create_dsh_router(
         provider_id = _provider_id(provider)
         expected = _parse_if_match(if_match)
         secret = payload.value.get_secret_value()
-        if not secret or len(secret) > _MAX_CREDENTIAL_CHARS:
+        if not secret:
             raise _invalid("invalid_credential")
+        try:
+            validate_text_budget(secret, label="凭据", budget=CONTENT_TEXT_BUDGET)
+        except ContentValidationError:
+            raise _invalid("invalid_credential") from None
         async with management_audit_span(
             principal=principal,
             request_id=request_id,
