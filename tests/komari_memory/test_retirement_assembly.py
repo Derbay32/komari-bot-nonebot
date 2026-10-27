@@ -437,6 +437,17 @@ def _child_env(
     env["SQLALCHEMY_DATABASE_URL"] = database_url
     env["PYTHONPATH"] = str(PROJECT_ROOT)
     env["LOG_LEVEL"] = "INFO"
+    env["KOMARI_MANAGEMENT_PLUGIN_ENABLE"] = "true"
+    env["KOMARI_MANAGEMENT_API_CREDENTIALS"] = json.dumps(
+        [
+            {
+                "credential_id": "tsk197-assembly",
+                "token": ASSEMBLY_TOKEN,
+                "permissions": ["*"],
+            }
+        ]
+    )
+    env["KOMARI_MANAGEMENT_API_ALLOWED_ORIGINS"] = "[]"
     env["TSK197_ASSEMBLY_TOKEN"] = ASSEMBLY_TOKEN
     env["TSK197_ASSEMBLY_GROUP"] = canary_group
     # Use exactly the endpoint selected for the persisted context row and
@@ -495,25 +506,6 @@ async def _insert_assembly_configs(
     *,
     redis_db: int,
 ) -> None:
-    await connection.execute(
-        "INSERT INTO komari_management_config "
-        "(id, revision, updated_at, plugin_enable, api_credentials, "
-        " api_allowed_origins, announce_status_page_url, announce_max_group_count, "
-        " announce_send_interval_seconds, announce_request_cooldown_seconds) "
-        "VALUES (1, 1, NOW(), TRUE, $1::jsonb, '[]'::jsonb, "
-        "        'https://status.invalid', 20, 1.0, 30.0) "
-        "ON CONFLICT (id) DO UPDATE SET "
-        "plugin_enable = TRUE, api_credentials = EXCLUDED.api_credentials",
-        json.dumps(
-            [
-                {
-                    "credential_id": "tsk197-assembly",
-                    "token": ASSEMBLY_TOKEN,
-                    "permissions": ["*"],
-                }
-            ]
-        ),
-    )
     await connection.execute(
         "INSERT INTO komari_context_config "
         "(id, revision, updated_at, redis_db, bot_nickname, error_notify_enabled) "

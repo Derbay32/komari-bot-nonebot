@@ -15,7 +15,13 @@ from komari_bot.config.typed_config import (
     ensure_typed_config_model,
     typed_model_config,
 )
-from komari_bot.plugins.komari_management.config_schema import DynamicConfigSchema
+from komari_bot.plugins.komari_management.config_schema import ManagementConfig
+
+
+def _management_config(**values: object) -> ManagementConfig:
+    return ManagementConfig.model_validate(
+        {f"komari_management_{key}": value for key, value in values.items()}
+    )
 
 
 def _load_schema_class(plugin_name: str, class_name: str) -> type[Any]:
@@ -33,7 +39,6 @@ def _load_schema_class(plugin_name: str, class_name: str) -> type[Any]:
 @pytest.mark.parametrize(
     ("plugin_name", "class_name", "expected_mode"),
     [
-        ("komari_management", "DynamicConfigSchema", "restart"),
         ("embedding_provider", "DynamicConfigSchema", "restart"),
         ("komari_context", "KomariContextConfigSchema", "immediate"),
         ("komari_memory", "KomariMemoryConfigSchema", "immediate"),
@@ -62,7 +67,6 @@ def test_managed_config_schemas_declare_default_apply_mode(
 @pytest.mark.parametrize(
     ("plugin_name", "class_name", "field_name"),
     [
-        ("komari_management", "DynamicConfigSchema", "api_credentials"),
         ("embedding_provider", "DynamicConfigSchema", "embedding_api_key"),
         ("embedding_provider", "DynamicConfigSchema", "rerank_api_key"),
         ("komari_memory", "KomariMemoryConfigSchema", "hindsight_api_key"),
@@ -120,7 +124,7 @@ def test_management_registers_komari_chat_config_resource() -> None:
 
 
 def test_management_config_schema_parses_origin_list_string() -> None:
-    config = DynamicConfigSchema(
+    config = _management_config(
         api_allowed_origins=cast(
             "Any",
             '["https://ui.example.com", "http://localhost:3000"]',
@@ -128,30 +132,32 @@ def test_management_config_schema_parses_origin_list_string() -> None:
         announce_status_page_url="https://status.example.com/komari",
     )
 
-    assert config.api_allowed_origins == [
+    assert config.komari_management_api_allowed_origins == [
         "https://ui.example.com",
         "http://localhost:3000",
     ]
 
 
 def test_management_config_schema_defaults_are_safe() -> None:
-    config = DynamicConfigSchema(
+    config = _management_config(
         announce_status_page_url="https://status.example.com/komari"
     )
 
-    assert config.plugin_enable is False
-    assert config.api_credentials == []
-    assert config.api_allowed_origins == []
-    assert isinstance(config.announce_status_page_url, str)
-    assert config.announce_status_page_url
-    assert config.announce_max_group_count == 20
-    assert config.announce_send_interval_seconds == 1.0
-    assert config.announce_request_cooldown_seconds == 30.0
+    assert config.komari_management_plugin_enable is False
+    assert config.komari_management_api_credentials == []
+    assert config.komari_management_api_allowed_origins == []
+    assert isinstance(config.komari_management_announce_status_page_url, str)
+    assert config.komari_management_announce_status_page_url
+    assert config.komari_management_announce_max_group_count == 20
+    assert config.komari_management_announce_send_interval_seconds == 1.0
+    assert config.komari_management_announce_request_cooldown_seconds == 30.0
 
 
 def test_management_config_schema_rejects_blank_status_page_url() -> None:
-    with pytest.raises(ValueError, match="announce_status_page_url 不能为空"):
-        DynamicConfigSchema(announce_status_page_url="   ")
+    with pytest.raises(
+        ValueError, match="komari_management_announce_status_page_url 不能为空"
+    ):
+        _management_config(announce_status_page_url="   ")
 
 
 def test_typed_config_schema_rejects_duplicate_section_ids() -> None:
@@ -212,7 +218,7 @@ def test_typed_config_schema_rejects_invalid_sections_shape() -> None:
 
 
 def test_management_config_schema_normalizes_named_credentials() -> None:
-    config = DynamicConfigSchema(
+    config = _management_config(
         api_credentials=cast(
             "Any",
             [
@@ -230,7 +236,7 @@ def test_management_config_schema_normalizes_named_credentials() -> None:
         ),
     )
 
-    credential = config.api_credentials[0]
+    credential = config.komari_management_api_credentials[0]
     assert credential.credential_id == "release-operator"
     assert credential.token == "token-value-00000000"
     assert credential.permissions == ["config:write", "announce:send"]
@@ -270,12 +276,12 @@ def test_management_config_schema_rejects_duplicate_credentials(
     credentials: list[dict[str, object]],
 ) -> None:
     with pytest.raises(ValueError, match=r"不允许重复|不允许复用"):
-        DynamicConfigSchema(api_credentials=cast("Any", credentials))
+        _management_config(api_credentials=cast("Any", credentials))
 
 
 def test_management_config_schema_rejects_invalid_permission() -> None:
     with pytest.raises(ValueError, match="无效的管理权限范围"):
-        DynamicConfigSchema(
+        _management_config(
             api_credentials=cast(
                 "Any",
                 [
@@ -291,7 +297,7 @@ def test_management_config_schema_rejects_invalid_permission() -> None:
 
 def test_management_config_schema_rejects_ambiguous_revocation_time() -> None:
     with pytest.raises(ValueError, match="revoked_at 必须包含明确时区"):
-        DynamicConfigSchema(
+        _management_config(
             api_credentials=cast(
                 "Any",
                 [

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import inspect
-from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
@@ -21,6 +20,7 @@ from komari_bot.plugins.komari_management.api_runtime import (
     ManagementApiComponents,
     register_management_api_for_driver,
 )
+from komari_bot.plugins.komari_management.config_schema import ManagementConfig
 from komari_bot.plugins.komari_management.managed_resources import (
     ManagedConfigResource,
 )
@@ -173,10 +173,12 @@ def test_management_components_require_roulette_fields() -> None:
 async def test_register_management_api_for_fastapi_driver(app: App) -> None:
     api_app = _build_api_app()
     logger = _FakeLogger()
-    config = SimpleNamespace(
-        plugin_enable=True,
-        api_credentials=_credentials(),
-        api_allowed_origins=["https://ui.example.com"],
+    config = ManagementConfig.model_validate(
+        {
+            "komari_management_plugin_enable": True,
+            "komari_management_api_credentials": _credentials(),
+            "komari_management_api_allowed_origins": ["https://ui.example.com"],
+        }
     )
 
     registered = register_management_api_for_driver(
@@ -249,14 +251,15 @@ async def test_register_management_api_for_fastapi_driver(app: App) -> None:
 
 
 @pytest.mark.asyncio
-async def test_registered_api_uses_current_token_after_rotation(app: App) -> None:
+async def test_registered_api_keeps_startup_credentials_until_restart(app: App) -> None:
     api_app = _build_api_app()
     logger = _FakeLogger()
-    token_state = {"value": _credentials("old-token-00000000")}
-    config = SimpleNamespace(
-        plugin_enable=True,
-        api_credentials=token_state["value"],
-        api_allowed_origins=[],
+    config = ManagementConfig.model_validate(
+        {
+            "komari_management_plugin_enable": True,
+            "komari_management_api_credentials": _credentials("old-token-00000000"),
+            "komari_management_api_allowed_origins": [],
+        }
     )
 
     registered = register_management_api_for_driver(
@@ -264,7 +267,6 @@ async def test_registered_api_uses_current_token_after_rotation(app: App) -> Non
         config=config,
         component_loader=_build_components,
         logger=logger,
-        api_token_getter=lambda: token_state["value"],
     )
 
     assert registered is True
@@ -275,7 +277,11 @@ async def test_registered_api_uses_current_token_after_rotation(app: App) -> Non
             headers={"Authorization": "Bearer old-token-00000000"},
         )
 
-        token_state["value"] = _credentials("new-token-00000000")
+        config.komari_management_api_credentials = ManagementConfig.model_validate(
+            {
+                "komari_management_api_credentials": _credentials("new-token-00000000"),
+            }
+        ).komari_management_api_credentials
         old_token_after_rotation = await client.get(
             "/api/v2/komari-knowledge/knowledge",
             headers={"Authorization": "Bearer old-token-00000000"},
@@ -286,8 +292,28 @@ async def test_registered_api_uses_current_token_after_rotation(app: App) -> Non
         )
 
     assert before_rotation.status_code == 503
-    assert old_token_after_rotation.status_code == 401
-    assert new_token_after_rotation.status_code == 503
+    assert old_token_after_rotation.status_code == 503
+    assert new_token_after_rotation.status_code == 401
+
+    restarted_app = _build_api_app()
+    assert register_management_api_for_driver(
+        driver=_FakeDriver("fastapi", restarted_app),
+        config=config,
+        component_loader=_build_components,
+        logger=logger,
+    )
+    async with app.test_server(asgi=cast("Any", restarted_app)) as ctx:
+        client = ctx.get_client()
+        old_after_restart = await client.get(
+            "/api/v2/komari-knowledge/knowledge",
+            headers={"Authorization": "Bearer old-token-00000000"},
+        )
+        new_after_restart = await client.get(
+            "/api/v2/komari-knowledge/knowledge",
+            headers={"Authorization": "Bearer new-token-00000000"},
+        )
+    assert old_after_restart.status_code == 401
+    assert new_after_restart.status_code == 503
 
 
 @pytest.mark.asyncio
@@ -296,25 +322,27 @@ async def test_read_only_credential_cannot_mutate_any_management_resource(
 ) -> None:
     api_app = _build_api_app()
     logger = _FakeLogger()
-    config = SimpleNamespace(
-        plugin_enable=True,
-        api_credentials=[
-            {
-                "credential_id": "dashboard-reader",
-                "token": "read-only-token-000000",
-                "permissions": [
-                    "knowledge:read",
-                    "help:read",
-                    "search:read",
-                    "config:read",
-                    "prompt:read",
-                    "announce:read",
-                    "user_ban:read",
-                    "reply_fulfillment:read",
-                ],
-            }
-        ],
-        api_allowed_origins=[],
+    config = ManagementConfig.model_validate(
+        {
+            "komari_management_plugin_enable": True,
+            "komari_management_api_credentials": [
+                {
+                    "credential_id": "dashboard-reader",
+                    "token": "read-only-token-000000",
+                    "permissions": [
+                        "knowledge:read",
+                        "help:read",
+                        "search:read",
+                        "config:read",
+                        "prompt:read",
+                        "announce:read",
+                        "user_ban:read",
+                        "reply_fulfillment:read",
+                    ],
+                }
+            ],
+            "komari_management_api_allowed_origins": [],
+        }
     )
     assert register_management_api_for_driver(
         driver=_FakeDriver("fastapi", api_app),
@@ -380,10 +408,12 @@ def test_register_management_api_skips_disabled_config() -> None:
 
     registered = register_management_api_for_driver(
         driver=_FakeDriver("fastapi", _build_api_app()),
-        config=SimpleNamespace(
-            plugin_enable=False,
-            api_credentials=_credentials(),
-            api_allowed_origins=[],
+        config=ManagementConfig.model_validate(
+            {
+                "komari_management_plugin_enable": False,
+                "komari_management_api_credentials": _credentials(),
+                "komari_management_api_allowed_origins": [],
+            }
         ),
         component_loader=_build_components,
         logger=logger,
@@ -398,10 +428,12 @@ def test_register_management_api_skips_missing_token_and_non_fastapi() -> None:
 
     registered_missing_token = register_management_api_for_driver(
         driver=_FakeDriver("fastapi", _build_api_app()),
-        config=SimpleNamespace(
-            plugin_enable=True,
-            api_credentials=[],
-            api_allowed_origins=[],
+        config=ManagementConfig.model_validate(
+            {
+                "komari_management_plugin_enable": True,
+                "komari_management_api_credentials": [],
+                "komari_management_api_allowed_origins": [],
+            }
         ),
         component_loader=_build_components,
         logger=logger,
@@ -412,10 +444,12 @@ def test_register_management_api_skips_missing_token_and_non_fastapi() -> None:
     non_fastapi_logger = _FakeLogger()
     registered_non_fastapi = register_management_api_for_driver(
         driver=_FakeDriver("aiohttp"),
-        config=SimpleNamespace(
-            plugin_enable=True,
-            api_credentials=_credentials(),
-            api_allowed_origins=[],
+        config=ManagementConfig.model_validate(
+            {
+                "komari_management_plugin_enable": True,
+                "komari_management_api_credentials": _credentials(),
+                "komari_management_api_allowed_origins": [],
+            }
         ),
         component_loader=_build_components,
         logger=non_fastapi_logger,

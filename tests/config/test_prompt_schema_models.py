@@ -70,7 +70,8 @@ def test_load_all_typed_models_covers_config_and_prompt_schemas() -> None:
     # TSK-279 新增 komari_roulette 配置资源；TSK-192 phase A 新增
     # komari_context 配置资源（迁移 0026）。
     # TSK-200/207 分别退役日志与模型网关配置资源（18 → 16）。
-    assert len(TYPED_CONFIG_MODEL_REGISTRY) == 16
+    # Management startup settings no longer register a database model.
+    assert len(TYPED_CONFIG_MODEL_REGISTRY) == 15
     assert len(TYPED_PROMPT_MODEL_REGISTRY) == 1
 
 

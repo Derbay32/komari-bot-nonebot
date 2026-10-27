@@ -9,7 +9,9 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import nonebot
+import nonebot.plugin
 import pytest
+from nonebot.config import Config
 from pydantic import BaseModel
 
 from komari_bot.plugins.character_binding.management_api import (
@@ -23,6 +25,7 @@ from komari_bot.plugins.komari_management.api_runtime import (
     ManagementApiComponents,
     register_management_api_for_driver,
 )
+from komari_bot.plugins.komari_management.config_schema import ManagementConfig
 from komari_bot.plugins.komari_management.managed_resources import (
     ManagedConfigResource,
 )
@@ -118,16 +121,18 @@ async def test_nonebot_fastapi_driver_exposes_docs_and_management_routes(
 
     registered = register_management_api_for_driver(
         driver=driver,
-        config=SimpleNamespace(
-            plugin_enable=True,
-            api_credentials=[
-                {
-                    "credential_id": "test-operator",
-                    "token": "secret-token-00000000",
-                    "permissions": ["*"],
-                }
-            ],
-            api_allowed_origins=[],
+        config=ManagementConfig.model_validate(
+            {
+                "komari_management_plugin_enable": True,
+                "komari_management_api_credentials": [
+                    {
+                        "credential_id": "test-operator",
+                        "token": "secret-token-00000000",
+                        "permissions": ["*"],
+                    }
+                ],
+                "komari_management_api_allowed_origins": [],
+            }
         ),
         component_loader=_build_components,
         logger=logger,
@@ -220,6 +225,7 @@ class _RecordingDriver:
     """Fake NoneBot driver that only records lifecycle-hook registration."""
 
     def __init__(self) -> None:
+        self.config = Config(_env_file=None)
         self.startup_hooks: list[object] = []
         self.shutdown_hooks: list[object] = []
 
@@ -243,8 +249,38 @@ def real_management_loader(
     ``_load_management_components`` plus the recorded ``require`` declarations.
     """
 
+    import komari_bot.plugins.config_manager as manager_plugin
+    from komari_bot.plugins.komari_management import api_runtime
+
+    monkeypatch.setenv("KOMARI_MANAGEMENT_PLUGIN_ENABLE", "true")
+    monkeypatch.setenv(
+        "KOMARI_MANAGEMENT_API_CREDENTIALS",
+        '[{"credential_id":"startup-test","token":"test-startup-token-0123456789","permissions":["*"]}]',
+    )
+    monkeypatch.setenv("KOMARI_MANAGEMENT_API_ALLOWED_ORIGINS", "[]")
     fake_driver = _RecordingDriver()
     monkeypatch.setattr(nonebot, "get_driver", lambda: fake_driver)
+    monkeypatch.setattr(nonebot.plugin, "get_driver", lambda: fake_driver)
+    manager_getter = manager_plugin.get_config_manager
+    manager_requests: list[str] = []
+
+    def guarded_manager_getter(name: str, schema: type[BaseModel]) -> object:
+        manager_requests.append(name)
+        assert name != "komari_management", (
+            "startup must not read PostgreSQL management config"
+        )
+        return manager_getter(name, schema)
+
+    monkeypatch.setattr(manager_plugin, "get_config_manager", guarded_manager_getter)
+    registration: dict[str, object] = {}
+
+    def capture_registration(**kwargs: object) -> bool:
+        registration.update(kwargs)
+        return True
+
+    monkeypatch.setattr(
+        api_runtime, "register_management_api_for_driver", capture_registration
+    )
 
     for plugin_name, symbols in _LOADER_DEPENDENCY_SYMBOLS.items():
         module = sys.modules.get(f"komari_bot.plugins.{plugin_name}")
@@ -282,6 +318,9 @@ def real_management_loader(
     return SimpleNamespace(
         load_components=module._load_management_components,
         required_plugins=required_plugins,
+        registration=registration,
+        driver=fake_driver,
+        manager_requests=manager_requests,
     )
 
 
@@ -344,3 +383,66 @@ def test_production_loader_carries_real_decision_registrar(
 
     assert "komari_decision" in real_management_loader.required_plugins
     assert components.register_decision_api is decision_plugin.register_decision_api
+
+
+def test_production_startup_uses_dotenv_without_management_storage(
+    real_management_loader: SimpleNamespace,
+) -> None:
+    config = real_management_loader.registration["config"]
+    assert isinstance(config, ManagementConfig)
+    assert config.komari_management_plugin_enable is True
+    assert config.komari_management_api_credentials[0].credential_id == "startup-test"
+    assert "api_token_getter" not in real_management_loader.registration
+    components = real_management_loader.load_components()
+    resource_ids = {resource.resource_id for resource in components.config_resources}
+    assert "komari_management" not in resource_ids
+    assert {
+        "komari_chat",
+        "komari_context",
+        "komari_decision",
+        "komari_knowledge",
+    } <= resource_ids
+    assert "komari_management" not in real_management_loader.manager_requests
+    assert all(
+        hook.__name__ != "_cleanup_management_v1_config"
+        for hook in real_management_loader.driver.startup_hooks
+    )
+
+
+@pytest.mark.asyncio
+async def test_production_config_routes_do_not_expose_management_credentials(
+    real_management_loader: SimpleNamespace,
+) -> None:
+    import httpx
+    from fastapi import FastAPI
+
+    from komari_bot.plugins.komari_management.config_api import register_config_api
+
+    components = real_management_loader.load_components()
+    config = real_management_loader.registration["config"]
+    api_app = FastAPI()
+    register_config_api(
+        api_app,
+        api_token=config.komari_management_api_credentials,
+        allowed_origins=[],
+        resources=components.config_resources,
+    )
+    headers = {
+        "Authorization": "Bearer test-startup-token-0123456789",
+        "X-Komari-Change-Reason": "test-retired-resource",
+    }
+    base = "/api/v2/komari-management-config/resources/komari_management"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=api_app),
+        base_url="http://management.test",
+    ) as client:
+        detail = await client.get(base, headers=headers)
+        write = await client.patch(
+            f"{base}/fields/api_credentials",
+            headers=headers,
+            json={"value": []},
+        )
+        reload_response = await client.post(f"{base}/reload", headers=headers)
+    assert detail.status_code == 404
+    assert write.status_code == 404
+    assert reload_response.status_code == 404

@@ -21,7 +21,6 @@ CONFIG_SCHEMA_MODULES = (
     "komari_bot.plugins.komari_decision.config_schema",
     "komari_bot.plugins.komari_help.config_schema",
     "komari_bot.plugins.komari_knowledge.config_schema",
-    "komari_bot.plugins.komari_management.config_schema",
     "komari_bot.plugins.komari_memory.config_schema",
     "komari_bot.plugins.komari_search.config_schema",
     "komari_bot.plugins.komari_sentry.config_schema",
@@ -61,8 +60,8 @@ def _config_models() -> list[type[TypedConfigModel]]:
 def test_every_dynamic_config_is_a_distinct_typed_table() -> None:
     models = _config_models()
 
-    # TSK-200 起 agent_run_logger 配置模型随插件退役（15 → 14）。
-    assert len(models) == 13
+    # Management now uses dotenv rather than a configuration table.
+    assert len(models) == 12
     assert all(issubclass(model, SQLModel) for model in models)
     assert all(hasattr(model, "__table__") for model in models)
     table_names = {model.__table__.name for model in models}

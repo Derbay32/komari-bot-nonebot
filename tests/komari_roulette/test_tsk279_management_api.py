@@ -23,7 +23,6 @@ import dataclasses
 import importlib
 import json
 from pathlib import Path
-from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -35,6 +34,7 @@ from komari_bot.management.management_audit import (
     hash_management_target,
     management_audit_span,
 )
+from komari_bot.plugins.komari_management.config_schema import ManagementConfig
 from komari_bot.plugins.komari_roulette.observability import RouletteObservation
 
 from .tsk279_management_support import (
@@ -748,7 +748,9 @@ def test_management_components_expose_the_roulette_fields() -> None:
     assert not missing, f"ManagementApiComponents 缺少 Stage-C2 字段: {missing}"
 
 
-async def test_shared_audit_span_started_is_fail_closed_and_final_is_swallowed() -> None:
+async def test_shared_audit_span_started_is_fail_closed_and_final_is_swallowed() -> (
+    None
+):
     """生产 ``management_audit_span`` 语义：``started`` 失败中止，final 失败被吞。
 
     C2 的 rebuild 审计沿用该共享接缝，所以把它的真实语义冻结在用例里：任何新
@@ -819,10 +821,12 @@ async def test_real_management_assembly_mounts_roulette_routes() -> None:
 
     api_app = FastAPI(docs_url="/api/docs", openapi_url="/api/openapi.json")
     logger = _FakeLogger()
-    config = SimpleNamespace(
-        plugin_enable=True,
-        api_credentials=management_credentials(),
-        api_allowed_origins=[],
+    config = ManagementConfig.model_validate(
+        {
+            "komari_management_plugin_enable": True,
+            "komari_management_api_credentials": management_credentials(),
+            "komari_management_api_allowed_origins": [],
+        }
     )
     registered = register_management_api_for_driver(
         driver=_FakeDriver("fastapi", api_app),

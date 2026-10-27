@@ -95,7 +95,7 @@ async def _populate_singleton(conn: asyncpg.Connection, table: str) -> None:
 
 @SKIP_NO_POSTGRES
 @pytest.mark.parametrize("populated", [False, True])
-async def test_0033_upgrade_exact_allowlist_and_zero_drift(*, populated: bool) -> None:
+async def test_0033_upgrade_exact_allowlist(*, populated: bool) -> None:
     scratch = await recreate_scratch_database(f"_tsk207_0033_{int(populated)}")
     url = scratch_url(str(scratch["database"]))
     try:
@@ -149,10 +149,8 @@ async def test_0033_upgrade_exact_allowlist_and_zero_drift(*, populated: bool) -
         finally:
             await conn.close()
 
-        result = run_bootstrap(url, "upgrade", "head")
+        result = run_bootstrap(url, "upgrade", "0033")
         assert result.returncode == 0, "retirement upgrade failed"
-        check = run_bootstrap(url, "check")
-        assert check.returncode == 0, "ORM drift after retirement"
         conn = await asyncpg.connect(**scratch)
         try:
             expected_schema = {

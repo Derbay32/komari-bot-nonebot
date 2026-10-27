@@ -74,6 +74,7 @@ from komari_bot.plugins.komari_decision.services.jev_runtime import DecisionRunt
 from komari_bot.plugins.komari_management.api_runtime import (
     register_management_api_for_driver,
 )
+from komari_bot.plugins.komari_management.config_schema import ManagementConfig
 from tests.komari_decision.jev_test_support import (
     CONFIGURED_API_KEY,
     CONFIGURED_MODEL,
@@ -483,14 +484,15 @@ async def management_env(
     def _mount() -> bool:
         return register_management_api_for_driver(
             driver=SimpleNamespace(type="fastapi", server_app=app),
-            config=SimpleNamespace(
-                plugin_enable=True,
-                api_credentials=credentials(),
-                api_allowed_origins=[ORIGIN],
+            config=ManagementConfig.model_validate(
+                {
+                    "komari_management_plugin_enable": True,
+                    "komari_management_api_credentials": credentials(),
+                    "komari_management_api_allowed_origins": [ORIGIN],
+                }
             ),
             component_loader=lambda: components,
             logger=logger,
-            api_token_getter=credentials,
         )
 
     assert _mount() is True
@@ -802,10 +804,10 @@ async def test_real_engine_log_is_readable_through_metadata_and_body(
 # ------------------------------ 4. 凭据矩阵 ------------------------------
 
 
-async def test_credentials_rotate_and_revoke_without_remounting(
+async def test_credentials_rotate_and_revoke_after_restart(
     management_env: _ManagementEnv,
 ) -> None:
-    """AC4：错误/缺失/scene-only/轮换/撤销都在既有动态凭据来源上生效。"""
+    """启动凭据保持鉴权边界；轮换和撤销配置在重启后生效。"""
     env = management_env
     await env.runtime.startup()
     routes = (f"{API_PREFIX}/health", f"{API_PREFIX}/decisions")
@@ -824,7 +826,28 @@ async def test_credentials_rotate_and_revoke_without_remounting(
         assert scene.status_code == 403, path
         assert scene.headers["cache-control"] == NO_STORE
 
-    # 轮换：旧 token 立即失效，新 token 立即生效，且未重挂载。
+    async def request_after_restart(headers: dict[str, str]) -> httpx.Response:
+        restarted = FastAPI()
+        restarted.add_middleware(_RequestScopeMiddleware)
+        assert register_management_api_for_driver(
+            driver=SimpleNamespace(type="fastapi", server_app=restarted),
+            config=ManagementConfig.model_validate(
+                {
+                    "komari_management_plugin_enable": True,
+                    "komari_management_api_credentials": env.credentials(),
+                    "komari_management_api_allowed_origins": [ORIGIN],
+                }
+            ),
+            component_loader=lambda: env.components,
+            logger=_FakeLogger(),
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=restarted),
+            base_url="http://management.test",
+        ) as client:
+            return await client.get(f"{API_PREFIX}/decisions", headers=headers)
+
+    # 改变部署凭据不会改变现有进程的启动快照。
     env.credentials.credentials = [
         _credential("decision-reader", ROTATED_TOKEN, ["decision:read"]),
         _credential("decision-body-reader", BODY_TOKEN, ["decision_logs:read"]),
@@ -832,21 +855,21 @@ async def test_credentials_rotate_and_revoke_without_remounting(
         _credential("scene-operator", SCENE_TOKEN, ["scene:read"]),
     ]
     stale = await env.client.get(f"{API_PREFIX}/decisions", headers=READ_HEADERS)
-    assert stale.status_code == 401
+    assert stale.status_code == 200
     rotated = await env.client.get(f"{API_PREFIX}/decisions", headers=ROTATED_HEADERS)
-    assert rotated.status_code == 200
+    assert rotated.status_code == 401
+    assert (await request_after_restart(READ_HEADERS)).status_code == 401
+    assert (await request_after_restart(ROTATED_HEADERS)).status_code == 200
 
-    # 只撤销权限时凭据仍有效，但判定读取立即返回 403。
+    # 修改权限后重启，凭据仍有效但判定读取返回 403。
     env.credentials.credentials = [
         _credential("decision-reader", ROTATED_TOKEN, ["scene:read"]),
     ]
-    permission_denied = await env.client.get(
-        f"{API_PREFIX}/decisions", headers=ROTATED_HEADERS
-    )
+    permission_denied = await request_after_restart(ROTATED_HEADERS)
     assert permission_denied.status_code == 403
     assert permission_denied.headers["cache-control"] == NO_STORE
 
-    # 撤销：同一 token 在撤销时间之后失效（不重挂载、不新建路由）。
+    # 已过撤销时间的凭据在新的启动配置中拒绝访问。
     env.credentials.credentials = [
         _credential(
             "decision-reader",
@@ -857,7 +880,7 @@ async def test_credentials_rotate_and_revoke_without_remounting(
         _credential("decision-body-reader", BODY_TOKEN, ["decision_logs:read"]),
         _credential("decision-admin", ADMIN_TOKEN, ["*"]),
     ]
-    revoked = await env.client.get(f"{API_PREFIX}/decisions", headers=ROTATED_HEADERS)
+    revoked = await request_after_restart(ROTATED_HEADERS)
     assert revoked.status_code == 401
     assert revoked.headers["cache-control"] == NO_STORE
     assert list(env.app.routes) == before_routes

@@ -336,13 +336,8 @@ async def test_0032_fresh_full_chain_reaches_head_without_log_storage() -> None:
             )
             assert not await _table_exists(connection, CONFIG_TABLE)
             assert not await _table_exists(connection, INDEX_TABLE)
-            # The management singleton has no seeded row on a fresh database;
-            # filtering must not fabricate one.
-            assert (
-                await connection.fetchval(
-                    f"SELECT EXISTS (SELECT 1 FROM {MANAGEMENT_TABLE} WHERE id = 1)"
-                )
-            ) is False
+            # 0034 retires the management startup configuration table.
+            assert not await _table_exists(connection, MANAGEMENT_TABLE)
         finally:
             await connection.close()
     finally:

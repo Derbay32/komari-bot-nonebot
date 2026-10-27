@@ -1,7 +1,7 @@
 """TSK-232 —— 迁移链重排的结构面静态守卫（无需真实数据库）。
 
 本轮（结构面）红基线刷新 ``migrations/versions`` 版本链的验收契约。目标链
-（单主干、head=0033）按 ADR-0012 「破坏性迁移后果」重排为：
+（单主干、head=0034）按 ADR-0012 「破坏性迁移后果」重排为：
 
 - ``0001`` ``0001_fresh_marker``　fresh marker，不再是一次性全量基线
   （仅空库身份，不含任何 legacy 大表/扩展）；
@@ -153,13 +153,13 @@ def _migration_file(revision: str) -> Path:
     return match[0]
 
 
-def test_chain_is_single_trunk_head_0033() -> None:
-    """新链单主干、无 alias、head=0033。"""
+def test_chain_is_single_trunk_head_0034() -> None:
+    """新链单主干、无 alias、head=0034。"""
     script = _load_script_directory()
     revisions = list(script.walk_revisions())
     heads = script.get_heads()
     assert len(heads) == 1
-    assert heads[0] == "0033"
+    assert heads[0] == "0034"
 
     baselines = [rev for rev in revisions if rev.down_revision is None]
     assert len(baselines) == 1

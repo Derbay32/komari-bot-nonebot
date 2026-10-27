@@ -24,7 +24,7 @@ from tests.db.tsk197_gate_support import (
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MIGRATIONS_DIR = PROJECT_ROOT / "migrations"
 SQLALCHEMY_URL = os.getenv("SQLALCHEMY_DATABASE_URL", "")
-HEAD = "0033"
+HEAD = "0034"
 #: 历史 0020 收据/履约迁移，保留其专属源文本断言（不被新 head 覆盖）。
 RECEIPT_REVISION = "0020"
 RECEIPT_TABLE = "komari_roulette_command_receipts"
