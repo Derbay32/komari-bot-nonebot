@@ -538,6 +538,7 @@ export class ChatCallbackSimulator {
 export interface ChatSendFrameOptions {
   readonly admission?: boolean | (() => boolean)
   readonly onCallback?: (name: string) => void
+  readonly onSearchWeb?: (data: Record<string, unknown>) => JsonValue
   readonly failFinalCallback?: boolean
 }
 
@@ -560,6 +561,11 @@ export function chatSendFrame(
         ok: false,
         error: { code: 'callback_failed', message: 'simulated callback failure' },
       })
+      return
+    }
+    if (payload.name === 'chat.search_web' && options.onSearchWeb !== undefined) {
+      const result = options.onSearchWeb(payload.data)
+      runtimeRef.current?.callbacks.handleResult(frame.id, { ok: true, result })
       return
     }
     const receipt = simulator.submit(payload.name, payload.data)
