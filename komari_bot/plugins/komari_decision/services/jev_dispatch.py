@@ -29,6 +29,7 @@ from nonebot.adapters.onebot.v11 import Adapter as OneBotV11Adapter
 from nonebot.adapters.onebot.v11 import Bot as OneBotV11Bot
 from nonebot.adapters.onebot.v11 import GroupMessageEvent
 from nonebot.message import event_preprocessor
+from nonebot.typing import T_State  # noqa: TC002 - Nonebot2 在运行时解析参数注解
 
 from komari_bot.decision.dispatch import (
     DecisionDispatch,
@@ -48,8 +49,6 @@ from .jev_onebot import (
 )
 
 if TYPE_CHECKING:
-    from nonebot.typing import T_State
-
     from komari_bot.decision.engine_protocol import DecisionEngineProtocol
 
 DISPATCH_STATE_KEY: Final = "komari_decision_dispatch"
@@ -193,9 +192,7 @@ def _build_request(
     )
     known_references: tuple[DecisionMessage, ...] = ()
     reply_to_bot = False
-    native_reply_id = (
-        segments.reference_ids[0] if segments.reference_ids else None
-    )
+    native_reply_id = segments.reference_ids[0] if segments.reference_ids else None
     if native_reply_id is not None and event.reply is not None:
         trusted = project_trusted_reply(
             event.reply,
