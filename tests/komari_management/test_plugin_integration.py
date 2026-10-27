@@ -6,12 +6,16 @@ import importlib.util
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
 
+import httpx
 import nonebot
 import nonebot.plugin
 import pytest
-from nonebot.config import Config
+from nonebot.config import Config, Env
+from nonebot.drivers import combine_driver
+from nonebot.drivers.fastapi import Driver as FastAPIDriver
+from nonebot.drivers.httpx import Mixin as HttpxMixin
+from nonebot.drivers.websockets import Mixin as WebsocketsMixin
 from pydantic import BaseModel
 
 from komari_bot.plugins.character_binding.management_api import (
@@ -35,9 +39,6 @@ from tests.config.prompt_field_contract import (
     make_managed_prompt_resource,
     prompt_display_name,
 )
-
-if TYPE_CHECKING:
-    from nonebug import App
 
 
 class _FakeLogger:
@@ -113,10 +114,27 @@ def _build_components() -> ManagementApiComponents:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("combined", [False, True], ids=["fastapi", "fastapi-httpx-websockets"])
 async def test_nonebot_fastapi_driver_exposes_docs_and_management_routes(
-    app: App,
+    *,
+    combined: bool,
 ) -> None:
-    driver = nonebot.get_driver()
+    driver_class = (
+        combine_driver(FastAPIDriver, HttpxMixin, WebsocketsMixin)
+        if combined
+        else FastAPIDriver
+    )
+    settings = {
+        "fastapi_docs_url": "/api/docs",
+        "fastapi_openapi_url": "/api/openapi.json",
+        "fastapi_include_adapter_schema": False,
+    }
+    driver = driver_class(
+        Env.model_construct(environment="dev"),
+        Config(_env_file=None, **settings),
+    )
+    assert isinstance(driver, FastAPIDriver)
+    assert driver.type == ("fastapi+httpx+websockets" if combined else "fastapi")
     logger = _FakeLogger()
 
     registered = register_management_api_for_driver(
@@ -140,8 +158,9 @@ async def test_nonebot_fastapi_driver_exposes_docs_and_management_routes(
 
     assert registered is True
 
-    async with app.test_server() as ctx:
-        client = ctx.get_client()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=driver.server_app), base_url="http://management.test",
+    ) as client:
         docs = await client.get("/api/docs")
         schema_response = await client.get("/api/openapi.json")
 
@@ -413,7 +432,6 @@ def test_production_startup_uses_dotenv_without_management_storage(
 async def test_production_config_routes_do_not_expose_management_credentials(
     real_management_loader: SimpleNamespace,
 ) -> None:
-    import httpx
     from fastapi import FastAPI
 
     from komari_bot.plugins.komari_management.config_api import register_config_api

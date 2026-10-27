@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
@@ -459,3 +460,23 @@ def test_register_management_api_skips_missing_token_and_non_fastapi() -> None:
         "当前驱动不是 FastAPI" in message
         for message in non_fastapi_logger.warning_messages
     )
+
+
+@pytest.mark.parametrize("server_app", [None, object()])
+def test_driver_type_label_cannot_substitute_for_fastapi_app(server_app: object) -> None:
+    logger = _FakeLogger()
+
+    def unexpected_component_load() -> ManagementApiComponents:
+        pytest.fail("unsupported server applications must not load management components")
+
+    registered = register_management_api_for_driver(
+        driver=SimpleNamespace(type="fastapi", server_app=server_app),
+        config=ManagementConfig.model_validate({
+            "komari_management_plugin_enable": True,
+            "komari_management_api_credentials": _credentials(),
+        }),
+        component_loader=unexpected_component_load,
+        logger=logger,
+    )
+    assert registered is False
+    assert any("当前驱动不是 FastAPI" in message for message in logger.warning_messages)
