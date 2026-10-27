@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from fastapi import FastAPI
+
 from komari_bot.management.management_api import resolve_management_settings
 
 from .announce_api import register_announce_api
@@ -79,9 +81,9 @@ def register_management_api_for_driver(
     if settings is None:
         return False
 
-    driver_type = getattr(driver, "type", None)
     server_app = getattr(driver, "server_app", None)
-    if driver_type != "fastapi" or server_app is None:
+    # Combined drivers expose names such as "fastapi+httpx+websockets".
+    if not isinstance(server_app, FastAPI):
         logger.warning("[Komari Management] 当前驱动不是 FastAPI，无法挂载管理 API")
         return False
 
