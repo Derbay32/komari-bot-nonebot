@@ -50,8 +50,9 @@ class SummaryImageRenderResult:
 
 
 def _load_font(size: int) -> FontLike:
-    """只加载固定字体；缺失或损坏时让字体错误向上传播。"""
-    return ImageFont.truetype(str(FONT_PATH), size=size)
+    """只从固定文件句柄加载字体，禁止 Pillow 按 basename 搜索其他字体。"""
+    with FONT_PATH.open("rb") as font_file:
+        return ImageFont.truetype(font_file, size=size)
 
 
 def _text_width(draw: ImageDraw.ImageDraw, text: str, font: FontLike) -> int:

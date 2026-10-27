@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import os
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -33,6 +34,26 @@ def builtin_font_double(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(image_renderer, "_load_font", _load_font)
 
 
+@pytest.fixture
+def builtin_font_bytes(monkeypatch: pytest.MonkeyPatch) -> bytes:
+    """捕获 Pillow 测试内置字体字节，作为测试自有字体源。"""
+    captured: list[bytes] = []
+    original_truetype = ImageFont.truetype
+
+    def _capture(font: Any, size: float = 10, **_kwargs: Any) -> Any:
+        if hasattr(font, "read"):
+            captured.append(font.read())
+            font.seek(0)
+        return original_truetype(font, size=size, **_kwargs)
+
+    with monkeypatch.context() as context:
+        context.setattr(ImageFont, "truetype", _capture)
+        ImageFont.load_default(size=20)
+
+    assert len(captured) == 1
+    return captured[0]
+
+
 @pytest.mark.usefixtures("builtin_font_double")
 def test_summary_assets_are_independent_of_working_directory(
     tmp_path: Path,
@@ -51,16 +72,22 @@ def test_summary_assets_are_independent_of_working_directory(
     assert image_bytes.startswith(b"\x89PNG\r\n\x1a\n")
 
 
-def test_renderer_uses_only_the_fixed_font_path(
+def test_renderer_opens_exact_fixed_path_and_closes_handle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fixed_path = tmp_path / "fixed" / "LXGWWenKaiGBScreen.ttf"
-    calls: list[tuple[str, int]] = []
+    fixed_path.parent.mkdir(parents=True)
+    fixed_path.write_bytes(b"test-owned fixed font bytes")
     default_font = ImageFont.load_default(size=23)
+    observed: dict[str, Any] = {}
 
-    def _truetype(font: str, size: int, **_kwargs: Any) -> Any:
-        calls.append((font, size))
+    def _truetype(font: Any, size: int, **_kwargs: Any) -> Any:
+        observed["name"] = font.name
+        observed["bytes"] = font.read()
+        observed["closed_during_call"] = font.closed
+        observed["handle"] = font
+        observed["size"] = size
         return default_font
 
     monkeypatch.setattr(image_renderer, "FONT_PATH", fixed_path)
@@ -68,27 +95,55 @@ def test_renderer_uses_only_the_fixed_font_path(
 
     loaded = image_renderer._load_font(23)
 
-    assert isinstance(loaded, ImageFont.FreeTypeFont)
-    assert calls == [(str(fixed_path), 23)]
+    assert loaded is default_font
+    assert observed["name"] == str(fixed_path)
+    assert observed["bytes"] == b"test-owned fixed font bytes"
+    assert observed["closed_during_call"] is False
+    assert observed["handle"].closed is True
+    assert observed["size"] == 23
     assert not hasattr(image_renderer, "FONT_DIR")
     assert not hasattr(image_renderer, "FONT_EXTENSIONS")
 
 
-def test_renderer_propagates_missing_fixed_font_without_fallback(
+def test_renderer_renders_from_fixed_file_with_test_owned_font(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    builtin_font_bytes: bytes,
+) -> None:
+    fixed_path = tmp_path / "fixed" / "LXGWWenKaiGBScreen.ttf"
+    fixed_path.parent.mkdir(parents=True)
+    fixed_path.write_bytes(builtin_font_bytes)
+    monkeypatch.setattr(image_renderer, "FONT_PATH", fixed_path)
+
+    image_bytes = base64.b64decode(
+        render_summary_image_base64(
+            "群聊总结",
+            "",
+            ["测试内容"],
+            {"char_enabled": False},
+        )
+    )
+
+    assert image_bytes.startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def test_renderer_propagates_missing_exact_fixed_name_without_system_scan(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Use a basename absent from host font directories so Pillow cannot mask
-    # the missing fixed path through its own platform lookup.
-    missing_path = tmp_path / "fonts" / "tsk209-missing-fixture-font.ttf"
+    missing_path = tmp_path / "fonts" / "LXGWWenKaiGBScreen.ttf"
     monkeypatch.setattr(image_renderer, "FONT_PATH", missing_path)
 
     def _unexpected_default(*_args: object, **_kwargs: object) -> Any:
         raise AssertionError
 
-    monkeypatch.setattr(image_renderer.ImageFont, "load_default", _unexpected_default)
+    def _unexpected_walk(*_args: object, **_kwargs: object) -> Any:
+        raise AssertionError
 
-    with pytest.raises(OSError):
+    monkeypatch.setattr(image_renderer.ImageFont, "load_default", _unexpected_default)
+    monkeypatch.setattr(os, "walk", _unexpected_walk)
+
+    with pytest.raises(FileNotFoundError):
         render_summary_image_base64(
             "群聊总结",
             "",
@@ -99,24 +154,26 @@ def test_renderer_propagates_missing_fixed_font_without_fallback(
     assert not missing_path.exists()
 
 
-def test_renderer_propagates_corrupt_fixed_font_without_scanning(
+def test_renderer_propagates_corrupt_exact_fixed_name_without_system_scan(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     font_dir = tmp_path / "fonts"
     font_dir.mkdir()
-    # Same uniqueness constraint as the missing-path case above: a corrupt
-    # target must not be replaced by a same-named host font.
-    corrupt_path = font_dir / "tsk209-corrupt-fixture-font.ttf"
+    corrupt_path = font_dir / "LXGWWenKaiGBScreen.ttf"
     corrupt_path.write_bytes(b"not a font")
-    other_path = font_dir / "tsk209-other-fixture-font.ttf"
+    other_path = font_dir / "AnotherFont.ttf"
     other_path.write_bytes(b"also not a font")
     monkeypatch.setattr(image_renderer, "FONT_PATH", corrupt_path)
 
     def _unexpected_default(*_args: object, **_kwargs: object) -> Any:
         raise AssertionError
 
+    def _unexpected_walk(*_args: object, **_kwargs: object) -> Any:
+        raise AssertionError
+
     monkeypatch.setattr(image_renderer.ImageFont, "load_default", _unexpected_default)
+    monkeypatch.setattr(os, "walk", _unexpected_walk)
 
     with pytest.raises(OSError):
         image_renderer._load_font(23)
