@@ -1,7 +1,7 @@
 """旧版 JSONB 配置离线迁移到强类型配置表（ticket 05 / ADR-0004）。
 
 把旧通用 JSONB 配置按静态映射搬运到历史强类型单行表。
-本次只退役模型网关、聊天与群总结提示词及对应模型字段映射。
+已退役管理启动配置、模型网关、聊天与群总结提示词及对应模型字段映射。
 记忆总结的历史映射继续保留，不代表当前运行时支持这些资源。
 操作者必须选择与映射匹配的历史数据库结构。
 本工具不负责恢复已删除的表或字段。
@@ -231,27 +231,6 @@ _RESOURCE_SPECS: tuple[ResourceSpec, ...] = (
             "user_whitelist": [],
             "group_whitelist": [],
             "query_rewrite_rules": {},
-        },
-    ),
-    ResourceSpec(
-        legacy_table="komari_plugin_configs",
-        legacy_key_column="plugin_name",
-        legacy_data_column="config_data",
-        key_value="komari_management",
-        target_table="komari_management_config",
-        columns=(
-            "plugin_enable",
-            "api_credentials",
-            "api_allowed_origins",
-            "announce_status_page_url",
-            "announce_max_group_count",
-            "announce_send_interval_seconds",
-            "announce_request_cooldown_seconds",
-        ),
-        deprecated_keys=_DEPRECATED_PLUGIN_KEYS,
-        jsonb_defaults={
-            "api_credentials": [],
-            "api_allowed_origins": [],
         },
     ),
     ResourceSpec(

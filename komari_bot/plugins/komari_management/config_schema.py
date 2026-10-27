@@ -1,15 +1,14 @@
-"""Komari Management 配置 Schema。"""
+"""Komari Management 启动配置，仅从 NoneBot dotenv / 环境变量读取。"""
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import UTC, datetime
-from typing import Any, ClassVar
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
-from sqlalchemy.dialects.postgresql import JSONB
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from komari_bot.config.typed_config import Field, TypedConfigModel, typed_model_config
 from komari_bot.management.management_api import management_token_meets_minimum_strength
 
 DEFAULT_ANNOUNCE_STATUS_PAGE_URL = "https://your.status.page/url/here"
@@ -21,7 +20,7 @@ _TOKEN_PATTERN = re.compile(r"^[!-~]+$")
 class ManagementCredentialSchema(BaseModel):
     """一条具名、可限权和可定时撤销的管理凭据。"""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     credential_id: str = Field(
         min_length=1,
@@ -32,6 +31,7 @@ class ManagementCredentialSchema(BaseModel):
         min_length=16,
         max_length=512,
         description="Bearer Token 正文",
+        repr=False,
         json_schema_extra={"secret": True},
     )
     permissions: list[str] = Field(
@@ -58,7 +58,9 @@ class ManagementCredentialSchema(BaseModel):
     def normalize_token(cls, value: str) -> str:
         normalized = value.strip()
         if not management_token_meets_minimum_strength(normalized):
-            msg = "管理凭据 Token 至少 16 字符，并需要不少于 8 个不同的可打印 ASCII 字符"
+            msg = (
+                "管理凭据 Token 至少 16 字符，并需要不少于 8 个不同的可打印 ASCII 字符"
+            )
             raise ValueError(msg)
         if not _TOKEN_PATTERN.fullmatch(normalized):
             msg = "管理凭据 Token 只能包含不带空格的 ASCII 可打印字符"
@@ -92,84 +94,87 @@ class ManagementCredentialSchema(BaseModel):
         return value.astimezone(UTC)
 
 
-class DynamicConfigSchema(TypedConfigModel, table=True):
-    """Komari Management 配置模型。"""
+class ManagementConfig(BaseModel):
+    """独立于动态配置表的启动快照；修改后必须重启。"""
 
-    plugin_name: ClassVar[str] = "komari_management"
-    __tablename__ = "komari_management_config"
-
-    model_config = typed_model_config(
-        json_schema_extra={"default_apply_mode": "restart"},
+    model_config = ConfigDict(
+        extra="ignore",
+        hide_input_in_errors=True,
     )
 
-    plugin_enable: bool = Field(default=False, description="是否启用统一管理 API 插件")
-    api_credentials: list[ManagementCredentialSchema] = Field(
+    komari_management_plugin_enable: bool = Field(
+        default=False, description="是否启用统一管理 API 插件"
+    )
+    komari_management_api_credentials: list[ManagementCredentialSchema] = Field(
         default_factory=list,
         max_length=32,
-        sa_type=JSONB,
         description="具名管理凭据列表",
-        json_schema_extra={"secret": True, "apply_mode": "immediate"},
+        json_schema_extra={"secret": True},
+        repr=False,
     )
-    api_allowed_origins: list[str] = Field(
+    komari_management_api_allowed_origins: list[str] = Field(
         default_factory=list,
-        sa_type=JSONB,
         description="允许访问管理 API 的前端 Origin 白名单",
     )
-    announce_status_page_url: str = Field(
+    komari_management_announce_status_page_url: str = Field(
         default=DEFAULT_ANNOUNCE_STATUS_PAGE_URL,
         description="维护通知中使用的状态页面链接",
     )
-    announce_max_group_count: int = Field(
+    komari_management_announce_max_group_count: int = Field(
         default=20,
         ge=1,
         le=100,
         description="单次维护通知最多发送的群数量",
     )
-    announce_send_interval_seconds: float = Field(
+    komari_management_announce_send_interval_seconds: float = Field(
         default=1.0,
         ge=0.0,
         le=60.0,
         description="维护通知逐群发送间隔秒数",
     )
-    announce_request_cooldown_seconds: float = Field(
+    komari_management_announce_request_cooldown_seconds: float = Field(
         default=30.0,
         ge=0.0,
         le=3600.0,
         description="维护通知请求级冷却秒数",
     )
 
-    @field_validator("api_allowed_origins", mode="before")
+    @field_validator(
+        "komari_management_api_credentials",
+        "komari_management_api_allowed_origins",
+        mode="before",
+    )
     @classmethod
-    def parse_list_string(cls, value: Any) -> Any:
-        """兼容从 .env 读取字符串列表。"""
+    def parse_json_array(cls, value: Any) -> Any:
+        """dotenv 数组使用 JSON，不接受逗号分隔或对象包装。"""
         if isinstance(value, str):
-            import json
-
             try:
-                parsed = json.loads(value)
-                return [str(item) for item in parsed]
-            except (json.JSONDecodeError, TypeError):
-                return [item.strip() for item in value.split(",") if item.strip()]
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                msg = "配置必须是有效的 JSON 数组"
+                raise ValueError(msg) from None
         return value
 
-    @field_validator("announce_status_page_url")
+    @field_validator("komari_management_announce_status_page_url")
     @classmethod
     def validate_announce_status_page_url(cls, value: str) -> str:
         """校验维护通知状态页链接。"""
         normalized = value.strip()
         if not normalized:
-            msg = "announce_status_page_url 不能为空"
+            msg = "komari_management_announce_status_page_url 不能为空"
             raise ValueError(msg)
         return normalized
 
     @model_validator(mode="after")
-    def validate_unique_credentials(self) -> DynamicConfigSchema:
-        credential_ids = [item.credential_id for item in self.api_credentials]
+    def validate_unique_credentials(self) -> ManagementConfig:
+        credential_ids = [
+            item.credential_id for item in self.komari_management_api_credentials
+        ]
         if len(credential_ids) != len(set(credential_ids)):
-            msg = "api_credentials 的 credential_id 不允许重复"
+            msg = "komari_management_api_credentials 的 credential_id 不允许重复"
             raise ValueError(msg)
-        tokens = [item.token for item in self.api_credentials]
+        tokens = [item.token for item in self.komari_management_api_credentials]
         if len(tokens) != len(set(tokens)):
-            msg = "api_credentials 不允许复用同一个 Token"
+            msg = "komari_management_api_credentials 不允许复用同一个 Token"
             raise ValueError(msg)
         return self

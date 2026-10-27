@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-from typing import cast
-
-from nonebot import get_driver, logger
+from nonebot import get_driver, get_plugin_config, logger
 from nonebot.plugin import PluginMetadata, require
 
 from komari_bot.config.prompt_storage import close_prompt_storage_if_created
@@ -46,23 +44,19 @@ from .binding_repair_lifecycle import (
     start_binding_repair_service,
     stop_binding_repair_service,
 )
-from .config_schema import DynamicConfigSchema, ManagementCredentialSchema
+from .config_schema import ManagementConfig
 from .managed_resources import ManagedConfigResource, ManagedPromptResource
-from .startup_cleanup import cleanup_management_v1_config
 
 require("config_manager")
 from komari_bot.plugins import config_manager as config_manager_plugin
 
-config_manager = config_manager_plugin.get_config_manager(
-    "komari_management",
-    DynamicConfigSchema,
-)
+config = get_plugin_config(ManagementConfig)
 
 __plugin_meta__ = PluginMetadata(
     name="komari_management",
     description="统一挂载 Komari 本地管理 API，并复用 FastAPI 官方 Swagger/OpenAPI 文档",
     usage="自动运行，无需命令",
-    config=DynamicConfigSchema,
+    config=ManagementConfig,
 )
 
 
@@ -122,11 +116,6 @@ def _load_management_components() -> ManagementApiComponents:
         register_decision_api=decision_plugin.register_decision_api,
         dsh_management_client_getter=agent_plugin.get_management_client,
         config_resources=(
-            ManagedConfigResource(
-                resource_id="komari_management",
-                display_name="Komari Management",
-                manager_getter=lambda: config_manager,
-            ),
             ManagedConfigResource(
                 resource_id="komari_context",
                 display_name="Komari Context",
@@ -237,25 +226,12 @@ driver = get_driver()
 state = PluginState()
 
 
-async def _get_management_credential_source() -> list[ManagementCredentialSchema]:
-    """动态返回具名管理凭据配置。"""
-    config = cast("DynamicConfigSchema", await config_manager.get_async())
-    return config.api_credentials
-
-
 state.api_registered = register_management_api_for_driver(
     driver=driver,
-    config=config_manager.get(),
+    config=config,
     component_loader=_load_management_components,
     logger=logger,
-    api_token_getter=_get_management_credential_source,
 )
-
-
-@driver.on_startup
-async def _cleanup_management_v1_config() -> None:
-    """清理 v1 管理配置残留并提示旧权限名。"""
-    await cleanup_management_v1_config(logger=logger)
 
 
 @driver.on_startup

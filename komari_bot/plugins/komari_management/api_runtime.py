@@ -9,7 +9,6 @@ from komari_bot.management.management_api import resolve_management_settings
 
 from .announce_api import register_announce_api
 from .config_api import register_config_api
-from .config_schema import DEFAULT_ANNOUNCE_STATUS_PAGE_URL
 from .dsh_api import API_PREFIX as AGENT_API_PREFIX
 from .dsh_api import register_dsh_management_api
 from .prompt_api import register_prompt_api
@@ -32,6 +31,7 @@ if TYPE_CHECKING:
         ManagementTokenSource,
     )
 
+    from .config_schema import ManagementConfig
     from .managed_resources import ManagedConfigResource, ManagedPromptResource
 
 
@@ -61,18 +61,18 @@ class ManagementApiComponents:
 def register_management_api_for_driver(
     *,
     driver: object,
-    config: object,
+    config: ManagementConfig,
     component_loader: Callable[[], ManagementApiComponents],
     logger: Any,
-    api_token_getter: ManagementTokenSource | None = None,
 ) -> bool:
     """按驱动与集中配置决定是否挂载统一管理 API。"""
-    if not getattr(config, "plugin_enable", False):
+    if not config.komari_management_plugin_enable:
         logger.info("[Komari Management] 插件未启用，跳过管理 API 注册")
         return False
 
     settings = resolve_management_settings(
-        config,
+        credentials=config.komari_management_api_credentials,
+        allowed_origins=config.komari_management_api_allowed_origins,
         logger=logger,
         warning_prefix="[Komari Management]",
     )
@@ -86,9 +86,7 @@ def register_management_api_for_driver(
         return False
 
     components = component_loader()
-    token_source: ManagementTokenSource = (
-        settings.credential_source if api_token_getter is None else api_token_getter
-    )
+    token_source: ManagementTokenSource = settings.credential_source
     components.register_knowledge_api(
         server_app,
         api_token=token_source,
@@ -162,22 +160,10 @@ def register_management_api_for_driver(
         server_app,
         api_token=token_source,
         allowed_origins=settings.allowed_origins,
-        status_page_url=getattr(
-            config,
-            "announce_status_page_url",
-            DEFAULT_ANNOUNCE_STATUS_PAGE_URL,
-        ),
-        announce_max_group_count=getattr(config, "announce_max_group_count", 20),
-        announce_send_interval_seconds=getattr(
-            config,
-            "announce_send_interval_seconds",
-            1.0,
-        ),
-        announce_request_cooldown_seconds=getattr(
-            config,
-            "announce_request_cooldown_seconds",
-            30.0,
-        ),
+        status_page_url=config.komari_management_announce_status_page_url,
+        announce_max_group_count=config.komari_management_announce_max_group_count,
+        announce_send_interval_seconds=config.komari_management_announce_send_interval_seconds,
+        announce_request_cooldown_seconds=config.komari_management_announce_request_cooldown_seconds,
     )
     docs_url = getattr(server_app, "docs_url", None) or "未启用"
     openapi_url = getattr(server_app, "openapi_url", None) or "未启用"

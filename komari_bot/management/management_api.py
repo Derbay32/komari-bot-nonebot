@@ -272,23 +272,18 @@ def ensure_management_cors(app: FastAPI, allowed_origins: Sequence[str]) -> None
 
 
 def resolve_management_settings(
-    config: Any,
     *,
+    credentials: Sequence[object],
+    allowed_origins: Sequence[str],
     logger: Any,
     warning_prefix: str = "[Komari Management]",
 ) -> SharedManagementSettings | None:
-    """从配置对象解析管理 API 共用设置。"""
-    raw_credentials = getattr(config, "api_credentials", [])
-    if isinstance(raw_credentials, Sequence) and not isinstance(raw_credentials, str):
-        credential_source: ManagementCredentialSourceValue = raw_credentials
-    else:
-        credential_source = []
-
-    if not _normalize_credentials(credential_source):
+    """从启动凭据与跨域白名单解析管理 API 共用设置。"""
+    if not _normalize_credentials(credentials):
         logger.warning(f"{warning_prefix} 未配置有效管理凭据，跳过管理 API 注册")
         return None
 
     return SharedManagementSettings(
-        credential_source=credential_source,
-        allowed_origins=normalize_origins(getattr(config, "api_allowed_origins", [])),
+        credential_source=credentials,
+        allowed_origins=normalize_origins(list(allowed_origins)),
     )
