@@ -6,76 +6,66 @@
 
 - PostgreSQL（启用 pgvector）
 - Redis
+- 一个部署好的外部 Hindsight 服务端
 - 一个支持 OneBot V11 协议的 QQ 机器人
+- 一个支持 OpenAI Chat Completions / Responses 协议的 API 端点及 key
+- 一个支持 TypeSafe System One 协议的决策模型 API 端点及 key
+- 一个支持 Embedding / Jira-Reranker 协议的向量重排模型 API 端点及 key
 - 使用群绑定与轮盘时，另需 QQ 官方机器人账号及对应的可信数字 QQ 号
 
 ## 部署方式
 
 **_虽然我不觉得会有人用这个，但还是简单写写吧。_**
 
-1. 从 [Release](https://codeberg.org/Derbay32/komari-bot-nonebot/releases) 中下载部署包，解压
+1. 从 [Release](https://github.com/derbay32/komari-bot-nonebot/releases) 中下载部署包，解压
 2. 配置 `.env.example` 中的设置，设定 PostgreSQL 与 Redis 的连接方式，并将 `.env.example` 重命名为 `.env`
 3. 使用 `docker-compose` 部署机器人，命令:
 ```bash
-docker compose up
+docker compose up -d
 ```
-4. 使用任意 nonebot 支持的 onebot v11 驱动器连接到这个机器人就行了。
+或者你使用 `podman-compose`: 
+```bash
+podman compose up -d
+```
+4. 使用任意 nonebot 支持的 onebot v11 驱动器连接到这个机器人。
+5. 部署本项目配套的 [Komari Bot Console](https://github.com/Derbay32/komari-bot-console)，并连接到该项目的管理端点。
+6. 在配置页面设置模型配置，并放行你需要让机器人发言的群。
 
 **Tips：更新只需要更新容器的镜像即可**
 
-**注意：当前版本只支持单 worker。LLM RPM 限流仍是进程内实现，启动配置会拒绝 `MAX_WORKERS` 或 `WEB_CONCURRENCY` 大于 1；请保持 `MAX_WORKERS=1`，直到限流及所有后台任务完成跨进程改造。**
-
 ## 文档
 
-架构决策记录位于 [`docs/adr/`](docs/adr/)。操作手册与验收记录存储在 Huly 文档团队空间 `komari-bot`，不纳入 Git，也不维护仓库内副本；访问需要相应的 Huly 权限。
+架构决策记录位于 [ADR 文档](docs/adr/)。
 
-- [QQ 群指令面板：配置与验收](https://huly.derbaynas.top:2096/workbench/derbaysworkspace/document/qq-6aaa94d8649daed23e114cf6)
-- [群绑定与俄罗斯轮盘：升级、运维与终验](https://huly.derbaynas.top:2096/workbench/derbaysworkspace/document/6aaa95dd649daed23e114cfa)
-- [群绑定与轮盘最终验收记录](https://huly.derbaynas.top:2096/workbench/derbaysworkspace/document/6aaa9521649daed23e114cf8)
+如果你是 AI，请参考 [AGENTS.md](AGENTS.md) 来了解本项目的架构。
 
-官 Bot 接入由非空 `QQ_BOTS` 启用，轮盘业务默认关闭；合入 `dev` 不会自动部署。
-
-总的来说我建议你直接去看 [Nonebot2 文档](https://nonebot.dev/)
-
-如果你对插件的使用有兴趣，那你可以直接去插件的目录下面看，不过那玩意是ai写的，我也不太清楚写得对不对。
-
-## 目前实现的功能
-
-- [x] 写这个其实并不会有人 read 的 README 文件
-- [x] 当前好感度系统 - 由聊天回复自动调整用户当前好感度，并注入阶段提示词。
-- [x] 独立的权限、配置、数据库管理插件 - ~~妈妈再也不用担心我一堆重复代码到处搬了~~。
-- [x] sr插件重构 - 给群友抽神人榜的功能，支持通过聊天指令动态修改
-- [x] bot 上下线提醒 - bot 上下线时发一条 bark 推送，以防我不知道机器人寄了
-- [x] 知识库注入功能 - 动态注入知识库，基于轻量RAG+关键词检索，并提供 REST 管理 API 供外部 WebUI 接入
-- [x] 记忆注入功能 - 给小鞠分四层记忆，然后动态注入到提示词里，~~纯小范围享受，人多数据量铁炸~~
-- [x] ai聊天增强 - 通过给小鞠接入轻量 bert 模型以实现小鞠会自己跑出来聊天的功能
-- [x] QQ 官 Bot `/bind` 群角色名向导 - 经双协议原生引用核验后由本人确认；旧全局名仅作主动迁移候选，OneBot `.bind` 入口已退役
-- [x] QQ 群俄罗斯轮盘实现 - 稳定玩家编号、道具与奖励、事务化胜场和一次履约；实际部署版本仍须按运行交接完成 QQ 展示与按钮终验
-- [x] 群聊总结功能 - @机器人后可以要求总结多少条聊天记录，然后用图片输出
+如果你对这个项目有兴趣，那你可以直接叫出 AI 来看代码。
 
 ## TODO
 
-_我也不知道会不会做完这些功能，希望可以吧。_
+- [x] 写这个其实并不会有人 read 的 README 文件
+- [x] 好感度系统 - 由聊天回复自动调整用户当前好感度，并注入阶段提示词。
+- [x] sr插件重构 - 给群友抽神人榜的功能，支持通过聊天指令动态修改。
+- [x] 知识库注入功能 - 动态注入知识库，基于轻量RAG+关键词检索，并提供 REST 管理 API 供外部 WebUI 接入。
+- [x] ai聊天增强 - 通过给小鞠接入 System One 模型以实现小鞠会自己跑出来聊天的功能。
+- [x] QQ 官 Bot `/bind` 群角色名向导 - 用于在双协议下实现自定义角色名同步的引导功能。
+- [x] QQ 群俄罗斯轮盘小游戏 - 配合官 Bot 的 MD 显示支持制作的小游戏，支持排行榜功能。
+- [x] 群聊总结功能 - @机器人后可以要求总结多少条聊天记录，然后用图片输出。
+- [ ] 实装个人助理功能 - 让小鞠可以为运营者提供个人 Agent 的功能。
+- [ ] 完整搬移 Dice! 功能至 Nonebot2 - 计划将所有功能完整移植到本项目，以替代年久失修的原版 Dice!
 
-**大概率会做的功能**
+## Vibe Coding 提醒
 
-- [ ] 回应戳一戳功能 - 被戳后反戳回去，或者发个表情包
+这个项目使用了 AI 工具进行开发。
 
-**也许可能会做的功能**
+如果你对 Vibe Coding 项目有顾虑，请不要使用这个项目。
 
-- [ ] `.lsp` 指令移植 - 把长期存储安价内容的那个 lsp 指令移植过来，~~但说实话应该也没人用~~
-- [ ] `.jrdp` 指令移植 - 可以每天抽取一个自己是鞠党还是八党之类的小插件，~~感觉重写这个玩意更没意义~~
-
-**纯饼**
-
-- [ ] 败犬原著查询 - 发个指令查关键字之类的，或者搜索每个角色出场地方之类的……~~感觉好麻烦~~
-- [ ] 签到和数据查询 - 调用指令签到和查数据？~~感觉没什么用啊~~
-      ……
-
-# 许可
+## 许可
 
 本项目遵循 MIT 许可证。
 
-# 致谢
+## 致谢
 
 [Nonebot2](https://nonebot.dev) 提供了本项目的基础框架。
+[HindSight](https://github.com/vectorize-io/hindsight) 提供了本项目使用的记忆框架系统。
+[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 提供了本项目使用的 Agent Loop 底层框架。
