@@ -1,24 +1,18 @@
-"""TSK-190 聊天 Prompt 字段契约 test oracle。
+"""TSK-190 历史迁移的测试侧字段契约（固定于 0032）。
 
-本文件是聊天 Prompt 新字段集的测试侧单一事实来源：
-
-- 字段名集合直接派生自强类型 Schema（``KomariChatPromptSchema``），
-  不复制生产默认正文；
-- ``output_instruction`` 是被删除字段；
-- ``tool_call_instruction`` / ``image_read_instruction`` 是 TSK-188
-  实现决策 26 明确点名的字段名，按精确名称断言；
-- 其余职责（联网搜索、网页抓取、委托图片理解、视觉描述）
-  只按字段名关键词断言“存在独立行为字段”，不锁定完整命名；
-- seed 资产的聊天 Prompt 块定位约定：``find_chat_prompt_mapping``
-  查找包含 ``system_prompt`` 且不含 ``planning_system_prompt`` 的映射
-  （后者是 group_history_summary 的判别键），除此之外不锁定 YAML 布局。
+字段来自历史表结构，不依赖已退役的运行时 Schema 或提示词正文。
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from komari_bot.plugins.komari_chat.prompt_schema import KomariChatPromptSchema
+HISTORICAL_CHAT_FIELDS = frozenset({
+    "system_prompt", "memory_ack", "memory_ack_role", "cot_prefix",
+    "cot_prefix_role", "tool_call_instruction", "image_read_instruction",
+    "search_web_instruction", "fetch_page_instruction",
+    "delegated_vision_instruction", "vision_description_prompt",
+})
 
 INTERNAL_STORAGE_FIELDS: frozenset[str] = frozenset({"id", "revision", "updated_at"})
 
@@ -62,7 +56,7 @@ type Mapping = dict[str, Any]
 
 def chat_prompt_field_names() -> set[str]:
     """返回聊天 Prompt Schema 的正文字段名集合（不含存储专用字段）。"""
-    return set(KomariChatPromptSchema.model_fields) - INTERNAL_STORAGE_FIELDS
+    return set(HISTORICAL_CHAT_FIELDS)
 
 
 def new_chat_prompt_column_names() -> set[str]:

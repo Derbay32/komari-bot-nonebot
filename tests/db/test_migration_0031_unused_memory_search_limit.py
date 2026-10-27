@@ -148,18 +148,18 @@ async def test_0031_drops_only_dead_setting_and_preserves_surviving_chat_data() 
         finally:
             await connection.close()
 
-        result = run_bootstrap(db_url, "upgrade", "head")
+        result = run_bootstrap(db_url, "upgrade", "0031")
         assert result.returncode == 0, result.stderr
 
         connection = await asyncpg.connect(**scratch)
         try:
             assert (
                 await connection.fetchval("SELECT version_num FROM alembic_version")
-                == HEAD_REVISION
+                == "0031"
             )
             columns = await _chat_columns(connection)
             assert RETIRED_COLUMN not in columns
-            assert columns == set(KomariChatConfigSchema.model_fields)
+            assert columns == set(before) - {RETIRED_COLUMN}
             after = await _chat_row(connection)
             expected_after = {
                 key: value for key, value in before.items() if key != RETIRED_COLUMN
@@ -168,19 +168,16 @@ async def test_0031_drops_only_dead_setting_and_preserves_surviving_chat_data() 
         finally:
             await connection.close()
 
-        check = run_bootstrap(db_url, "check")
-        assert check.returncode == 0, f"{check.stdout}\n{check.stderr}"
-
-        # TSK-200：链在 0032 先拒绝降级，head 上的降级不再到达 0031。
+        # 固定在 0031，验证本次历史迁移自身的拒绝降级行为。
         downgrade = run_bootstrap(db_url, "downgrade", "0030")
         assert downgrade.returncode != 0
-        latest_code = "0032_TSK200_IS_IRREVERSIBLE"
+        latest_code = DOWNGRADE_CODE
         assert latest_code in f"{downgrade.stdout}\n{downgrade.stderr}"
         connection = await asyncpg.connect(**scratch)
         try:
             assert (
                 await connection.fetchval("SELECT version_num FROM alembic_version")
-                == HEAD_REVISION
+                == "0031"
             )
             assert RETIRED_COLUMN not in await _chat_columns(connection)
             assert await _chat_row(connection) == expected_after

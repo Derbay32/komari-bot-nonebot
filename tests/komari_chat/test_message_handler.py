@@ -32,12 +32,6 @@ import pytest
 message_handler_module = import_module(
     "komari_bot.plugins.komari_chat.handlers.message_handler"
 )
-llm_service_module = import_module(
-    "komari_bot.plugins.komari_chat.services.llm_service"
-)
-image_reading_session_module = import_module(
-    "komari_bot.plugins.komari_chat.services.image_reading_session"
-)
 proactive_reservation_module = import_module(
     "komari_bot.plugins.komari_chat.services.proactive_reservation"
 )

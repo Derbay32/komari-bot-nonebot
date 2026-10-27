@@ -14,15 +14,15 @@
 - 公开 CLI ``--decision-seed-file`` 独立读取可选资产：资产缺失、畸形、
   重复键、version 非字符串、未知顶层键、字段缺失/空白/非字符串/多余、
   超预算时只输出一条固定安全诊断，不回显正文/未知字段值/原始异常/
-  回溯，且不阻止必需资源初始化；
-- 必需 manifest 的既有严格校验（缺块与 YAML 重复键）保持不变，并仍在
-  任何数据库访问之前失败。
+  回溯，且不阻止独立服务启动；
+- 旧聊天与总结 manifest 和 --seed-file 参数已退役。
 
 断言不复制生产判定正文：期望值一律来自打包资产本身或测试自有字面量。
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import subprocess
@@ -36,7 +36,6 @@ import yaml
 from komari_bot.config.typed_config import ensure_typed_prompt_model
 from komari_bot.db.seed_bootstrap import (
     DEFAULT_DECISION_SEED_FILE,
-    DEFAULT_SEED_FILE,
     SeedValidationError,
     load_decision_prompt_seed,
 )
@@ -300,12 +299,10 @@ def test_seed_cli_accepts_explicit_valid_decision_seed_file(
     result = _run_seed_cli("--decision-seed-file", str(path))
     output = _combined(result)
 
-    assert result.returncode != 0, output  # 数据库地址故意不可达
-    assert "数据库播种失败" in output, output
+    assert result.returncode == 0, output
+    assert output.count(OPTIONAL_UNAVAILABLE_MESSAGE) == 1, output
     assert "初始数据校验失败" not in output, output
-    assert OPTIONAL_UNAVAILABLE_MESSAGE not in output, (
-        "合法可选资产不得产生跳过诊断"
-    )
+
 
 
 def test_seed_cli_skips_missing_decision_seed_file_and_continues(
@@ -316,9 +313,8 @@ def test_seed_cli_skips_missing_decision_seed_file_and_continues(
     result = _run_seed_cli("--decision-seed-file", str(path))
     output = _combined(result)
 
-    assert result.returncode != 0, output  # 数据库地址故意不可达
+    assert result.returncode == 0, output
     assert output.count(OPTIONAL_UNAVAILABLE_MESSAGE) == 1, output
-    assert "数据库播种失败" in output, "可选资产缺失不得阻止必需资源初始化"
     assert "初始数据校验失败" not in output, output
     assert "Traceback" not in output, output
 
@@ -334,70 +330,27 @@ def test_seed_cli_isolates_invalid_decision_seed_file(
     result = _run_seed_cli("--decision-seed-file", str(path))
     output = _combined(result)
 
-    assert result.returncode != 0, output  # 数据库地址故意不可达
+    assert result.returncode == 0, output
     assert output.count(OPTIONAL_UNAVAILABLE_MESSAGE) == 1, output
-    assert "数据库播种失败" in output, "非法可选资产不得阻止必需资源初始化"
     assert "初始数据校验失败" not in output, output
     assert SENTINEL not in output, "新诊断不得回显可选资产内容或未知字段值"
     assert "Traceback" not in output, output
 
 
-def test_seed_cli_fails_fast_when_mandatory_prompt_block_missing(
-    tmp_path: Path,
+
+def test_optional_seed_cancellation_propagates_without_success_diagnostic(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """必需 manifest 缺 Prompt 块仍在任何数据库访问之前失败（既有语义）。"""
-    body = (
-        'version: "1"\n'
-        "fixed_candidates:\n"
-        + "".join(
-            f'  {key}: "固定内容 {key}"\n' for key in REQUIRED_FIXED_SCENE_KEYS
-        )
-        + "general_scenes:\n"
-        "  - id: 'scene_tsk182_general'\n"
-        "    text: '一般场景内容'\n"
-    )
-    seed_file = _write(tmp_path, "no-prompts.yaml", body)
-    decision_file = _write(
-        tmp_path,
-        "decision-ok.yaml",
-        _decision_text(_sentinel_values()),
-    )
-    result = _run_seed_cli(
-        "--seed-file",
-        str(seed_file),
-        "--decision-seed-file",
-        str(decision_file),
-    )
-    output = _combined(result)
+    from komari_bot.db import seed_bootstrap
 
-    assert result.returncode != 0, output
-    assert "缺少 Prompt 初始数据块" in output, output
-    assert "数据库播种失败" not in output, "必需 Prompt 缺块必须在访问数据库前失败"
-    assert OPTIONAL_UNAVAILABLE_MESSAGE not in output, (
-        "必需 manifest 门禁必须先于可选资产读取裁决"
-    )
+    monkeypatch.setattr(seed_bootstrap, "_bootstrap_nonebot", lambda: None)
 
+    async def cancelled(_values: dict[str, str]) -> tuple[int, int]:
+        raise asyncio.CancelledError
 
-def test_seed_cli_still_rejects_duplicate_keys_in_required_manifest(
-    tmp_path: Path,
-) -> None:
-    """CLI：新增选项不放宽必需 manifest 的严格重复键拒绝。"""
-    body = DEFAULT_SEED_FILE.read_text(encoding="utf-8") + '\nversion: "2"\n'
-    seed_file = _write(tmp_path, "duplicate-manifest.yaml", body)
-    decision_file = _write(
-        tmp_path,
-        "decision-ok.yaml",
-        _decision_text(_sentinel_values()),
-    )
-    result = _run_seed_cli(
-        "--seed-file",
-        str(seed_file),
-        "--decision-seed-file",
-        str(decision_file),
-    )
-    output = _combined(result)
-
-    assert result.returncode != 0, output
-    assert "YAML 解析失败" in output, output
-    assert "duplicate key" in output or "重复键" in output, output
-    assert "数据库播种失败" not in output, "必需 manifest 重复键必须在访问数据库前失败"
+    monkeypatch.setattr(seed_bootstrap, "_seed_database", cancelled)
+    with pytest.raises(asyncio.CancelledError):
+        seed_bootstrap.main(["--decision-seed-file", str(DEFAULT_DECISION_SEED_FILE)])
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""

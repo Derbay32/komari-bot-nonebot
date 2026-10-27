@@ -14,13 +14,7 @@ from komari_bot.plugins.embedding_provider.config_schema import (
 from komari_bot.plugins.group_history_summary.config_schema import (
     DynamicConfigSchema as GroupHistorySummaryConfigSchema,
 )
-from komari_bot.plugins.group_history_summary.prompt_schema import (
-    DISPLAY_NAME as GROUP_HISTORY_PROMPT_DISPLAY_NAME,
-)
 from komari_bot.plugins.komari_chat.config_schema import KomariChatConfigSchema
-from komari_bot.plugins.komari_chat.prompt_schema import (
-    DISPLAY_NAME as KOMARI_CHAT_PROMPT_DISPLAY_NAME,
-)
 from komari_bot.plugins.komari_context.config_schema import (
     KomariContextConfigSchema,
 )
@@ -39,9 +33,6 @@ from komari_bot.plugins.komari_roulette.config_schema import (
     DynamicConfigSchema as RouletteConfigSchema,
 )
 from komari_bot.plugins.komari_sentry.config_schema import KomariSentryConfigSchema
-from komari_bot.plugins.llm_provider.config_schema import (
-    DynamicConfigSchema as LlmProviderConfigSchema,
-)
 from komari_bot.plugins.sr.config_schema import (
     DynamicConfigSchema as SrConfigSchema,
 )
@@ -177,14 +168,6 @@ def _load_management_components() -> ManagementApiComponents:
                 ),
             ),
             ManagedConfigResource(
-                resource_id="llm_provider",
-                display_name="LLM Provider",
-                manager_getter=lambda: config_manager_plugin.get_config_manager(
-                    "llm_provider",
-                    LlmProviderConfigSchema,
-                ),
-            ),
-            ManagedConfigResource(
                 resource_id="embedding_provider",
                 display_name="Embedding Provider",
                 manager_getter=lambda: config_manager_plugin.get_config_manager(
@@ -242,14 +225,6 @@ def _load_management_components() -> ManagementApiComponents:
             ),
         ),
         prompt_resources=(
-            ManagedPromptResource(
-                resource_id="komari_chat",
-                display_name=KOMARI_CHAT_PROMPT_DISPLAY_NAME,
-            ),
-            ManagedPromptResource(
-                resource_id="group_history_summary",
-                display_name=GROUP_HISTORY_PROMPT_DISPLAY_NAME,
-            ),
             ManagedPromptResource(
                 resource_id="komari_decision",
                 display_name=KOMARI_DECISION_PROMPT_DISPLAY_NAME,

@@ -214,14 +214,14 @@ async def test_0032_drops_retired_log_storage_and_filters_permissions() -> None:
         finally:
             await connection.close()
 
-        result = run_bootstrap(db_url, "upgrade", "head")
+        result = run_bootstrap(db_url, "upgrade", "0032")
         assert result.returncode == 0, result.stderr
 
         connection = await asyncpg.connect(**scratch)
         try:
             assert (
                 await connection.fetchval("SELECT version_num FROM alembic_version")
-                == HEAD_REVISION
+                == "0032"
             )
             assert not await _table_exists(connection, CONFIG_TABLE)
             assert not await _table_exists(connection, INDEX_TABLE)
@@ -257,9 +257,6 @@ async def test_0032_drops_retired_log_storage_and_filters_permissions() -> None:
         finally:
             await connection.close()
 
-        check = run_bootstrap(db_url, "check")
-        assert check.returncode == 0, f"{check.stdout}\n{check.stderr}"
-
         downgrade = run_bootstrap(db_url, "downgrade", "0031")
         assert downgrade.returncode != 0
         assert DOWNGRADE_CODE in f"{downgrade.stdout}\n{downgrade.stderr}"
@@ -268,7 +265,7 @@ async def test_0032_drops_retired_log_storage_and_filters_permissions() -> None:
         try:
             assert (
                 await connection.fetchval("SELECT version_num FROM alembic_version")
-                == HEAD_REVISION
+                == "0032"
             )
             assert not await _table_exists(connection, CONFIG_TABLE)
             assert not await _table_exists(connection, INDEX_TABLE)
@@ -303,7 +300,7 @@ async def test_0032_leaves_config_untouched_without_retired_permissions() -> Non
         finally:
             await connection.close()
 
-        result = run_bootstrap(db_url, "upgrade", "head")
+        result = run_bootstrap(db_url, "upgrade", "0032")
         assert result.returncode == 0, result.stderr
 
         connection = await asyncpg.connect(**scratch)

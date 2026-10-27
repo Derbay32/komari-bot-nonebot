@@ -885,6 +885,6 @@ def test_0013_fresh_empty_database_passes_head_without_redis() -> None:
     try:
         result = run_bootstrap(database_url, "upgrade", "head")
         assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
-        assert asyncio.run(_fetch_version(params)) == "0032"
+        assert asyncio.run(_fetch_version(params)) == "0033"
     finally:
         asyncio.run(drop_scratch_database(str(params["database"])))

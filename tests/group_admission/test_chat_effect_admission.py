@@ -31,9 +31,6 @@ pytestmark = pytest.mark.group_admission_acceptance
 message_handler_module = importlib.import_module(
     "komari_bot.plugins.komari_chat.handlers.message_handler"
 )
-llm_service_module = importlib.import_module(
-    "komari_bot.plugins.komari_chat.services.llm_service"
-)
 
 GROUP_ID = 100
 
@@ -55,227 +52,89 @@ def _patch_chat_config(
     monkeypatch.setattr(message_handler_module, "get_context_config", lambda: stub)
 
 
-def _llm_config() -> SimpleNamespace:
-    """任务起点冻结的 chat 配置替身（覆盖预算与槽位字段）。"""
-    return SimpleNamespace(
-        llm_model_chat="chat-model",
-        llm_temperature_chat=0.7,
-        llm_max_tokens_chat=1024,
-        llm_thinking_mode_chat=False,
-        llm_reasoning_effort_chat="",
-        bot_nickname="小鞠",
-        agent_max_rounds=10,
-        agent_max_tool_calls_per_round=4,
-        agent_max_total_tool_calls=20,
-        agent_tool_call_mode="required",
-        llm_request_api_chat="chat_completions",
-        llm_stream_enabled_chat=False,
+async def _run_dsh() -> tuple[Any, Any]:
+    from tests.komari_chat.test_dsh_chat_service import (
+        _FakeHost,
+        _generate,
+        _invoke,
+        _service,
     )
 
+    async def finalize(callbacks: dict[str, Any]) -> None:
+        await _invoke(callbacks, "chat.submit_final_response", {"content": "回复内容"})
+        await _invoke(callbacks, "chat.submit_favorability", {"delta": 0, "reason": "无变化"})
 
-def _final_response_completion() -> Any:
-    """与 LLMCompletionResultSchema 兼容的假 completion（final_response 终结）。"""
-    return SimpleNamespace(
-        content="",
-        tool_calls=[
-            SimpleNamespace(
-                id="call-final",
-                type="function",
-                function=SimpleNamespace(name="final_response", arguments="{}"),
-                raw_arguments="{}",
-                parsed_arguments={
-                    "content": "回复内容",
-                    "interaction_history": {
-                        "event": "打招呼",
-                        "result": "陪话",
-                        "emotion": "开心",
-                    },
-                },
-            )
-        ],
-        finish_reason="stop",
-        duration_ms=10.0,
-        usage=None,
-    )
-
-
-class _RecorderProvider:
-    """记录 provider 调用；completions 队列由调用方灌入。"""
-
-    def __init__(self) -> None:
-        self.completion_calls: list[dict[str, Any]] = []
-        self.completions: list[Any] = []
-
-    async def generate_messages_completion(self, **kwargs: Any) -> Any:
-        self.completion_calls.append(kwargs)
-        if not self.completions:
-            raise AssertionError("provider 无脚本化 completion 队列")  # noqa: TRY003
-        return self.completions.pop(0)
-
-
-# ---------------------------------------------------------------------------
-# 每轮聊天 LLM / provider（chat.llm_round）
-# ---------------------------------------------------------------------------
+    host = _FakeHost({"content": "回复内容", "favorability_delta": 0,
+                      "favorability_reason": "无变化"}, finalize)
+    service, _memory, session = _service(host)
+    result = await _generate(service, session)
+    return result, host
 
 
 async def test_llm_round_admitted_executes_provider_exactly_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """chat.llm_round：获准后每轮 provider 恰好执行一次（绿）。"""
+    """获准后由 DSH 执行一次任务，不再调用自有模型网关。"""
     scripted = ScriptedAdjudicate("admitted")
     install_scripted_adjudicate(monkeypatch, scripted)
-    provider = _RecorderProvider()
-    provider.completions = [_final_response_completion()]
-    monkeypatch.setattr(llm_service_module, "llm_provider", provider)
-
-    result = await llm_service_module.generate_reply(
-        config=_llm_config(),
-        messages=[{"role": "user", "content": "你好"}],
-    )
-
-    assert scripted.calls != [], "chat.llm_round 效果前未调用 adjudicate"
+    result, host = await _run_dsh()
+    assert scripted.calls
     assert result.content == "回复内容"
-    assert len(provider.completion_calls) == 1
+    assert len(host.requests) == 1
 
 
 async def test_llm_round_restricted_blocks_provider_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """chat.llm_round：受限时 provider 不得被调用（红：当前未接裁决）。"""
     scripted = ScriptedAdjudicate("restricted")
     install_scripted_adjudicate(monkeypatch, scripted)
-    provider = _RecorderProvider()
-    provider.completions = [_final_response_completion()]
-    monkeypatch.setattr(llm_service_module, "llm_provider", provider)
-
-    await llm_service_module.generate_reply(
-        config=_llm_config(),
-        messages=[{"role": "user", "content": "你好"}],
-    )
-
-    assert scripted.calls != [], "chat.llm_round 效果前未调用 adjudicate"
-    assert provider.completion_calls == [], (
-        "chat.llm_round 在受限准入下仍调用了 provider"
-    )
+    result, host = await _run_dsh()
+    assert scripted.calls
+    assert result.content == ""
+    assert host.requests == []
 
 
 async def test_llm_round_failed_discards_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """chat.llm_round：failed（无有效策略）同样阻止 provider 调用（红）。"""
     scripted = ScriptedAdjudicate("failed")
     install_scripted_adjudicate(monkeypatch, scripted)
-    provider = _RecorderProvider()
-    provider.completions = [_final_response_completion()]
-    monkeypatch.setattr(llm_service_module, "llm_provider", provider)
-
-    await llm_service_module.generate_reply(
-        config=_llm_config(),
-        messages=[{"role": "user", "content": "hi"}],
-    )
-
-    assert scripted.calls != [], "chat.llm_round failed 时未调用 adjudicate"
-    assert provider.completion_calls == [], (
-        "chat.llm_round 在 failed 准入下仍调用了 provider"
-    )
+    result, host = await _run_dsh()
+    assert scripted.calls
+    assert result.content == ""
+    assert host.requests == []
 
 
-# ---------------------------------------------------------------------------
-# 工具 dispatch（chat.tool_dispatch / chat.tool_search）
-# ---------------------------------------------------------------------------
-
-
-def _read_image_tool_call() -> SimpleNamespace:
-    return SimpleNamespace(
-        id="call-read",
-        type="function",
-        function=SimpleNamespace(name="read_image", arguments="{}"),
-        raw_arguments="{}",
-        parsed_arguments={"image_index": 0},
-    )
-
-
+@pytest.mark.parametrize("name", ["chat.recall_memory", "chat.search_knowledge", "chat.search_web", "chat.fetch_page"])
 async def test_tool_dispatch_restricted_blocks_tool_body(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, name: str,
 ) -> None:
-    """chat.tool_dispatch：工具 dispatch 前必须裁决，受限时工具体不执行。"""
+    from komari_bot.plugins.komari_chat.services.admission_gate import (
+        effect_business_admitted,
+    )
+    from komari_bot.plugins.komari_chat.services.chat_query_tools import (
+        ChatQueryAdmissionError,
+    )
+    from tests.komari_chat.test_chat_query_tools import _callbacks, _request, _tools
+
     scripted = ScriptedAdjudicate("restricted")
     install_scripted_adjudicate(monkeypatch, scripted)
-
-    read_calls: list[int] = []
-
-    async def fake_read(index: int, **kwargs: Any) -> Any:
-        del kwargs
-        read_calls.append(index)
-        return SimpleNamespace(
-            status="success", description="图片描述", failure_message=None
-        )
-
-    fake_image_session = SimpleNamespace(
-        total_count=1,
-        read=fake_read,
-        all_images_unavailable=lambda: False,
+    tools, memory, calls, knowledge_calls = _tools(
+        admitted=lambda: effect_business_admitted(group_id=GROUP_ID),
     )
-
-    await llm_service_module._execute_business_tool(
-        tool_call=_read_image_tool_call(),
-        image_session=fake_image_session,
-        phase_prefix="test",
-        round_num=1,
-        recall_session=None,
-        group_id=str(GROUP_ID),
-        caller_group_id=None,
-        caller_is_superuser=False,
-        request_trace_id="chat-1",
-    )
-
-    assert scripted.calls != [], "chat.tool_dispatch 工具前未调用 adjudicate"
-    assert read_calls == [], (
-        "chat.tool_dispatch 在受限准入下仍执行了工具体（read_image）"
-    )
+    data = {"urls": ["https://example.com"]} if name == "chat.fetch_page" else {"query": "test"}
+    with pytest.raises(ChatQueryAdmissionError):
+        await _callbacks(tools)[name](_request(name, data))
+    assert scripted.calls
+    assert calls == []
+    assert memory.recall_calls == []
+    assert knowledge_calls == []
 
 
 async def test_tool_search_restricted_blocks_search_web(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """chat.tool_search：search 工具进入前裁决；受限时不得发起外呼。"""
-    scripted = ScriptedAdjudicate("restricted")
-    install_scripted_adjudicate(monkeypatch, scripted)
-
-    search_calls: list[dict[str, Any]] = []
-
-    async def fake_search(query: str, **kwargs: Any) -> str:
-        search_calls.append({"query": query, **kwargs})
-        return "[搜索结果]"
-
-    monkeypatch.setattr(
-        llm_service_module,
-        "komari_search",
-        SimpleNamespace(search_web=fake_search),
-    )
-
-    tool_call = SimpleNamespace(
-        id="call-search",
-        type="function",
-        function=SimpleNamespace(name="search_web", arguments="{}"),
-        raw_arguments="{}",
-        parsed_arguments={"query": "test"},
-    )
-
-    await llm_service_module._execute_business_tool(
-        tool_call=tool_call,
-        image_session=None,
-        phase_prefix="reader",
-        round_num=1,
-        recall_session=None,
-        group_id=str(GROUP_ID),
-        caller_group_id=None,
-        caller_is_superuser=False,
-        request_trace_id="chat-2",
-    )
-
-    assert scripted.calls != [], "chat.tool_search 搜索前未调用 adjudicate"
-    assert search_calls == [], "chat.tool_search 在受限准入下仍发起了 search_web"
+    await test_tool_dispatch_restricted_blocks_tool_body(monkeypatch, "chat.search_web")
 
 
 # ---------------------------------------------------------------------------

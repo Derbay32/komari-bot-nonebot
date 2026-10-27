@@ -98,19 +98,21 @@ def test_tracked_doc_inventory_excludes_ignored_and_untracked_files(
 
 
 def test_ai_context_documents_new_chat_contract() -> None:
-    """AC10：AI 上下文把新预算/约束模式/图片模式/图片预算记为 komari_chat 契约。"""
+    """当前契约保留任务与图片预算，DSH 替代已退役的双模式配置。"""
     text = _read(PROJECT_ROOT / "AGENTS.md")
 
     for field in (
         "agent_max_rounds",
         "agent_max_tool_calls_per_round",
         "agent_max_total_tool_calls",
-        "agent_tool_call_mode",
-        "image_understanding_mode",
         "vision_image_download_",
     ):
         assert field in text, f"AGENTS.md 必须记录新契约字段: {field}"
     assert "komari_chat_config" in text, "AGENTS.md 必须点名新契约所在配置表"
+    assert "agent_tool_call_mode" not in text
+    assert "image_understanding_mode" not in text
+    assert "DSH" in text
+    assert "ADR-0016" in text
 
 
 def test_no_tracked_doc_references_removed_vision_switch() -> None:

@@ -22,11 +22,11 @@ from sqlalchemy import delete
 
 from komari_bot.config import prompt_storage as storage_module
 from komari_bot.config.prompt_storage import PromptStorage
-from komari_bot.plugins.komari_chat.prompt_schema import KomariChatPromptSchema
+from komari_bot.plugins.komari_decision.prompt_schema import KomariDecisionPromptSchema
 
 POSTGRES_URL = os.getenv("KOMARI_TEST_POSTGRES_URL", "")
 
-RESOURCE_ID = "komari_chat"
+RESOURCE_ID = "komari_decision"
 
 
 def _configured_database_url() -> str:
@@ -87,7 +87,7 @@ def _prompt_data(**overrides: str) -> dict[str, str]:
     AC1 移除 Python 长文本默认字典后，本测试只关心存储 CAS 语义，字段值
     使用测试自有字面量即可；字段集合仍与 Schema 保持一致。
     """
-    fields = set(KomariChatPromptSchema.model_fields) - {
+    fields = set(KomariDecisionPromptSchema.model_fields) - {
         "id",
         "revision",
         "updated_at",
@@ -120,30 +120,30 @@ async def test_prompt_field_cas_between_storage_instances() -> None:
 
         created = await first.replace_if_revision_async(
             resource_id=RESOURCE_ID,
-            prompt_data=_prompt_data(system_prompt="初始"),
+            prompt_data=_prompt_data(role_description="初始"),
             expected_revision=0,
         )
         assert created is not None
         assert created.revision == 1
-        assert created.prompt_data["system_prompt"] == "初始"
+        assert created.prompt_data["role_description"] == "初始"
 
         # expected_revision=0 仅允许创建：已有记录时不再写入
         duplicate = await second.replace_if_revision_async(
             resource_id=RESOURCE_ID,
-            prompt_data=_prompt_data(system_prompt="并发创建"),
+            prompt_data=_prompt_data(role_description="并发创建"),
             expected_revision=0,
         )
         assert duplicate is None
 
         first_update = await first.update_field_if_revision_async(
             resource_id=RESOURCE_ID,
-            field_name="system_prompt",
+            field_name="role_description",
             value="第一处更新",
             expected_revision=1,
         )
         stale_update = await second.update_field_if_revision_async(
             resource_id=RESOURCE_ID,
-            field_name="memory_ack",
+            field_name="reply_eligibility",
             value="第二处更新",
             expected_revision=1,
         )
@@ -156,14 +156,14 @@ async def test_prompt_field_cas_between_storage_instances() -> None:
         assert latest is not None
         retried = await second.update_field_if_revision_async(
             resource_id=RESOURCE_ID,
-            field_name="memory_ack",
+            field_name="reply_eligibility",
             value="第二处更新",
             expected_revision=latest.revision,
         )
         assert retried is not None
         assert retried.prompt_data == _prompt_data(
-            system_prompt="第一处更新",
-            memory_ack="第二处更新",
+            role_description="第一处更新",
+            reply_eligibility="第二处更新",
         )
         assert retried.revision == 3
 
@@ -171,7 +171,7 @@ async def test_prompt_field_cas_between_storage_instances() -> None:
         local_changes.clear()
         replaced = await second.upsert_async(
             resource_id=RESOURCE_ID,
-            prompt_data=_prompt_data(system_prompt="整体替换"),
+            prompt_data=_prompt_data(role_description="整体替换"),
         )
         assert replaced.revision == 4
         assert local_changes.is_set() is True

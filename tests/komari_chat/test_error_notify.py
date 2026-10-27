@@ -16,16 +16,12 @@ from komari_bot.onebot import (
     ImageFailureDiagnostic,
     image_failure_reason_code,
 )
+from komari_bot.plugins.komari_chat.services.image_failure import (
+    ImageFailureSummary,
+)
 from tests.komari_chat.hindsight_recall_support import (
     FakeHindsightMemory,
     fake_recall_session,
-)
-
-image_reading_session_module = import_module(
-    "komari_bot.plugins.komari_chat.services.image_reading_session"
-)
-from komari_bot.plugins.komari_chat.services.image_failure import (
-    ImageFailureSummary,
 )
 
 message_handler_module = import_module(

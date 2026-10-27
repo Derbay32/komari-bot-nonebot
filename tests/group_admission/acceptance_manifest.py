@@ -297,8 +297,8 @@ ADMISSION_EFFECT_CASES: tuple[AdmissionEffectCase, ...] = (
     AdmissionEffectCase(
         effect_id="group_admission.effect.chat.llm_round",
         owner_module="komari_bot.plugins.komari_chat",
-        source_symbol="_execute_tool_loop/_call_llm_completion",
-        sink_kind="llm_provider_round",
+        source_symbol="DshChatService.generate",
+        sink_kind="dsh_chat_task",
         intent="business",
         attribution_source="komari_chat_message_group_id",
         work_category="transient_interaction",
@@ -544,20 +544,20 @@ ADMISSION_EFFECT_CASES += (
     AdmissionEffectCase(
         effect_id="group_admission.effect.chat.tool_dispatch",
         owner_module="komari_bot.plugins.komari_chat",
-        source_symbol="_execute_business_tool",
+        source_symbol="ChatQueryTools.callbacks",
         sink_kind="tool_body_execution",
         intent="business",
         attribution_source="komari_chat_message_group_id",
         work_category="transient_interaction",
         acceptance_anchor=(
             "tests/group_admission/test_chat_effect_admission.py"
-            "::test_tool_dispatch_restricted_blocks_tool_body"
+            "::test_tool_dispatch_restricted_blocks_tool_body[chat.search_web]"
         ),
     ),
     AdmissionEffectCase(
         effect_id="group_admission.effect.chat.tool_search",
         owner_module="komari_bot.plugins.komari_chat",
-        source_symbol="_build_search_tool_result",
+        source_symbol="ChatQueryTools._search_web_tool",
         sink_kind="komari_search_http",
         intent="business",
         attribution_source="komari_chat_message_group_id",
@@ -647,7 +647,7 @@ ADMISSION_EFFECT_CASES += (
     AdmissionEffectCase(
         effect_id="group_admission.effect.chat.tool_fetch_page",
         owner_module="komari_bot.plugins.komari_chat",
-        source_symbol="_build_fetch_tool_result",
+        source_symbol="ChatQueryTools._fetch_page_tool",
         sink_kind="komari_search_http",
         intent="business",
         attribution_source="komari_chat_message_group_id",
@@ -662,22 +662,9 @@ ADMISSION_EFFECT_CASES += (
 
 ADMISSION_EFFECT_CASES += (
     AdmissionEffectCase(
-        effect_id="group_admission.effect.chat.vision_completion",
-        owner_module="komari_bot.plugins.komari_chat",
-        source_symbol="vision_service.read_image",
-        sink_kind="vision_llm_round",
-        intent="business",
-        attribution_source="komari_chat_message_group_id",
-        work_category="transient_interaction",
-        acceptance_anchor=(
-            "tests/group_admission/test_chat_seam_admission.py"
-            "::test_vision_completion_restricted_blocks_vision_llm"
-        ),
-    ),
-    AdmissionEffectCase(
         effect_id="group_admission.effect.chat.image_download",
         owner_module="komari_bot.plugins.komari_chat",
-        source_symbol="image_downloader.download_images",
+        source_symbol="NativeImageInput.prepare",
         sink_kind="image_http_download",
         intent="business",
         attribution_source="komari_chat_message_group_id",

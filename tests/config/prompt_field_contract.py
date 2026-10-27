@@ -1,41 +1,14 @@
-"""TSK-191/TSK-197 两个必需 Prompt 资源字段契约 test oracle。
-
-单一事实来源（对齐 ``tests/config/chat_prompt_field_contract.py`` 的 oracle
-惯例）：
-
-- 两个必需 Prompt 资源（chat / group history summary）的正文字段集合全部
-  直接派生自强类型 Schema，不复制生产默认正文；TSK-191 起二者都不再定义
-  Python 长文本 ``DEFAULTS``；记忆总结 Prompt 已随 TSK-197 退役；
-- seed 资产中两资源块的定位约定：按各自唯一判别键（discriminator）在文档
-  中查找映射，不锁定 YAML 布局：
-
-  - ``komari_chat``：包含 ``system_prompt`` 且不含 ``planning_system_prompt``；
-  - ``group_history_summary``：包含 ``planning_system_prompt``。
-
-- 测试输入值一律使用 marker（``marker-<字段名>``），禁止复制 seed 或生产
-  Prompt 正文；管理资源经 ``make_managed_prompt_resource(resource_id,
-  display_name)`` 构造，这是 TSK-191 后的唯一形态：资源不再携带
-  ``defaults``（AC8），测试绝不传/透传 Python 默认正文；
-- ``CROSS_RESOURCE_FOREIGN_FIELDS`` 提供跨资源拒绝用例的注入字段：每个
-  资源取一个属于其他资源、不属于本资源 Schema 的字段，用于证明白名单与
-  完整性校验是 resource_id 对应 Schema，不是多资源字段的全局 union。
-"""
+"""Test-owned markers for the sole surviving PostgreSQL prompt resource (Jev)."""
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, cast
 
-from komari_bot.plugins.group_history_summary.prompt_schema import (
-    DISPLAY_NAME as GROUP_HISTORY_DISPLAY_NAME,
+from komari_bot.plugins.komari_decision.prompt_schema import (
+    DISPLAY_NAME as DECISION_DISPLAY_NAME,
 )
-from komari_bot.plugins.group_history_summary.prompt_schema import (
-    GroupHistorySummaryPromptSchema,
-)
-from komari_bot.plugins.komari_chat.prompt_schema import (
-    DISPLAY_NAME as KOMARI_CHAT_DISPLAY_NAME,
-)
-from komari_bot.plugins.komari_chat.prompt_schema import (
-    KomariChatPromptSchema,
+from komari_bot.plugins.komari_decision.prompt_schema import (
+    KomariDecisionPromptSchema,
 )
 
 if TYPE_CHECKING:
@@ -43,32 +16,12 @@ if TYPE_CHECKING:
         ManagedPromptResource,
     )
 
-#: 两个必需 Prompt 资源的稳定顺序（与生产管理资源注册顺序一致）。
-PROMPT_RESOURCE_IDS: tuple[str, str] = (
-    "komari_chat",
-    "group_history_summary",
-)
-
-#: 跨资源拒绝用例的注入字段：key 是目标资源，value 是注入的异资源字段。
-#: chat←group 的 planning_system_prompt；group←chat 的 vision_description_prompt。
-CROSS_RESOURCE_FOREIGN_FIELDS: dict[str, str] = {
-    "komari_chat": "planning_system_prompt",
-    "group_history_summary": "vision_description_prompt",
-}
-
-INTERNAL_STORAGE_FIELDS: frozenset[str] = frozenset(
-    {"id", "revision", "updated_at"}
-)
-
-_PROMPT_SCHEMAS: dict[str, type[Any]] = {
-    "komari_chat": KomariChatPromptSchema,
-    "group_history_summary": GroupHistorySummaryPromptSchema,
-}
-
-_PROMPT_DISPLAY_NAMES: dict[str, str] = {
-    "komari_chat": KOMARI_CHAT_DISPLAY_NAME,
-    "group_history_summary": GROUP_HISTORY_DISPLAY_NAME,
-}
+PROMPT_RESOURCE_IDS: tuple[str, ...] = ("komari_decision",)
+# A formerly valid chat field must not be accepted by the surviving resource.
+CROSS_RESOURCE_FOREIGN_FIELDS = {"komari_decision": "system_prompt"}
+INTERNAL_STORAGE_FIELDS = frozenset({"id", "revision", "updated_at"})
+_PROMPT_SCHEMAS: dict[str, type[Any]] = {"komari_decision": KomariDecisionPromptSchema}
+_PROMPT_DISPLAY_NAMES = {"komari_decision": DECISION_DISPLAY_NAME}
 
 
 def prompt_resource_field_names(resource_id: str) -> set[str]:
@@ -108,11 +61,7 @@ def find_prompt_mapping(raw: object, resource_id: str) -> dict[str, Any] | None:
     按唯一判别键查找映射；遍历不修改原文档，找不到返回 ``None``。
     """
     predicates: dict[str, Any] = {
-        "komari_chat": (
-            lambda node: "system_prompt" in node
-            and "planning_system_prompt" not in node
-        ),
-        "group_history_summary": (lambda node: "planning_system_prompt" in node),
+        "komari_decision": lambda node: "role_description" in node,
     }
     if resource_id not in predicates:
         raise KeyError(f"未知 Prompt 资源: {resource_id}")  # noqa: TRY003

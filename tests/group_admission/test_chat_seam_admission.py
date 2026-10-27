@@ -27,11 +27,6 @@ pytestmark = pytest.mark.group_admission_acceptance
 GROUP_ID = 100
 
 mh = importlib.import_module("komari_bot.plugins.komari_chat.handlers.message_handler")
-llm = importlib.import_module("komari_bot.plugins.komari_chat.services.llm_service")
-vs = importlib.import_module("komari_bot.plugins.komari_chat.services.vision_service")
-irs = importlib.import_module(
-    "komari_bot.plugins.komari_chat.services.image_reading_session"
-)
 idm = importlib.import_module(
     "komari_bot.plugins.komari_chat.services.image_downloader"
 )
@@ -65,100 +60,40 @@ class _DL:
         return None
 
 
-def _sess(
-    monkeypatch: pytest.MonkeyPatch,
-    dl: Any,
-    quoted: list[str] | None = None,
-    current: list[str] | None = None,
-) -> Any:
-    monkeypatch.setattr(irs, "ImageDownloadSession", lambda _p: dl)
-    vis = SimpleNamespace(__call__=lambda _images, **_kw: ["d"])
-    monkeypatch.setattr(irs, "read_images", vis)
-    return irs.ImageReadingSession.build(
-        quoted_sources=quoted or [],
-        current_sources=current or [],
-        policy=_pol(),
-        vision_model="v",
-        vision_temperature=0.3,
-        vision_max_tokens=1024,
-        request_trace_id="t",
-    )
-
-
-async def test_vision_completion_restricted_blocks_vision_llm(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    s = ScriptedAdjudicate("restricted")
-    install_scripted_adjudicate(monkeypatch, s)
-    monkeypatch.setattr(
-        vs,
-        "llm_provider_config_manager",
-        SimpleNamespace(get=lambda: SimpleNamespace(api_token="x")),
-    )
-    calls: list[dict[str, Any]] = []
-
-    class _P:
-        async def generate_messages_completion(self, **kw: Any) -> Any:
-            calls.append(kw)
-            return SimpleNamespace(content="视觉")
-
-    monkeypatch.setattr(vs, "llm_provider", _P())
-    await vs._read_single_image(
-        image_data_uri="data:image/png;base64,QQ==",
-        image_index=0,
-        vision_model="v",
-        vision_description_prompt="p",
-        temperature=0.3,
-        max_tokens=1024,
-    )
-    assert s.calls != [], "vision 前未裁决"
-    assert calls == [], "受限下仍调用视觉 LLM"
-
-
 async def test_fetch_page_restricted_blocks_fetch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    s = ScriptedAdjudicate("restricted")
-    install_scripted_adjudicate(monkeypatch, s)
-    fc: list[dict[str, Any]] = []
-
-    async def f(urls: list[str], **kw: object) -> str:
-        fc.append({"urls": urls, **kw})
-        return "[正文]"
-
-    monkeypatch.setattr(llm, "komari_search", SimpleNamespace(fetch_page=f))
-    tc = SimpleNamespace(
-        id="c",
-        type="function",
-        function=SimpleNamespace(name="fetch_page", arguments="{}"),
-        raw_arguments="{}",
-        parsed_arguments={"urls": ["https://x/a"]},
+    from tests.group_admission.test_chat_effect_admission import (
+        test_tool_dispatch_restricted_blocks_tool_body,
     )
-    await llm._execute_business_tool(
-        tool_call=tc,
-        image_session=None,
-        phase_prefix="p",
-        round_num=1,
-        recall_session=None,
-        group_id=str(GROUP_ID),
-        caller_group_id=None,
-        caller_is_superuser=False,
-        request_trace_id="t",
-    )
-    assert s.calls != [], "fetch_page 前未裁决"
-    assert fc == [], "受限下仍发起 fetch_page"
+
+    await test_tool_dispatch_restricted_blocks_tool_body(monkeypatch, "chat.fetch_page")
 
 
 async def test_image_download_restricted_blocks_download(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from komari_bot.plugins.komari_chat.services import native_image
+    from komari_bot.plugins.komari_chat.services.admission_gate import (
+        effect_business_admitted,
+    )
+
     s = ScriptedAdjudicate("restricted")
     install_scripted_adjudicate(monkeypatch, s)
     dl = _DL()
-    session = _sess(monkeypatch, dl, quoted=["https://example.com/a.png"])
-    await session.read(0)
-    assert s.calls != [], "下载前未裁决"
-    assert dl.calls == [], "受限下仍触发图片下载"
+    monkeypatch.setattr(native_image, "ImageDownloadSession", lambda _policy: dl)
+    images = native_image.NativeImageInput(
+        quoted_sources=["https://example.com/a.png"], current_sources=[],
+        policy=_pol(), admission_guard=lambda: effect_business_admitted(group_id=GROUP_ID),
+        group_id=str(GROUP_ID), request_trace_id="test-image",
+    )
+    try:
+        with pytest.raises(native_image.ImageChunkAdmissionError):
+            await images.prepare()
+    finally:
+        await images.aclose()
+    assert s.calls
+    assert dl.calls == []
 
 
 async def _perm_ok(_a: object, _b: object, _c: object) -> tuple[bool, str]:
@@ -280,76 +215,80 @@ async def test_reply_send_restricted_blocks_outbound(
 async def test_phase_barrier_admitted_then_restricted_blocks_start(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from tests.group_admission.test_chat_effect_admission import _run_dsh
+
     s = ScriptedAdjudicate("admitted")
-    s.set_sequence("admitted", "restricted")  # 入口获准，效果启动前翻转受限
+    s.set_sequence("admitted", "restricted")
     install_scripted_adjudicate(monkeypatch, s)
-    monkeypatch.setattr(
-        vs,
-        "llm_provider_config_manager",
-        SimpleNamespace(get=lambda: SimpleNamespace(api_token="x")),
-    )
-    started = asyncio.Event()
-
-    async def gated(**kw: object) -> Any:
-        del kw
-        # 效果真正启动的屏障信号：受限（已翻转）时不得置位。
-        started.set()
-        return SimpleNamespace(content="d")
-
-    monkeypatch.setattr(
-        vs, "llm_provider", SimpleNamespace(generate_messages_completion=gated)
-    )
-    await vs._read_single_image(
-        image_data_uri="data:image/png;base64,QQ==",
-        image_index=0,
-        vision_model="v",
-        vision_description_prompt="p",
-        temperature=0.3,
-        max_tokens=1024,
-    )
-    assert len(s.calls) >= 2, "入口与效果两个时点都应裁决"
-    assert started.is_set() is False, "翻转受限后效果不应被启动"
+    result, host = await _run_dsh()
+    assert len(s.calls) >= 2
+    assert result.content == ""
+    assert host.requests == []
 
 
 async def test_reauth_does_not_resurrect_skipped_effect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from komari_bot.plugins.komari_chat.services.admission_gate import (
+        effect_business_admitted,
+    )
+    from komari_bot.plugins.komari_chat.services.chat_query_tools import (
+        ChatQueryAdmissionError,
+    )
+    from tests.komari_chat.test_chat_query_tools import _callbacks, _request, _tools
+
     s = ScriptedAdjudicate("admitted")
     s.set_sequence("admitted", "restricted", "admitted")
     install_scripted_adjudicate(monkeypatch, s)
-    dl = _DL()
-    session = _sess(
-        monkeypatch,
-        dl,
-        quoted=["https://x/0.png", "https://x/1.png"],
-        current=["https://x/2.png"],
-    )
-    await session.read(0)
-    await session.read(1)
-    await session.read(2)
-    assert dl.calls == ["https://x/0.png", "https://x/2.png"], (
-        "受限时该 sibling 效果被跳过，恢复准入后不得补执行/复活"
-    )
+    tools, _memory, calls, _knowledge = _tools(admitted=lambda: effect_business_admitted(group_id=GROUP_ID))
+    callback = _callbacks(tools)["chat.search_web"]
+    await callback(_request("chat.search_web", {"query": "first"}))
+    with pytest.raises(ChatQueryAdmissionError):
+        await callback(_request("chat.search_web", {"query": "skipped"}))
+    await callback(_request("chat.search_web", {"query": "last"}))
+    assert calls == ["search:first:trace-1", "search:last:trace-1"]
+    assert len(s.calls) == 3
 
 
 async def test_concurrent_sibling_admitted_completes_restricted_not_started(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from komari_bot.plugins.komari_chat.services.admission_gate import (
+        effect_business_admitted,
+    )
+    from komari_bot.plugins.komari_chat.services.chat_query_tools import (
+        ChatQueryAdmissionError,
+    )
+    from tests.komari_chat.test_chat_query_tools import _callbacks, _request, _tools
+
     s = ScriptedAdjudicate("admitted")
     s.set_sequence("admitted", "restricted")
     install_scripted_adjudicate(monkeypatch, s)
-    dl = _DL()
-    session = _sess(
-        monkeypatch,
-        dl,
-        quoted=["https://x/0.png", "https://x/1.png"],
-        current=["https://x/2.png"],
+    started, release = asyncio.Event(), asyncio.Event()
+    calls: list[str] = []
+
+    async def search(query: str, **_kwargs: object) -> str:
+        calls.append(query)
+        started.set()
+        await release.wait()
+        return "已完成"
+
+    tools, _memory, _calls, _knowledge = _tools(
+        admitted=lambda: effect_business_admitted(group_id=GROUP_ID), search=search,
     )
-    await asyncio.gather(session.read(0), session.read(1))
-    assert len(s.calls) >= 2, "两个 sibling 各自在 dispatch 前裁决"
-    assert len(dl.calls) == 1, (
-        "并发 sibling：获准者完成下载，受限者不启动；已 dispatch 结果不外溢"
-    )
+    callback = _callbacks(tools)["chat.search_web"]
+    first = asyncio.create_task(callback(_request("chat.search_web", {"query": "first"})))
+    try:
+        await asyncio.wait_for(started.wait(), 1)
+        with pytest.raises(ChatQueryAdmissionError):
+            await callback(_request("chat.search_web", {"query": "denied"}))
+        release.set()
+        assert (await first)["ok"] is True
+    finally:
+        release.set()
+        await first
+    assert calls == ["first"]
+    assert len(s.calls) == 2
 
 
 # ---------------------------------------------------------------------------
