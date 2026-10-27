@@ -460,3 +460,61 @@ async def test_unquoted_if_match_is_rejected_before_control(app: App) -> None:
     assert response.status_code == 422
     assert response.json()["detail"]["code"] == "invalid_request"
     assert client.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("value", "accepted"),
+    [
+        pytest.param("", False, id="empty"),
+        pytest.param("a" * 12_001, False, id="over-character-budget"),
+        pytest.param("😀" * 9_001, False, id="over-utf8-budget"),
+        pytest.param("密" * 6_001, False, id="over-token-budget"),
+        pytest.param("a" * 12_000, True, id="character-boundary"),
+        pytest.param("密" * 6_000, True, id="token-boundary"),
+        pytest.param(" \tcredential-with-whitespace\n ", True, id="literal-whitespace"),
+    ],
+)
+async def test_credential_writes_enforce_shared_budget_without_changing_secrets(
+    app: App,
+    value: str,
+    *,
+    accepted: bool,
+) -> None:
+    client = _FakeClient()
+    audit_events: list[ManagementAuditEvent] = []
+    async with app.test_server(
+        asgi=cast("Any", _app(client, audit_events=audit_events)),
+    ) as ctx:
+        response = await ctx.get_client().put(
+            f"{API_PREFIX}/providers/fixture/credential",
+            headers=_WRITE_HEADERS,
+            json={"value": value},
+        )
+
+    # Assert only safe predicates: failures must not render credential payloads.
+    response_is_safe = not value or value not in response.text
+    audit_is_safe = not value or value not in json.dumps(
+        [event.to_dict() for event in audit_events],
+        ensure_ascii=False,
+    )
+    assert response_is_safe
+    assert audit_is_safe
+    if accepted:
+        assert response.status_code == 200
+        assert len(client.calls) == 1
+        received_exactly = client.calls[0] == (
+            "put_credential",
+            ("fixture", value, "etag-1"),
+        )
+        assert received_exactly
+        assert any(event.action == "dsh.credential.put" for event in audit_events)
+    else:
+        assert response.status_code == 422
+        error_is_safe = response.json()["detail"] == {
+            "code": "invalid_credential",
+            "message": "The credential is invalid.",
+        }
+        assert error_is_safe
+        assert len(client.calls) == 0
+        assert len(audit_events) == 0
