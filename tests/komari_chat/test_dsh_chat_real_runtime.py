@@ -542,6 +542,25 @@ async def test_real_dsh_all_query_tools_share_session_and_frozen_limits(
         "search_web",
         "fetch_page",
     }
+    required_instructions = (
+        "Use only the tools declared for this task.",
+        "You may use the declared query tools to retrieve context.",
+        "A business result requires valid final_response and "
+        "record_favorability_delta submissions.",
+        "An ordinary assistant text message is never a business result.",
+    )
+    forbidden_instruction = (
+        "Use only the declared final_response and record_favorability_delta tools."
+    )
+    for request in server.requests:
+        system_text = " ".join(request.system_text.split())
+        if not all(instruction in system_text for instruction in required_instructions):
+            pytest.fail("System instructions must allow queries and require both submissions")
+        if forbidden_instruction in system_text:
+            pytest.fail("System instructions must not restrict the task to completion tools")
+        if request.system_text != first.system_text:
+            pytest.fail("System instructions must remain immutable throughout the task")
+
     assert "<capabilities>" not in first.user_texts[0]
     assert '"capabilities"' not in first.user_texts[0]
 
