@@ -105,12 +105,15 @@ async def search_knowledge(
     query_embedding: list[float] | None = None,
     *,
     embedding_guard: Callable[[], bool] | None = None,
+    raw_query: bool = False,
 ) -> list[SearchResult]:
     """
     检索相关知识。
 
     这是供其他插件调用的主要接口。``embedding_guard`` 只保护需要即时
     生成查询向量的聊天调用；不传时保持独立知识调用方的既有语义。
+    ``raw_query`` 仅供自动聊天原文查询显式跳过旧改写规则，默认 False
+    保持独立调用方行为不变。
     """
     engine = get_engine()
     if engine is None:
@@ -126,6 +129,7 @@ async def search_knowledge(
         limit,
         query_vec=query_embedding,
         embedding_guard=embedding_guard,
+        raw_query=raw_query,
     )
 
 

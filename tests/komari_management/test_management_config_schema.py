@@ -44,7 +44,6 @@ def _load_schema_class(plugin_name: str, class_name: str) -> type[Any]:
         ("komari_decision", "KomariDecisionConfigSchema", "immediate"),
         ("komari_help", "DynamicConfigSchema", "immediate"),
         ("komari_knowledge", "DynamicConfigSchema", "immediate"),
-        ("llm_provider", "DynamicConfigSchema", "immediate"),
         ("sr", "DynamicConfigSchema", "immediate"),
     ],
 )
@@ -68,7 +67,6 @@ def test_managed_config_schemas_declare_default_apply_mode(
         ("embedding_provider", "DynamicConfigSchema", "rerank_api_key"),
         ("komari_memory", "KomariMemoryConfigSchema", "hindsight_api_key"),
         ("komari_sentry", "KomariSentryConfigSchema", "dsn"),
-        ("llm_provider", "DynamicConfigSchema", "api_token"),
     ],
 )
 def test_managed_secret_fields_use_explicit_schema_metadata(

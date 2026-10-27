@@ -125,57 +125,49 @@ async def test_sr_uses_verified_group_context_for_name(
 def test_prompt_builder_passes_canonical_context_to_binding_lookup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from tests.komari_chat.test_prompt_builder import (
-        _build_config,
-        _patch_dependencies,
-    )
-
-    prompt_builder = importlib.import_module(
-        "komari_bot.plugins.komari_chat.services.prompt_builder"
-    )
-    _patch_dependencies(monkeypatch)
-    binding = _StrictScopedBinding(
-        {
-            ("114514", "1047195267"): "群内角色",
-            ("200000", "1047195267"): "另一群角色",
-        }
-    )
-    monkeypatch.setattr(prompt_builder, "character_binding", binding)
-
     import asyncio
 
-    messages = asyncio.run(
-        prompt_builder.build_prompt(
-            user_message="你好",
-            config=_build_config(),
-            current_user_id="1047195267",
-            current_user_nickname="平台昵称",
-            group_id="114514",
-        )
+    from tests.komari_chat.test_dsh_chat_service import (
+        _config,
+        _FakeHost,
+        _message,
+        _service,
     )
-    assert any("群内角色" in str(message["content"]) for message in messages)
-    assert binding.lookup_calls
 
-    other_messages = asyncio.run(
-        prompt_builder.build_prompt(
-            user_message="你好",
-            config=_build_config(),
-            current_user_id="1047195267",
-            current_user_nickname="平台昵称",
-            group_id="200000",
-        )
-    )
-    assert any("另一群角色" in str(message["content"]) for message in other_messages)
-    assert ("114514", "1047195267", "平台昵称") in binding.lookup_calls
-    assert ("200000", "1047195267", "平台昵称") in binding.lookup_calls
+    calls: list[str] = []
+
+    class _Bindings:
+        def list_onebot_group_bindings(self, *, group_id: str) -> dict[str, str]:
+            calls.append(group_id)
+            return {"u-0": {"114514": "群内角色", "200000": "另一群角色"}[group_id]}
+
+    binding = importlib.import_module("komari_bot.plugins.character_binding")
+    monkeypatch.setattr(binding, "get_binding_manager", lambda: _Bindings())
+    service_module = importlib.import_module("komari_bot.plugins.komari_chat.services.dsh_chat_service")
+    monkeypatch.setattr(service_module, "effect_business_admitted", lambda **_kw: True)
+    host = _FakeHost(RuntimeError("stop after observing trusted task input"))
+    service, _memory, session = _service(host)
+    service._group_bindings_getter = service_module._default_group_bindings
+    for group_id in ("114514", "200000"):
+        with pytest.raises(RuntimeError, match="stop after"):
+            asyncio.run(service.generate(
+                message=_message(0, group_id=group_id), recent_messages=[],
+                reply_context=None, recall_session=cast("Any", session),
+                request_trace_id="binding-test", config=_config(),
+            ))
+    assert calls == ["114514", "200000"]
+    assert "群内角色" in str(host.requests[0].task_data)
+    assert "另一群角色" in str(host.requests[1].task_data)
+    assert "另一群角色" not in str(host.requests[0].task_data)
+    assert "群内角色" not in str(host.requests[1].task_data)
 
 
 @pytest.mark.asyncio
 async def test_summary_history_resolves_each_name_with_group_scope(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    planner = importlib.import_module(
-        "komari_bot.plugins.group_history_summary.planner_service"
+    history_tools = importlib.import_module(
+        "komari_bot.plugins.group_history_summary.history_tools"
     )
     binding = _StrictScopedBinding(
         {
@@ -183,8 +175,8 @@ async def test_summary_history_resolves_each_name_with_group_scope(
             ("200000", "1047195267"): "群二角色",
         }
     )
-    monkeypatch.setattr(planner, "character_binding", binding)
-    monkeypatch.setattr(planner, "ensure_effect_admitted", lambda **_kwargs: None)
+    monkeypatch.setattr(history_tools, "character_binding", binding)
+    monkeypatch.setattr(history_tools, "ensure_effect_admitted", lambda **_kwargs: None)
 
     class _HistoryBot:
         async def call_api(self, _api: str, **_kwargs: object) -> object:
@@ -210,13 +202,13 @@ async def test_summary_history_resolves_each_name_with_group_scope(
             }
 
     bot = _HistoryBot()
-    first = await planner._fetch_history_window(
+    first = await history_tools.fetch_history_window(
         bot=cast("Any", bot),
         group_id="114514",
         count=2,
         batch_size=2,
     )
-    second = await planner._fetch_history_window(
+    second = await history_tools.fetch_history_window(
         bot=cast("Any", bot),
         group_id="200000",
         count=2,

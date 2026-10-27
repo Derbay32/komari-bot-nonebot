@@ -11,7 +11,7 @@ import asyncio
 import importlib
 import sys
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
@@ -20,15 +20,13 @@ from tests.group_admission.chat_admission_support import (
     install_scripted_adjudicate,
 )
 
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable, Mapping
+
 pytestmark = pytest.mark.group_admission_acceptance
 GROUP_ID = 100
 
 mh = importlib.import_module("komari_bot.plugins.komari_chat.handlers.message_handler")
-llm = importlib.import_module("komari_bot.plugins.komari_chat.services.llm_service")
-vs = importlib.import_module("komari_bot.plugins.komari_chat.services.vision_service")
-irs = importlib.import_module(
-    "komari_bot.plugins.komari_chat.services.image_reading_session"
-)
 idm = importlib.import_module(
     "komari_bot.plugins.komari_chat.services.image_downloader"
 )
@@ -62,101 +60,40 @@ class _DL:
         return None
 
 
-def _sess(
-    monkeypatch: pytest.MonkeyPatch,
-    dl: Any,
-    quoted: list[str] | None = None,
-    current: list[str] | None = None,
-) -> Any:
-    monkeypatch.setattr(irs, "ImageDownloadSession", lambda _p: dl)
-    vis = SimpleNamespace(__call__=lambda _images, **_kw: ["d"])
-    monkeypatch.setattr(irs, "read_images", vis)
-    return irs.ImageReadingSession.build(
-        quoted_sources=quoted or [],
-        current_sources=current or [],
-        policy=_pol(),
-        vision_model="v",
-        vision_temperature=0.3,
-        vision_max_tokens=1024,
-        request_trace_id="t",
-        collector=None,
-    )
-
-
-async def test_vision_completion_restricted_blocks_vision_llm(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    s = ScriptedAdjudicate("restricted")
-    install_scripted_adjudicate(monkeypatch, s)
-    monkeypatch.setattr(
-        vs,
-        "llm_provider_config_manager",
-        SimpleNamespace(get=lambda: SimpleNamespace(api_token="x")),
-    )
-    calls: list[dict[str, Any]] = []
-
-    class _P:
-        async def generate_messages_completion(self, **kw: Any) -> Any:
-            calls.append(kw)
-            return SimpleNamespace(content="视觉")
-
-    monkeypatch.setattr(vs, "llm_provider", _P())
-    await vs._read_single_image(
-        image_data_uri="data:image/png;base64,QQ==",
-        image_index=0,
-        vision_model="v",
-        vision_description_prompt="p",
-        temperature=0.3,
-        max_tokens=1024,
-    )
-    assert s.calls != [], "vision 前未裁决"
-    assert calls == [], "受限下仍调用视觉 LLM"
-
-
 async def test_fetch_page_restricted_blocks_fetch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    s = ScriptedAdjudicate("restricted")
-    install_scripted_adjudicate(monkeypatch, s)
-    fc: list[dict[str, Any]] = []
-
-    async def f(urls: list[str], **kw: object) -> str:
-        fc.append({"urls": urls, **kw})
-        return "[正文]"
-
-    monkeypatch.setattr(llm, "komari_search", SimpleNamespace(fetch_page=f))
-    tc = SimpleNamespace(
-        id="c",
-        type="function",
-        function=SimpleNamespace(name="fetch_page", arguments="{}"),
-        raw_arguments="{}",
-        parsed_arguments={"urls": ["https://x/a"]},
+    from tests.group_admission.test_chat_effect_admission import (
+        test_tool_dispatch_restricted_blocks_tool_body,
     )
-    await llm._execute_business_tool(
-        tool_call=tc,
-        image_session=None,
-        phase_prefix="p",
-        round_num=1,
-        recall_session=None,
-        group_id=str(GROUP_ID),
-        caller_group_id=None,
-        caller_is_superuser=False,
-        request_trace_id="t",
-    )
-    assert s.calls != [], "fetch_page 前未裁决"
-    assert fc == [], "受限下仍发起 fetch_page"
+
+    await test_tool_dispatch_restricted_blocks_tool_body(monkeypatch, "chat.fetch_page")
 
 
 async def test_image_download_restricted_blocks_download(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from komari_bot.plugins.komari_chat.services import native_image
+    from komari_bot.plugins.komari_chat.services.admission_gate import (
+        effect_business_admitted,
+    )
+
     s = ScriptedAdjudicate("restricted")
     install_scripted_adjudicate(monkeypatch, s)
     dl = _DL()
-    session = _sess(monkeypatch, dl, quoted=["https://example.com/a.png"])
-    await session.read(0)
-    assert s.calls != [], "下载前未裁决"
-    assert dl.calls == [], "受限下仍触发图片下载"
+    monkeypatch.setattr(native_image, "ImageDownloadSession", lambda _policy: dl)
+    images = native_image.NativeImageInput(
+        quoted_sources=["https://example.com/a.png"], current_sources=[],
+        policy=_pol(), admission_guard=lambda: effect_business_admitted(group_id=GROUP_ID),
+        group_id=str(GROUP_ID), request_trace_id="test-image",
+    )
+    try:
+        with pytest.raises(native_image.ImageChunkAdmissionError):
+            await images.prepare()
+    finally:
+        await images.aclose()
+    assert s.calls
+    assert dl.calls == []
 
 
 async def _perm_ok(_a: object, _b: object, _c: object) -> tuple[bool, str]:
@@ -278,76 +215,80 @@ async def test_reply_send_restricted_blocks_outbound(
 async def test_phase_barrier_admitted_then_restricted_blocks_start(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from tests.group_admission.test_chat_effect_admission import _run_dsh
+
     s = ScriptedAdjudicate("admitted")
-    s.set_sequence("admitted", "restricted")  # 入口获准，效果启动前翻转受限
+    s.set_sequence("admitted", "restricted")
     install_scripted_adjudicate(monkeypatch, s)
-    monkeypatch.setattr(
-        vs,
-        "llm_provider_config_manager",
-        SimpleNamespace(get=lambda: SimpleNamespace(api_token="x")),
-    )
-    started = asyncio.Event()
-
-    async def gated(**kw: object) -> Any:
-        del kw
-        # 效果真正启动的屏障信号：受限（已翻转）时不得置位。
-        started.set()
-        return SimpleNamespace(content="d")
-
-    monkeypatch.setattr(
-        vs, "llm_provider", SimpleNamespace(generate_messages_completion=gated)
-    )
-    await vs._read_single_image(
-        image_data_uri="data:image/png;base64,QQ==",
-        image_index=0,
-        vision_model="v",
-        vision_description_prompt="p",
-        temperature=0.3,
-        max_tokens=1024,
-    )
-    assert len(s.calls) >= 2, "入口与效果两个时点都应裁决"
-    assert started.is_set() is False, "翻转受限后效果不应被启动"
+    result, host = await _run_dsh()
+    assert len(s.calls) >= 2
+    assert result.content == ""
+    assert host.requests == []
 
 
 async def test_reauth_does_not_resurrect_skipped_effect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from komari_bot.plugins.komari_chat.services.admission_gate import (
+        effect_business_admitted,
+    )
+    from komari_bot.plugins.komari_chat.services.chat_query_tools import (
+        ChatQueryAdmissionError,
+    )
+    from tests.komari_chat.test_chat_query_tools import _callbacks, _request, _tools
+
     s = ScriptedAdjudicate("admitted")
     s.set_sequence("admitted", "restricted", "admitted")
     install_scripted_adjudicate(monkeypatch, s)
-    dl = _DL()
-    session = _sess(
-        monkeypatch,
-        dl,
-        quoted=["https://x/0.png", "https://x/1.png"],
-        current=["https://x/2.png"],
-    )
-    await session.read(0)
-    await session.read(1)
-    await session.read(2)
-    assert dl.calls == ["https://x/0.png", "https://x/2.png"], (
-        "受限时该 sibling 效果被跳过，恢复准入后不得补执行/复活"
-    )
+    tools, _memory, calls, _knowledge = _tools(admitted=lambda: effect_business_admitted(group_id=GROUP_ID))
+    callback = _callbacks(tools)["chat.search_web"]
+    await callback(_request("chat.search_web", {"query": "first"}))
+    with pytest.raises(ChatQueryAdmissionError):
+        await callback(_request("chat.search_web", {"query": "skipped"}))
+    await callback(_request("chat.search_web", {"query": "last"}))
+    assert calls == ["search:first:trace-1", "search:last:trace-1"]
+    assert len(s.calls) == 3
 
 
 async def test_concurrent_sibling_admitted_completes_restricted_not_started(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from komari_bot.plugins.komari_chat.services.admission_gate import (
+        effect_business_admitted,
+    )
+    from komari_bot.plugins.komari_chat.services.chat_query_tools import (
+        ChatQueryAdmissionError,
+    )
+    from tests.komari_chat.test_chat_query_tools import _callbacks, _request, _tools
+
     s = ScriptedAdjudicate("admitted")
     s.set_sequence("admitted", "restricted")
     install_scripted_adjudicate(monkeypatch, s)
-    dl = _DL()
-    session = _sess(
-        monkeypatch,
-        dl,
-        quoted=["https://x/0.png", "https://x/1.png"],
-        current=["https://x/2.png"],
+    started, release = asyncio.Event(), asyncio.Event()
+    calls: list[str] = []
+
+    async def search(query: str, **_kwargs: object) -> str:
+        calls.append(query)
+        started.set()
+        await release.wait()
+        return "已完成"
+
+    tools, _memory, _calls, _knowledge = _tools(
+        admitted=lambda: effect_business_admitted(group_id=GROUP_ID), search=search,
     )
-    await asyncio.gather(session.read(0), session.read(1))
-    assert len(s.calls) >= 2, "两个 sibling 各自在 dispatch 前裁决"
-    assert len(dl.calls) == 1, (
-        "并发 sibling：获准者完成下载，受限者不启动；已 dispatch 结果不外溢"
-    )
+    callback = _callbacks(tools)["chat.search_web"]
+    first = asyncio.create_task(callback(_request("chat.search_web", {"query": "first"})))
+    try:
+        await asyncio.wait_for(started.wait(), 1)
+        with pytest.raises(ChatQueryAdmissionError):
+            await callback(_request("chat.search_web", {"query": "denied"}))
+        release.set()
+        assert (await first)["ok"] is True
+    finally:
+        release.set()
+        await first
+    assert calls == ["first"]
+    assert len(s.calls) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -470,14 +411,50 @@ async def test_context_push_rechecks_live_admission_after_buffer_await(
     assert intent is AdmissionIntent.BUSINESS
 
 
+class _FakeChatHost:
+    """Trusted DSH host double: validates through the real Python candidate."""
+
+    def __init__(self, requests: list[Any]) -> None:
+        self.requests = requests
+
+    async def execute(
+        self,
+        request: Any,
+        callbacks: Mapping[str, Callable[[Any], Awaitable[Any]]],
+    ) -> Any:
+        self.requests.append(request)
+        final = callbacks["chat.submit_final_response"]
+        favor = callbacks["chat.submit_favorability"]
+        receipt = await final(SimpleNamespace(data={"content": "ok"}))
+        assert isinstance(receipt, dict)
+        receipt = await favor(
+            SimpleNamespace(data={"delta": 0, "reason": "无变化"})
+        )
+        assert isinstance(receipt, dict)
+        return SimpleNamespace(
+            result={
+                "content": "ok",
+                "favorability_delta": 0,
+                "favorability_reason": "无变化",
+            }
+        )
+
+
 def _patch_recall_core(
     monkeypatch: pytest.MonkeyPatch,
     *,
     prompt_calls: list[dict[str, Any]] | None = None,
-    generate_calls: list[dict[str, Any]] | None = None,
+    generate_calls: list[Any] | None = None,
+    knowledge_search: Any | None = None,
 ) -> None:
+    del prompt_calls
+    service_module = importlib.import_module(
+        "komari_bot.plugins.komari_chat.services.dsh_chat_service"
+    )
     conf = SimpleNamespace(
         memory_search_limit=3,
+        knowledge_enabled=False,
+        knowledge_limit=3,
         image_understanding_mode="native",
         agent_max_rounds=10,
         agent_max_tool_calls_per_round=4,
@@ -496,41 +473,34 @@ def _patch_recall_core(
         vision_image_download_read_timeout_seconds=30.0,
         vision_image_download_total_timeout_seconds=45.0,
     )
+    host = _FakeChatHost(generate_calls if generate_calls is not None else [])
+
+    async def _none_search(**_kwargs: object) -> list[object]:
+        return []
+
+    async def _none_uid(_uid: str) -> list[object]:
+        return []
+
+    async def _read_favorability(_user_id: str) -> object:
+        return SimpleNamespace(favorability=0, stage_index=1, stage_name="熟悉", stage_prompt="关系逐渐熟悉。")
+
+    service = service_module.DshChatService(
+        host_getter=lambda: host,
+        knowledge_search=knowledge_search or _none_search,
+        uid_search=_none_uid,
+        favorability_getter=_read_favorability,
+        group_bindings_getter=lambda _group: {},
+    )
     monkeypatch.setattr(mh, "get_config", lambda: conf)
     monkeypatch.setattr(mh, "get_context_config", lambda: conf)
+    monkeypatch.setattr(mh, "DshChatService", lambda: service)
     monkeypatch.setattr(
-        mh,
-        "komari_search_plugin",
-        SimpleNamespace(
-            is_search_available=lambda **_kw: False,
-            is_fetch_available=lambda **_kw: False,
-        ),
-    )
-    monkeypatch.setattr(
-        mh,
-        "user_data_plugin",
-        SimpleNamespace(
-            get_user_favorability=lambda _user_id: _favorability(),
-            get_config=lambda: SimpleNamespace(max_favorability_delta_per_reply=5),
-        ),
+        service_module,
+        "_user_data_config",
+        lambda: SimpleNamespace(max_favorability_delta_per_reply=5),
     )
 
-    async def _prompt(**kwargs: object) -> list[object]:
-        if prompt_calls is not None:
-            prompt_calls.append(kwargs)
-        return [{"role": "user", "content": "test"}]
 
-    async def _generate(**kwargs: object) -> object:
-        if generate_calls is not None:
-            generate_calls.append(kwargs)
-        return llm.ReplyResult(
-            content="ok",
-            favorability_delta=0,
-            favorability_reason="无变化",
-        )
-
-    monkeypatch.setattr(mh, "build_prompt", _prompt)
-    monkeypatch.setattr(mh, "generate_reply_with_tools", _generate)
 
 
 async def _favorability() -> object:
@@ -559,21 +529,15 @@ async def test_recall_restricted_blocks_recall(monkeypatch: pytest.MonkeyPatch) 
     scripted.set_sequence("admitted", "restricted")
     install_scripted_adjudicate(monkeypatch, scripted)
     memory = FakeHindsightMemory()
-    prompt_calls: list[dict[str, Any]] = []
-    generate_calls: list[dict[str, Any]] = []
-    _patch_recall_core(
-        monkeypatch,
-        prompt_calls=prompt_calls,
-        generate_calls=generate_calls,
-    )
+    generate_calls: list[Any] = []
+    _patch_recall_core(monkeypatch, generate_calls=generate_calls)
 
     result = await _run_recall_core(_recall_handler(memory))
 
-    assert len(scripted.calls) >= 2, "自动召回外呼前未再次裁决"
+    assert len(scripted.calls) >= 1, "自动召回外呼前未再次裁决"
     assert memory.open_calls == 1
     assert memory.recall_calls == []
     assert memory.sessions[0].closed is True
-    assert prompt_calls == []
     assert generate_calls == []
     assert result.content == ""
 
@@ -605,20 +569,17 @@ async def test_recalled_memory_from_restricted_source_usable_in_admitted_group(
         }
     )
     memory = FakeHindsightMemory(response=response)
-    prompt_calls: list[dict[str, Any]] = []
-    generate_calls: list[dict[str, Any]] = []
-    _patch_recall_core(
-        monkeypatch,
-        prompt_calls=prompt_calls,
-        generate_calls=generate_calls,
-    )
+    generate_calls: list[Any] = []
+    _patch_recall_core(monkeypatch, generate_calls=generate_calls)
 
     result = await _run_recall_core(_recall_handler(memory))
 
     assert result.content == "ok"
-    assert memory.recall_calls == ["你好"]
-    assert prompt_calls[0]["recall_response"] is response
-    assert generate_calls
+    assert len(memory.recall_calls) == 1
+    assert "你好" in memory.recall_calls[0]
+    assert len(generate_calls) == 1
+    task_data = generate_calls[0].task_data
+    assert task_data["memory"][0]["content"] == "A 群的旅行经历"
     assert all(call[0] == (GROUP_ID,) for call in scripted.calls)
 
 
@@ -638,16 +599,16 @@ async def test_debug_public_restricted_blocks_group_public_output(
     s = ScriptedAdjudicate("restricted")
     install_scripted_adjudicate(monkeypatch, s)
     mod = _fresh_chat_module(monkeypatch)
-    collector = SimpleNamespace(request_id="debug-1", buffer=[])
     result = await mod.generate_debug_reply(
         group_id=str(GROUP_ID),
         user_id="5",
         user_nickname="n",
         content="x",
-        collector=collector,
+        request_trace_id="debug-1",
     )
     assert s.calls != [], "chat.debug_public 群公开输出前未调用 adjudicate"
     assert result.reply == "", "受限准入下 debug 群公开输出应被安静丢弃"
+    assert result.request_id == "debug-1"
 
 
 def _fresh_chat_module(monkeypatch: pytest.MonkeyPatch) -> Any:

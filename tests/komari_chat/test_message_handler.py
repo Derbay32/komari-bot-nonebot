@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import dataclasses
 import inspect
-import json
 from importlib import import_module
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,7 +15,14 @@ from nonebot.adapters.onebot.v11 import Message, MessageSegment
 from nonebot.adapters.onebot.v11.event import Reply, Sender
 
 from komari_bot.context.redis_store import MessageSchema
-from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
+from komari_bot.plugins.komari_chat.services.dsh_chat_service import (
+    ImageTransportTaskError,
+)
+from komari_bot.plugins.komari_chat.services.image_failure import (
+    ImageFailureSummary,
+    ImageUnderstandingFailureError,
+)
+from komari_bot.plugins.komari_chat.services.reply_context import ReplyContext
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -25,15 +32,10 @@ import pytest
 message_handler_module = import_module(
     "komari_bot.plugins.komari_chat.handlers.message_handler"
 )
-llm_service_module = import_module(
-    "komari_bot.plugins.komari_chat.services.llm_service"
-)
-image_reading_session_module = import_module(
-    "komari_bot.plugins.komari_chat.services.image_reading_session"
-)
 proactive_reservation_module = import_module(
     "komari_bot.plugins.komari_chat.services.proactive_reservation"
 )
+user_data_module = import_module("komari_bot.plugins.user_data")
 ReservationDenied = proactive_reservation_module.ReservationDenied
 ReservationLostError = proactive_reservation_module.ReservationLostError
 
@@ -55,7 +57,6 @@ from tests.komari_chat.hindsight_recall_support import (
     FakeHindsightMemory,
     FakeRecallSession,
     fake_recall_session,
-    recall_response,
 )
 
 
@@ -65,6 +66,41 @@ def _attempt_recall_session(handler: object) -> FakeRecallSession:
         return fake_recall_session(memory)
     return fake_recall_session(FakeHindsightMemory())
 
+
+
+class _DebugFavorabilityWriteError(AssertionError):
+    """Debug must never reach the user-data favorability write entry."""
+
+
+class _FakeDshChat:
+    """Capture the handler-to-DSH seam without running a model."""
+
+    def __init__(
+        self,
+        *,
+        content: str = "生成成功",
+        delta: int | None = 1,
+        reason: str | None = "测试",
+        error: Exception | None = None,
+        image_failure_summary: object | None = None,
+    ) -> None:
+        self.content = content
+        self.delta = delta
+        self.reason = reason
+        self.error = error
+        self.image_failure_summary = image_failure_summary
+        self.calls: list[dict[str, Any]] = []
+
+    async def generate(self, **kwargs: object) -> object:
+        self.calls.append(kwargs)
+        if self.error is not None:
+            raise self.error
+        return import_module("komari_bot.plugins.komari_chat.services.chat_result").ReplyResult(
+            content=self.content,
+            favorability_delta=self.delta,
+            favorability_reason=self.reason,
+            image_failure_summary=self.image_failure_summary,
+        )
 
 class _FakeEvent:
     def __init__(
@@ -120,6 +156,8 @@ def _chat_memory_stub(**overrides: object) -> SimpleNamespace:
         "context_max_estimated_tokens": 6_000,
         "summary_max_buffer_size": 500,
         "memory_search_limit": 3,
+        "knowledge_enabled": False,
+        "knowledge_limit": 3,
         "bot_nickname": "小鞠",
         "memory_agent_lock_timeout_seconds": 5,
         "global_interaction_enabled": True,
@@ -210,21 +248,15 @@ class _FakeQueryRewrite:
     def __init__(self) -> None:
         self.current_query: str | None = None
         self.request_trace_id: str | None = None
-        self.parent_call_id: str | None = None
-        self.collector: object = None
 
     async def rewrite_query(
         self,
         current_query: str,
         *,
         request_trace_id: str | None = None,
-        parent_call_id: str | None = None,
-        collector: object = None,
     ) -> str:
         self.current_query = current_query
         self.request_trace_id = request_trace_id
-        self.parent_call_id = parent_call_id
-        self.collector = collector
         return "重写后的查询"
 
 
@@ -412,7 +444,7 @@ def test_read_buffers_excludes_chat_trigger_from_its_own_prompt_snapshot(
     assert [message.message_id for message in redis.pushed_messages] == ["current"]
 
 
-def test_attempt_reply_only_rewrites_current_message(
+def test_attempt_reply_delegates_to_dsh_service_without_side_effects(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     previous_message = MessageSchema(
@@ -433,63 +465,15 @@ def test_attempt_reply_only_rewrites_current_message(
     )
 
     redis = _FakeRedis([previous_message])
-    recall_result = recall_response(
-        {"id": "memory-1", "text": "长期记忆", "type": "world"}
-    )
-    memory = FakeHindsightMemory(response=recall_result)
+    memory = FakeHindsightMemory()
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
     )
     handler.redis = redis
     handler.hindsight_memory = memory
-    handler.query_rewrite = _FakeQueryRewrite()
-    build_prompt_kwargs: dict[str, object] = {}
-    generate_with_tools_kwargs: dict[str, object] = {}
-
-    async def _fake_build_prompt(**_kwargs: object) -> list[dict[str, object]]:
-        build_prompt_kwargs.update(_kwargs)
-        return []
-
-    async def _fake_generate_reply_with_tools(**_kwargs: object) -> object:
-        generate_with_tools_kwargs.update(_kwargs)
-        return llm_service_module.ReplyResult(
-            content="收到啦",
-            favorability_delta=1,
-            favorability_reason="正常互动",
-            hindsight_target_fingerprint="a" * 64,
-        )
-
-    _patch_both_configs(
-        monkeypatch,
-        lambda: _chat_memory_stub(
-            proactive_enabled=False,
-            context_messages_limit=10,
-            summary_max_buffer_size=500,
-            memory_search_limit=3,
-            bot_nickname="小鞠",
-            memory_agent_lock_timeout_seconds=5,
-            global_interaction_enabled=True,
-            global_interaction_trigger_size=20,
-        ),
-    )
-    monkeypatch.setattr(
-        message_handler_module,
-        "build_prompt",
-        _fake_build_prompt,
-    )
-    monkeypatch.setattr(
-        message_handler_module,
-        "generate_reply_with_tools",
-        _fake_generate_reply_with_tools,
-    )
-    monkeypatch.setattr(
-        message_handler_module,
-        "komari_search_plugin",
-        SimpleNamespace(
-            is_search_available=lambda **_kwargs: False,
-            is_fetch_available=lambda **_kwargs: False,
-        ),
-    )
+    service = _FakeDshChat(content="收到啦", delta=1, reason="正常互动")
+    handler.dsh_chat = service
+    _patch_both_configs(monkeypatch, lambda: _chat_memory_stub())
 
     result = asyncio.run(
         handler._attempt_reply(
@@ -512,30 +496,14 @@ def test_attempt_reply_only_rewrites_current_message(
     assert pending_reply is not None
     assert pending_reply.reply == "收到啦"
     assert pending_reply.reply_to_message_id == current_message.message_id
-    assert handler.query_rewrite.current_query == "当前待回复消息"
+    assert len(service.calls) == 1
+    call = service.calls[0]
+    assert call["message"] is current_message
+    assert [message.message_id for message in call["recent_messages"]] == ["msg-1"]
+    assert call["image_urls"] is None
+    assert call["request_trace_id"] == "chat-msg-2"
     assert redis.global_interaction_buffer_calls == []
-    assert memory.recall_calls == ["重写后的查询"]
-    assert build_prompt_kwargs["recall_response"] is recall_result
-    assert llm_service_module.RECALL_MEMORY_TOOL in generate_with_tools_kwargs["tools"]
-    assert (
-        llm_service_module.RECORD_FAVORABILITY_DELTA_TOOL
-        in generate_with_tools_kwargs["tools"]
-    )
-    assert generate_with_tools_kwargs["recall_session"] is memory.sessions[0]
-    assert generate_with_tools_kwargs["group_id"] == "group-1"
-    assert generate_with_tools_kwargs["caller_group_id"] == "group-1"
-    assert generate_with_tools_kwargs["caller_is_superuser"] is False
-    assert generate_with_tools_kwargs["tools"] is not None
-    assert "max_tool_rounds" not in generate_with_tools_kwargs, (
-        "普通入口不得传递入口专属轮次封顶（TSK-192）"
-    )
-    injected_favorability = cast("SimpleNamespace", build_prompt_kwargs["favorability"])
-    assert injected_favorability.favorability == 0
-    assert generate_with_tools_kwargs["max_favorability_delta"] == 5
     assert redis.pushed_global_interactions == []
-
-    assert redis.pushed_global_interactions == []
-
 
 def test_message_handler_has_no_direct_side_effect_path() -> None:
     """消息生成器不拥有回复履约编排或其存储 adapter。"""
@@ -613,18 +581,7 @@ def _wire_reaction_sent_case(
     handler.redis = redis
     handler.hindsight_memory = memory
     handler._reaction_tasks = set()
-    handler.query_rewrite = _FakeQueryRewrite()
-
-    async def _fake_build_prompt(**_kwargs: object) -> list[dict[str, object]]:
-        return [{"role": "user", "content": "test"}]
-
-    async def _fake_generate(**_kwargs: object) -> object:
-        return llm_service_module.ReplyResult(
-            content="生成成功",
-            favorability_delta=1,
-            favorability_reason="测试",
-            hindsight_target_fingerprint="a" * 64,
-        )
+    handler.dsh_chat = _FakeDshChat()
 
     _patch_both_configs(
         monkeypatch,
@@ -643,24 +600,6 @@ def _wire_reaction_sent_case(
             error_notify_enabled=False,
         ),
     )
-    monkeypatch.setattr(
-        message_handler_module,
-        "komari_search_plugin",
-        SimpleNamespace(
-            is_search_available=lambda **_kwargs: False,
-            is_fetch_available=lambda **_kwargs: False,
-        ),
-    )
-    monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
-    monkeypatch.setattr(
-        message_handler_module, "generate_reply_with_tools", _fake_generate
-    )
-    monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
-
-    monkeypatch.setattr(
-        message_handler_module, "user_data_plugin", _FakeUserDataForDebug()
-    )
-
     message = MessageSchema(
         user_id="user-1",
         user_nickname="测试用户",
@@ -1039,57 +978,28 @@ class _FakeProactiveReservation:
         return lease
 
 
-class _FakeUserDataForDebug:
-    """记录 adjust 调用，验证 debug 路径不调 adjust。"""
-
-    def __init__(self) -> None:
-        self.adjust_calls: list[dict[str, object]] = []
-        self.favorability_calls: list[str] = []
-
-    def get_config(self) -> SimpleNamespace:
-        return SimpleNamespace(max_favorability_delta_per_reply=5)
-
-    async def get_user_favorability(self, user_id: str) -> SimpleNamespace:
-        self.favorability_calls.append(user_id)
-        return SimpleNamespace(
-            user_id=user_id,
-            favorability=0,
-            stage_index=1,
-            stage_name="疏离戒备",
-            stage_prompt="保持距离",
-            updated_at="2026-01-01T00:00:00+00:00",
-        )
-
-    async def adjust_user_favorability(
-        self, user_id: str, delta: int
-    ) -> SimpleNamespace:
-        self.adjust_calls.append({"user_id": user_id, "delta": delta})
-        return SimpleNamespace(
-            user_id=user_id, before=0, delta=delta, after=delta, stage_index=1
-        )
-
-
 def test_generate_debug_reply_skips_all_side_effects(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """验证 debug reply 路径不触发 Redis push、好感度 adjust、互动写入、冷却/频控。"""
     redis = _FakeRedisForDebug()
     memory = FakeHindsightMemory()
-    fake_user_data = _FakeUserDataForDebug()
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
     )
     handler.redis = redis
     handler.hindsight_memory = memory
-    handler.query_rewrite = _FakeQueryRewrite()
-    monkeypatch.setattr(message_handler_module, "user_data_plugin", fake_user_data)
+    handler.dsh_chat = _FakeDshChat(
+        content="debug测试回复",
+        delta=1,
+        reason="debug测试",
+    )
+
+    async def _forbidden_adjust(*_args: object, **_kwargs: object) -> object:
+        raise _DebugFavorabilityWriteError
+
     monkeypatch.setattr(
-        message_handler_module,
-        "komari_search_plugin",
-        SimpleNamespace(
-            is_search_available=lambda **_kwargs: False,
-            is_fetch_available=lambda **_kwargs: False,
-        ),
+        user_data_module, "adjust_user_favorability", _forbidden_adjust
     )
 
     # 注入必要的全局配置
@@ -1105,24 +1015,6 @@ def test_generate_debug_reply_skips_all_side_effects(
             image_understanding_mode="native",
         ),
     )
-
-    # 注入 fake build_prompt 和 generate_reply_with_tools
-    async def _fake_build_prompt(**_kwargs: object) -> list[dict[str, object]]:
-        return [{"role": "user", "content": "test"}]
-
-    async def _fake_generate(**_kwargs: object) -> object:
-        return llm_service_module.ReplyResult(
-            content="debug测试回复",
-            favorability_delta=1,
-            favorability_reason="debug测试",
-            hindsight_target_fingerprint="a" * 64,
-        )
-
-    monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
-    monkeypatch.setattr(
-        message_handler_module, "generate_reply_with_tools", _fake_generate
-    )
-    monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
 
     result = asyncio.run(
         handler.generate_debug_reply(
@@ -1140,8 +1032,9 @@ def test_generate_debug_reply_skips_all_side_effects(
     assert result.favorability_delta == 1
     assert result.favorability_reason == "debug测试"
     assert not hasattr(result, "interaction_history")
-    assert result.collector is not None
-    assert result.collector.request_id.startswith("debug-reply-")
+    assert not hasattr(result, "collector")
+    assert result.request_id.startswith("debug-reply-")
+    assert result.image_failure_summary is None
     assert result.reply_to_message_id is None
 
     # 断言零副作用
@@ -1149,14 +1042,89 @@ def test_generate_debug_reply_skips_all_side_effects(
     assert redis.pushed_global_interactions == []  # 没有写互动历史
     # debug 路径不触达预占 module（冷却/频控零副作用）：本测试未布线
     # proactive_reservation，任何预占触达都会以 AttributeError 红灯
-    assert fake_user_data.adjust_calls == []  # 没有调好感度 adjust
-    assert memory.recall_calls == ["重写后的查询"]  # debug 允许召回读取
+    assert memory.recall_calls == []  # fake service owns recall in this seam test
 
 
-def test_generate_debug_reply_collector_has_query_rewrite_trace(
+
+def test_generate_debug_reply_projects_partial_image_summary_without_effects(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """验证 debug reply 的 collector 包含查询重写和生成阶段的 trace。"""
+    """Successful debug keeps only the safe summary and performs no effect."""
+    redis = _FakeRedisForDebug()
+    memory = FakeHindsightMemory()
+    summary = ImageFailureSummary(
+        mode="native",
+        all_images_unavailable=False,
+        total_images=2,
+        attempted_images=2,
+        failed_images=1,
+        error_types=("image_unavailable",),
+        stages=("download",),
+    )
+    handler = message_handler_module.MessageHandler.__new__(
+        message_handler_module.MessageHandler
+    )
+    handler.redis = redis
+    handler.hindsight_memory = memory
+    handler.dsh_chat = _FakeDshChat(
+        content="debug附图回复",
+        delta=0,
+        reason="无变化",
+        image_failure_summary=summary,
+    )
+    _patch_both_configs(monkeypatch, lambda: _chat_memory_stub())
+
+    async def _forbidden_adjust(*_args: object, **_kwargs: object) -> object:
+        raise _DebugFavorabilityWriteError
+
+    monkeypatch.setattr(
+        user_data_module, "adjust_user_favorability", _forbidden_adjust
+    )
+
+    def _forbidden_notifier(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("debug must not construct the notifier")  # noqa: TRY003
+
+    monkeypatch.setattr(
+        message_handler_module, "GroupTaskFailureNotifier", _forbidden_notifier
+    )
+
+    async def _forbidden_notify(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("debug must not notify")  # noqa: TRY003
+
+    monkeypatch.setattr(handler, "_notify_image_failure_summary", _forbidden_notify)
+
+    async def _forbidden_summary_adjust(
+        *_args: object, **_kwargs: object
+    ) -> object:
+        raise _DebugFavorabilityWriteError
+
+    monkeypatch.setattr(
+        user_data_module, "adjust_user_favorability", _forbidden_summary_adjust
+    )
+
+    result = asyncio.run(
+        handler.generate_debug_reply(
+            group_id="debug-group-summary",
+            user_id="user-debug-summary",
+            user_nickname="图片用户",
+            content="debug 成功摘要",
+        )
+    )
+
+    assert result.reply == "debug附图回复"
+    assert result.image_failure_summary is summary
+    rendered = dataclasses.asdict(summary)
+    assert "image_unavailable" in str(rendered)
+    assert "http" not in str(rendered)
+    assert "base64" not in str(rendered)
+    assert redis.pushed_messages == []
+    assert redis.pushed_global_interactions == []
+    assert memory.retain_calls == []
+
+def test_generate_debug_reply_uses_explicit_request_trace_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TSK-200/TSK-203: the command trace ID reaches the same DSH service."""
     redis = _FakeRedisForDebug()
     memory = FakeHindsightMemory()
     handler = message_handler_module.MessageHandler.__new__(
@@ -1164,81 +1132,38 @@ def test_generate_debug_reply_collector_has_query_rewrite_trace(
     )
     handler.redis = redis
     handler.hindsight_memory = memory
-    handler.query_rewrite = _FakeQueryRewrite()
-    monkeypatch.setattr(
-        message_handler_module, "user_data_plugin", _FakeUserDataForDebug()
-    )
-    monkeypatch.setattr(
-        message_handler_module,
-        "komari_search_plugin",
-        SimpleNamespace(
-            is_search_available=lambda **_kwargs: False,
-            is_fetch_available=lambda **_kwargs: False,
-        ),
-    )
-    _patch_both_configs(
-        monkeypatch,
-        lambda: _chat_memory_stub(
-            summary_max_buffer_size=500,
-            memory_search_limit=3,
-            bot_nickname="小鞠",
-            memory_agent_lock_timeout_seconds=5,
-            global_interaction_enabled=True,
-            global_interaction_trigger_size=20,
-            image_understanding_mode="native",
-        ),
-    )
+    service = _FakeDshChat(content="带trace的回复", delta=2, reason="trace测试")
+    handler.dsh_chat = service
+    _patch_both_configs(monkeypatch, lambda: _chat_memory_stub())
 
-    async def _fake_build_prompt(**_kwargs: object) -> list[dict[str, object]]:
-        return [{"role": "user", "content": "test"}]
-
-    collector_from_generate: object = None
-    trace_id_from_generate: str | None = None
-
-    async def _fake_generate_with_tools(**kwargs: object) -> object:
-        nonlocal collector_from_generate, trace_id_from_generate
-        collector_from_generate = kwargs.get("collector")
-        trace_id_from_generate = cast("str | None", kwargs.get("request_trace_id"))
-        assert "max_tool_rounds" not in kwargs, (
-            "debug 入口不得传递入口专属轮次封顶（TSK-192）"
-        )
-        return llm_service_module.ReplyResult(
-            content="带trace的回复",
-            favorability_delta=2,
-            favorability_reason="trace测试",
-            hindsight_target_fingerprint="a" * 64,
-        )
-
-    monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
-    monkeypatch.setattr(
-        message_handler_module, "generate_reply_with_tools", _fake_generate_with_tools
-    )
-    monkeypatch.setattr(
-        message_handler_module, "generate_reply", _fake_generate_with_tools
-    )
-
-    supplied_collector = LLMDiagnosticCollector(request_id="debug-reply-supplied")
     result = asyncio.run(
         handler.generate_debug_reply(
             group_id="debug-group-2",
             user_id="user-trace",
             user_nickname="trace用户",
             content="debug trace测试",
-            collector=supplied_collector,
+            request_trace_id="debug-reply-supplied",
         )
     )
 
-    assert result.collector is supplied_collector
-    assert result.collector.request_id == "debug-reply-supplied"
-    assert collector_from_generate is result.collector
-    assert handler.query_rewrite.request_trace_id == result.collector.request_id
-    assert trace_id_from_generate == result.collector.request_id
+    assert result.request_id == "debug-reply-supplied"
+    assert service.calls[0]["request_trace_id"] == "debug-reply-supplied"
+    assert result.reply == "带trace的回复"
+
+class _DebugImageService:
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+        self.calls: list[dict[str, object]] = []
+
+    async def generate(self, **kwargs: object) -> object:
+        self.calls.append(dict(kwargs))
+        raise self.error
 
 
-def test_generate_debug_reply_with_images_and_reply_context(
+def _debug_handler_with_service(
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """验证 debug reply 附带引用消息和图片时仍正确工作且无副作用。"""
+    service: _DebugImageService,
+) -> Any:
     redis = _FakeRedisForDebug()
     memory = FakeHindsightMemory()
     handler = message_handler_module.MessageHandler.__new__(
@@ -1246,66 +1171,27 @@ def test_generate_debug_reply_with_images_and_reply_context(
     )
     handler.redis = redis
     handler.hindsight_memory = memory
-    handler.query_rewrite = _FakeQueryRewrite()
-    monkeypatch.setattr(
-        message_handler_module, "user_data_plugin", _FakeUserDataForDebug()
+    handler._reaction_tasks = set()
+    handler.dsh_chat = service
+    _patch_both_configs(monkeypatch, lambda: _chat_memory_stub())
+    return handler, redis, memory
+
+
+def test_generate_debug_reply_transport_failure_has_no_business_effects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Debug surfaces a safe transport failure without falling back or writing."""
+    redis = _FakeRedisForDebug()
+    memory = FakeHindsightMemory()
+    service = _DebugImageService(ImageTransportTaskError("invalid_image_input"))
+    handler = message_handler_module.MessageHandler.__new__(
+        message_handler_module.MessageHandler
     )
-    monkeypatch.setattr(
-        message_handler_module,
-        "komari_search_plugin",
-        SimpleNamespace(
-            is_search_available=lambda **_kwargs: False,
-            is_fetch_available=lambda **_kwargs: False,
-        ),
-    )
-    _patch_both_configs(
-        monkeypatch,
-        lambda: _chat_memory_stub(
-            summary_max_buffer_size=500,
-            memory_search_limit=3,
-            bot_nickname="小鞠",
-            memory_agent_lock_timeout_seconds=5,
-            global_interaction_enabled=True,
-            global_interaction_trigger_size=20,
-            image_understanding_mode="native",
-        ),
-    )
-
-    build_prompt_kwargs: dict[str, object] = {}
-
-    async def _fake_build_prompt(**_kwargs: object) -> list[dict[str, object]]:
-        build_prompt_kwargs.update(_kwargs)
-        return [{"role": "user", "content": "test"}]
-
-    async def _fake_generate(**_kwargs: object) -> object:
-        return llm_service_module.ReplyResult(
-            content="附图debug回复",
-            favorability_delta=0,
-            favorability_reason="无变化",
-            hindsight_target_fingerprint="a" * 64,
-        )
-
-    monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
-    monkeypatch.setattr(
-        message_handler_module, "generate_reply_with_tools", _fake_generate
-    )
-    monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
-    download_batches: list[list[str]] = []
-
-    async def _download_images(
-        urls: list[str],
-        _policy: object,
-    ) -> list[str | None]:
-        download_batches.append(urls)
-        return [f"base64:{url}" for url in urls]
-
-    monkeypatch.setattr(
-        message_handler_module,
-        "download_images_as_base64_aligned",
-        _download_images,
-    )
-
-    from komari_bot.plugins.komari_chat.services.reply_context import ReplyContext
+    handler.redis = redis
+    handler.hindsight_memory = memory
+    handler._reaction_tasks = set()
+    handler.dsh_chat = service
+    _patch_both_configs(monkeypatch, lambda: _chat_memory_stub())
 
     reply_ctx = ReplyContext(
         source_side="user",
@@ -1318,111 +1204,43 @@ def test_generate_debug_reply_with_images_and_reply_context(
         has_visible_image=True,
     )
 
-    result = asyncio.run(
-        handler.generate_debug_reply(
-            group_id="debug-group-3",
-            user_id="user-img",
-            user_nickname="图片用户",
-            content="看看这张图是什么意思",
-            image_urls=["https://example.com/img.png"],
-            reply_context=reply_ctx,
+    with pytest.raises(ImageTransportTaskError) as exc_info:
+        asyncio.run(
+            handler.generate_debug_reply(
+                group_id="debug-group-3",
+                user_id="user-img",
+                user_nickname="图片用户",
+                content="看看这张图是什么意思",
+                image_urls=["https://example.com/img.png"],
+                reply_context=reply_ctx,
+            )
         )
-    )
 
-    assert result.reply == "附图debug回复"
-    assert result.collector is not None
+    assert exc_info.value.code == "invalid_image_input"
+    assert "example.com" not in str(exc_info.value)
+    assert memory.open_calls == 1
     assert redis.pushed_messages == []
     assert redis.pushed_global_interactions == []
-    assert download_batches == [
-        ["https://example.com/ref.png", "https://example.com/img.png"]
-    ]
-    assert build_prompt_kwargs.get("reply_context") is reply_ctx
-    assert build_prompt_kwargs.get("reply_image_urls") == [
-        "base64:https://example.com/ref.png"
-    ]
-    assert build_prompt_kwargs.get("image_urls") == [
-        "base64:https://example.com/img.png"
-    ]
+    assert service.calls and service.calls[0]["image_urls"] == ["https://example.com/img.png"]
 
 
-def test_generate_debug_reply_with_image_failure_summary_never_notifies(
+def test_generate_debug_reply_image_failure_never_notifies_or_returns_summary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """TSK-196 复审：debug 干跑在 core 返回带 partial image_failure_summary
-    时，只把安全结果保留在 collector/output，绝不调用通知边界或发送任何
-    群/私聊消息（不依赖“代码没走 process_message”的注释来保证）。"""
-    redis = _FakeRedisForDebug()
-    memory = FakeHindsightMemory()
-    handler = message_handler_module.MessageHandler.__new__(
-        message_handler_module.MessageHandler
-    )
-    handler.redis = redis
-    handler.hindsight_memory = memory
-    handler.query_rewrite = _FakeQueryRewrite()
-    monkeypatch.setattr(
-        message_handler_module, "user_data_plugin", _FakeUserDataForDebug()
-    )
-    monkeypatch.setattr(
-        message_handler_module,
-        "komari_search_plugin",
-        SimpleNamespace(
-            is_search_available=lambda **_kwargs: False,
-            is_fetch_available=lambda **_kwargs: False,
-        ),
-    )
-    _patch_both_configs(
-        monkeypatch,
-        lambda: _chat_memory_stub(
-            summary_max_buffer_size=500,
-            memory_search_limit=3,
-            bot_nickname="小鞠",
-            memory_agent_lock_timeout_seconds=5,
-            global_interaction_enabled=True,
-            global_interaction_trigger_size=20,
-            image_understanding_mode="native",
-        ),
-    )
-
-    async def _fake_build_prompt(**_kwargs: object) -> list[dict[str, object]]:
-        return [{"role": "user", "content": "test"}]
-
-    summary = image_reading_session_module.ImageFailureSummary(
-        mode="native",
-        all_images_unavailable=False,
-        total_images=2,
-        attempted_images=2,
-        failed_images=1,
-        error_types=("image_unavailable",),
-        stages=("download",),
-    )
-
-    async def _fake_generate(**_kwargs: object) -> object:
-        return llm_service_module.ReplyResult(
-            content="debug附图回复",
-            favorability_delta=0,
-            favorability_reason="无变化",
-            image_failure_summary=summary,
-            hindsight_target_fingerprint="a" * 64,
+    """Debug image failures never construct a notifier or return a partial result."""
+    error = ImageUnderstandingFailureError(
+        ImageFailureSummary(
+            mode="native",
+            all_images_unavailable=True,
+            total_images=2,
+            attempted_images=2,
+            failed_images=2,
+            error_types=("image_unavailable",),
+            stages=("download",),
         )
-
-    monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
-    monkeypatch.setattr(
-        message_handler_module, "generate_reply_with_tools", _fake_generate
     )
-    monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
-
-    async def _download_images(
-        urls: list[str],
-        _policy: object,
-    ) -> list[str | None]:
-        del urls
-        return [None, "base64:https://example.com/ok.png"]
-
-    monkeypatch.setattr(
-        message_handler_module,
-        "download_images_as_base64_aligned",
-        _download_images,
-    )
+    service = _DebugImageService(error)
+    handler, redis, _memory = _debug_handler_with_service(monkeypatch, service)
 
     class _RecordingBot:
         def __init__(self) -> None:
@@ -1449,29 +1267,22 @@ def test_generate_debug_reply_with_image_failure_summary_never_notifies(
 
     monkeypatch.setattr(handler, "_notify_image_failure_summary", _forbidden_notify)
 
-    result = asyncio.run(
-        handler.generate_debug_reply(
-            group_id="debug-group-img-fail",
-            user_id="user-debug-img",
-            user_nickname="图片用户",
-            content="看图",
-            image_urls=["https://example.com/a.png", "https://example.com/b.png"],
-            reply_context=None,
-            _bot=bot,  # type: ignore[arg-type]
+    with pytest.raises(ImageUnderstandingFailureError):
+        asyncio.run(
+            handler.generate_debug_reply(
+                group_id="debug-group-img-fail",
+                user_id="user-debug-img",
+                user_nickname="图片用户",
+                content="看图",
+                image_urls=["https://example.com/a.png", "https://example.com/b.png"],
+                reply_context=None,
+                _bot=bot,  # type: ignore[arg-type]
+            )
         )
-    )
 
-    assert result.reply == "debug附图回复"
-    # 零通知：不构造 notifier、不调汇总、bot 零群/私聊调用
     assert bot.calls == []
-    # 安全结果保留在 collector/output：output 投影含 mode=native 摘要且无 URL
-    record = result.collector.build_record()
-    rendered = json.dumps(record, ensure_ascii=False, default=str)
-    assert "native" in rendered
-    assert "image_unavailable" in rendered
-    assert "example.com" not in rendered
-    assert "base64" not in rendered
-
+    assert service.calls
+    assert redis.pushed_messages == []
 
 def test_normal_attempt_reply_defers_side_effects_until_delivery(
     monkeypatch: pytest.MonkeyPatch,
@@ -1487,53 +1298,13 @@ def test_normal_attempt_reply_defers_side_effects_until_delivery(
     )
     redis = _FakeRedisForDebug()
     memory = FakeHindsightMemory()
-    fake_user_data = _FakeUserDataForDebug()
     handler = message_handler_module.MessageHandler.__new__(
         message_handler_module.MessageHandler
     )
     handler.redis = redis
     handler.hindsight_memory = memory
-    handler.query_rewrite = _FakeQueryRewrite()
-    monkeypatch.setattr(message_handler_module, "user_data_plugin", fake_user_data)
-    monkeypatch.setattr(
-        message_handler_module,
-        "komari_search_plugin",
-        SimpleNamespace(
-            is_search_available=lambda **_kwargs: False,
-            is_fetch_available=lambda **_kwargs: False,
-        ),
-    )
-    _patch_both_configs(
-        monkeypatch,
-        lambda: _chat_memory_stub(
-            proactive_enabled=False,
-            context_messages_limit=10,
-            summary_max_buffer_size=500,
-            memory_search_limit=3,
-            bot_nickname="小鞠",
-            memory_agent_lock_timeout_seconds=5,
-            global_interaction_enabled=True,
-            global_interaction_trigger_size=20,
-            image_understanding_mode="native",
-        ),
-    )
-
-    async def _fake_build_prompt(**_kwargs: object) -> list[dict[str, object]]:
-        return [{"role": "user", "content": "test"}]
-
-    async def _fake_generate(**_kwargs: object) -> object:
-        return llm_service_module.ReplyResult(
-            content="正常回复",
-            favorability_delta=1,
-            favorability_reason="正常互动",
-            hindsight_target_fingerprint="a" * 64,
-        )
-
-    monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
-    monkeypatch.setattr(
-        message_handler_module, "generate_reply_with_tools", _fake_generate
-    )
-    monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
+    handler.dsh_chat = _FakeDshChat(content="正常回复", delta=1, reason="正常互动")
+    _patch_both_configs(monkeypatch, lambda: _chat_memory_stub())
 
     result = asyncio.run(
         handler._attempt_reply(
@@ -1560,12 +1331,7 @@ def test_normal_attempt_reply_defers_side_effects_until_delivery(
 
     # 当前用户消息属于输入缓冲，不是回复副作用；其余写入必须等待送达确认
     assert len(redis.pushed_messages) == 1
-    assert fake_user_data.adjust_calls == []
     assert redis.pushed_global_interactions == []
-
-    assert fake_user_data.adjust_calls == []
-    assert redis.pushed_global_interactions == []
-
 
 def test_proactive_attempt_returns_pending_reply_carrying_handoff(
     monkeypatch: pytest.MonkeyPatch,
@@ -1587,7 +1353,7 @@ def test_proactive_attempt_returns_pending_reply_carrying_handoff(
         return [], True
 
     async def _fake_generate_core(**_kwargs: object) -> object:
-        return llm_service_module.ReplyResult(
+        return import_module("komari_bot.plugins.komari_chat.services.chat_result").ReplyResult(
             content="主动回复",
             favorability_delta=0,
             favorability_reason="主动关心",
@@ -1793,7 +1559,7 @@ def test_generate_debug_reply_refetches_quoted_image_without_url(
 
     async def _fake_generate_core(**kwargs: object) -> object:
         captured.update(kwargs)
-        return llm_service_module.ReplyResult(
+        return import_module("komari_bot.plugins.komari_chat.services.chat_result").ReplyResult(
             content="已读取引用图片",
             favorability_delta=0,
             favorability_reason="无变化",
@@ -1865,6 +1631,7 @@ def test_reaction_scheduled_before_generate_core(
     )
     handler.redis = redis
     handler.hindsight_memory = memory
+    handler.dsh_chat = _FakeDshChat(content="带表情的回复", delta=1, reason="表情互动")
     handler._reaction_tasks = set()
     handler.query_rewrite = _FakeQueryRewrite()
 
@@ -1885,20 +1652,12 @@ def test_reaction_scheduled_before_generate_core(
             error_notify_enabled=False,
         ),
     )
-    monkeypatch.setattr(
-        message_handler_module,
-        "komari_search_plugin",
-        SimpleNamespace(
-            is_search_available=lambda **_kwargs: False,
-            is_fetch_available=lambda **_kwargs: False,
-        ),
-    )
 
     async def _fake_build_prompt(**_kwargs: object) -> list[dict[str, object]]:
         return [{"role": "user", "content": "test"}]
 
     async def _fake_generate(**_kwargs: object) -> object:
-        return llm_service_module.ReplyResult(
+        return import_module("komari_bot.plugins.komari_chat.services.chat_result").ReplyResult(
             content="带表情的回复",
             favorability_delta=1,
             favorability_reason="表情互动",
@@ -1909,15 +1668,7 @@ def test_reaction_scheduled_before_generate_core(
         nonlocal reaction_called
         reaction_called = True
 
-    monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
-    monkeypatch.setattr(
-        message_handler_module, "generate_reply_with_tools", _fake_generate
-    )
-    monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
 
-    monkeypatch.setattr(
-        message_handler_module, "user_data_plugin", _FakeUserDataForDebug()
-    )
 
     current_message = MessageSchema(
         user_id="user-reaction",
@@ -1965,6 +1716,7 @@ def test_reaction_not_scheduled_when_disabled(
     )
     handler.redis = redis
     handler.hindsight_memory = memory
+    handler.dsh_chat = _FakeDshChat(content="无表情回复", delta=1, reason="测试")
     handler.query_rewrite = _FakeQueryRewrite()
 
     _patch_both_configs(
@@ -1984,20 +1736,12 @@ def test_reaction_not_scheduled_when_disabled(
             error_notify_enabled=False,
         ),
     )
-    monkeypatch.setattr(
-        message_handler_module,
-        "komari_search_plugin",
-        SimpleNamespace(
-            is_search_available=lambda **_kwargs: False,
-            is_fetch_available=lambda **_kwargs: False,
-        ),
-    )
 
     async def _fake_build_prompt(**_kwargs: object) -> list[dict[str, object]]:
         return [{"role": "user", "content": "test"}]
 
     async def _fake_generate(**_kwargs: object) -> object:
-        return llm_service_module.ReplyResult(
+        return import_module("komari_bot.plugins.komari_chat.services.chat_result").ReplyResult(
             content="无表情回复",
             favorability_delta=1,
             favorability_reason="测试",
@@ -2008,15 +1752,7 @@ def test_reaction_not_scheduled_when_disabled(
         nonlocal reaction_called
         reaction_called = True
 
-    monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
-    monkeypatch.setattr(
-        message_handler_module, "generate_reply_with_tools", _fake_generate
-    )
-    monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
 
-    monkeypatch.setattr(
-        message_handler_module, "user_data_plugin", _FakeUserDataForDebug()
-    )
 
     current_message = MessageSchema(
         user_id="user-no-reaction",
@@ -2062,6 +1798,7 @@ def test_reaction_sent_then_empty_reply_returns_failure_with_reaction_sent_true(
     )
     handler.redis = redis
     handler.hindsight_memory = memory
+    handler.dsh_chat = _FakeDshChat(content="", delta=1, reason="测试")
     handler._reaction_tasks = set()
     handler.query_rewrite = _FakeQueryRewrite()
 
@@ -2082,35 +1819,19 @@ def test_reaction_sent_then_empty_reply_returns_failure_with_reaction_sent_true(
             error_notify_enabled=False,
         ),
     )
-    monkeypatch.setattr(
-        message_handler_module,
-        "komari_search_plugin",
-        SimpleNamespace(
-            is_search_available=lambda **_kwargs: False,
-            is_fetch_available=lambda **_kwargs: False,
-        ),
-    )
 
     async def _fake_build_prompt(**_kwargs: object) -> list[dict[str, object]]:
         return [{"role": "user", "content": "test"}]
 
     async def _fake_generate(**_kwargs: object) -> object:
-        return llm_service_module.ReplyResult(
+        return import_module("komari_bot.plugins.komari_chat.services.chat_result").ReplyResult(
             content="",  # 空回复
             favorability_delta=1,
             favorability_reason="测试",
             hindsight_target_fingerprint="a" * 64,
         )
 
-    monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
-    monkeypatch.setattr(
-        message_handler_module, "generate_reply_with_tools", _fake_generate
-    )
-    monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
 
-    monkeypatch.setattr(
-        message_handler_module, "user_data_plugin", _FakeUserDataForDebug()
-    )
 
     current_message = MessageSchema(
         user_id="user-empty",
@@ -2158,6 +1879,7 @@ def test_reaction_sent_then_delta_missing_returns_failure_with_reaction_sent_tru
     )
     handler.redis = redis
     handler.hindsight_memory = memory
+    handler.dsh_chat = _FakeDshChat(content="有回复但无delta", delta=None, reason=None)
     handler._reaction_tasks = set()
     handler.query_rewrite = _FakeQueryRewrite()
 
@@ -2178,35 +1900,19 @@ def test_reaction_sent_then_delta_missing_returns_failure_with_reaction_sent_tru
             error_notify_enabled=False,
         ),
     )
-    monkeypatch.setattr(
-        message_handler_module,
-        "komari_search_plugin",
-        SimpleNamespace(
-            is_search_available=lambda **_kwargs: False,
-            is_fetch_available=lambda **_kwargs: False,
-        ),
-    )
 
     async def _fake_build_prompt(**_kwargs: object) -> list[dict[str, object]]:
         return [{"role": "user", "content": "test"}]
 
     async def _fake_generate(**_kwargs: object) -> object:
-        return llm_service_module.ReplyResult(
+        return import_module("komari_bot.plugins.komari_chat.services.chat_result").ReplyResult(
             content="有回复但无delta",
             favorability_delta=None,  # 缺失
             favorability_reason=None,
             hindsight_target_fingerprint="a" * 64,
         )
 
-    monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
-    monkeypatch.setattr(
-        message_handler_module, "generate_reply_with_tools", _fake_generate
-    )
-    monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
 
-    monkeypatch.setattr(
-        message_handler_module, "user_data_plugin", _FakeUserDataForDebug()
-    )
 
     current_message = MessageSchema(
         user_id="user-delta",
@@ -2428,7 +2134,7 @@ def test_proactive_handoff_lost_returns_generate_failure_with_reaction_sent_true
         return [], True
 
     async def _fake_generate_core(**_kwargs: object) -> object:
-        return llm_service_module.ReplyResult(
+        return import_module("komari_bot.plugins.komari_chat.services.chat_result").ReplyResult(
             content="生成成功但租约已丢",
             favorability_delta=1,
             favorability_reason="测试",
@@ -2509,18 +2215,8 @@ def test_pending_reply_does_not_retain_reaction_callback(
     )
     handler.redis = redis
     handler.hindsight_memory = memory
+    handler.dsh_chat = _FakeDshChat(content="送达测试", delta=1, reason="测试")
     handler.query_rewrite = _FakeQueryRewrite()
-    monkeypatch.setattr(
-        message_handler_module, "user_data_plugin", _FakeUserDataForDebug()
-    )
-    monkeypatch.setattr(
-        message_handler_module,
-        "komari_search_plugin",
-        SimpleNamespace(
-            is_search_available=lambda **_kwargs: False,
-            is_fetch_available=lambda **_kwargs: False,
-        ),
-    )
 
     _patch_both_configs(
         monkeypatch,
@@ -2542,18 +2238,13 @@ def test_pending_reply_does_not_retain_reaction_callback(
         return [{"role": "user", "content": "test"}]
 
     async def _fake_generate(**_kwargs: object) -> object:
-        return llm_service_module.ReplyResult(
+        return import_module("komari_bot.plugins.komari_chat.services.chat_result").ReplyResult(
             content="送达测试",
             favorability_delta=1,
             favorability_reason="测试",
             hindsight_target_fingerprint="a" * 64,
         )
 
-    monkeypatch.setattr(message_handler_module, "build_prompt", _fake_build_prompt)
-    monkeypatch.setattr(
-        message_handler_module, "generate_reply_with_tools", _fake_generate
-    )
-    monkeypatch.setattr(message_handler_module, "generate_reply", _fake_generate)
 
     current_message = MessageSchema(
         user_id="user-commit",

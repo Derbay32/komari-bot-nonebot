@@ -917,3 +917,58 @@ async def test_out_of_range_summary_is_rejected_only_after_successful_claim(
     assert "execute" not in calls
     assert calls[-1] == "finish"
     assert str(sent[0]) == summary_module.OUT_OF_RANGE_MESSAGE
+
+
+@pytest.mark.asyncio
+async def test_incomplete_history_keeps_the_existing_dedicated_notice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HistoryIncompleteError must still reach the ordinary dedicated notice."""
+    import komari_bot.plugins.group_history_summary as summary_module
+    from komari_bot.plugins.group_history_summary.history_service import (
+        HistoryFetchMetadata,
+        HistoryIncompleteError,
+    )
+
+    calls: list[str] = []
+    _install_config(summary_module, monkeypatch)
+    _install_permission(summary_module, monkeypatch, allowed=True, calls=calls)
+    monkeypatch.setattr(
+        summary_module,
+        "check_group_history_supported",
+        _tracked_async_result(calls, "capability", result=True),
+    )
+    _install_dispatch(summary_module, monkeypatch, calls)
+    metadata = HistoryFetchMetadata(
+        status="partial",
+        requested_count=50,
+        retrieved_item_count=10,
+        missing_count=40,
+        completed_batches=1,
+        failed_batch=2,
+        failure_code="history_api_error",
+    )
+
+    async def _incomplete(**_kwargs: object) -> object:
+        raise HistoryIncompleteError(metadata)
+
+    monkeypatch.setattr(summary_module, "execute_group_summary", _incomplete)
+    sent: list[object] = []
+
+    async def _finish(message: object = None, **_kwargs: object) -> None:
+        sent.append(message)
+        from nonebot.exception import FinishedException
+
+        raise FinishedException
+
+    monkeypatch.setattr(summary_module.summary_matcher, "finish", _finish)
+    matcher = _Matcher()
+
+    from nonebot.exception import FinishedException
+
+    with pytest.raises(FinishedException):
+        await _handle(summary_module, matcher, _Bot(), _Event("总结一下今天聊了什么"))
+
+    assert matcher.block is True
+    assert len(sent) == 1
+    assert str(sent[0]) == "群历史记录没能完整取回，暂时不能可靠地总结……"

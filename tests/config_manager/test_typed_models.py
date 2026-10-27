@@ -14,7 +14,6 @@ if TYPE_CHECKING:
     from komari_bot.config.typed_config import TypedConfigModel
 
 CONFIG_SCHEMA_MODULES = (
-    "komari_bot.plugins.agent_run_logger.config_schema",
     "komari_bot.plugins.embedding_provider.config_schema",
     "komari_bot.plugins.group_history_summary.config_schema",
     "komari_bot.plugins.komari_context.config_schema",
@@ -26,7 +25,6 @@ CONFIG_SCHEMA_MODULES = (
     "komari_bot.plugins.komari_memory.config_schema",
     "komari_bot.plugins.komari_search.config_schema",
     "komari_bot.plugins.komari_sentry.config_schema",
-    "komari_bot.plugins.llm_provider.config_schema",
     "komari_bot.plugins.sr.config_schema",
     "komari_bot.plugins.user_data.config_schema",
 )
@@ -49,7 +47,7 @@ def _config_models() -> list[type[TypedConfigModel]]:
                     getattr(
                         module,
                         "KomariContextConfigSchema",
-                        getattr(module, "AgentRunLoggerConfigSchema", None),
+                        None,
                     ),
                 ),
             ),
@@ -63,7 +61,8 @@ def _config_models() -> list[type[TypedConfigModel]]:
 def test_every_dynamic_config_is_a_distinct_typed_table() -> None:
     models = _config_models()
 
-    assert len(models) == 15
+    # TSK-200 起 agent_run_logger 配置模型随插件退役（15 → 14）。
+    assert len(models) == 13
     assert all(issubclass(model, SQLModel) for model in models)
     assert all(hasattr(model, "__table__") for model in models)
     table_names = {model.__table__.name for model in models}
@@ -82,20 +81,16 @@ def test_storage_metadata_is_hidden_and_legacy_metadata_is_removed() -> None:
 
 def test_table_constructor_keeps_pydantic_validation() -> None:
     schema = import_module(
-        "komari_bot.plugins.llm_provider.config_schema"
+        "komari_bot.plugins.group_history_summary.config_schema"
     ).DynamicConfigSchema
 
     with pytest.raises(ValidationError):
-        schema(chat_rpm_limit=0)
+        schema(summary_planning_round_limit=0)
 
 
 def test_extensible_config_fields_use_jsonb_columns() -> None:
-    llm_schema = import_module(
-        "komari_bot.plugins.llm_provider.config_schema"
-    ).DynamicConfigSchema
     summary_schema = import_module(
         "komari_bot.plugins.group_history_summary.config_schema"
     ).DynamicConfigSchema
 
-    assert isinstance(llm_schema.__table__.c.extra_params.type, JSONB)
     assert isinstance(summary_schema.__table__.c.layout_params.type, JSONB)

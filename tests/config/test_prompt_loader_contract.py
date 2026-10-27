@@ -18,7 +18,6 @@ Schema 派生，输入用测试自有 marker，不复制生产/seed 正文。
 
 from __future__ import annotations
 
-import importlib
 from datetime import UTC, datetime
 from typing import Any
 
@@ -34,14 +33,22 @@ from tests.config.prompt_field_contract import (
     prompt_resource_field_names,
 )
 
-_LOADER_MODULE_NAMES: dict[str, str] = {
-    "komari_chat": "komari_bot.plugins.komari_chat.services.prompt_template",
-    "group_history_summary": "komari_bot.plugins.group_history_summary.prompt_template",
-}
+_LOADERS: dict[str, Any] = {}
 
 
 def _loader_module(resource_id: str) -> Any:
-    return importlib.import_module(_LOADER_MODULE_NAMES[resource_id])
+    from types import SimpleNamespace
+
+    if resource_id not in _LOADERS:
+        loader = prompt_storage.PromptTemplateLoader(
+            resource_id=resource_id,
+            display_name=prompt_display_name(resource_id),
+            log_prefix="[Jev test]",
+        )
+        _LOADERS[resource_id] = SimpleNamespace(
+            _loader=loader, get_template=loader.get_template_async,
+        )
+    return _LOADERS[resource_id]
 
 
 def _reset_loader_cache(resource_id: str) -> None:

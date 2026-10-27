@@ -1,30 +1,8 @@
-"""TSK-182 判定 Prompt 可选初始数据 —— PostgreSQL 集成验收。
+"""可选 Jev 初始数据的真实数据库验收。
 
-依赖已执行 ``alembic upgrade head`` 的迁移管理 schema
-（``KOMARI_TEST_POSTGRES_URL`` 门控，且与 ``SQLALCHEMY_DATABASE_URL``
-同库，否则按既有约定 skip）。
-
-隔离纪律：用例在门控 DSN 派生的一次性隔离库（库名后缀
-``_tsk182_decision_seed*``）内执行，用例结束即 DROP；共享门控库的版本与
-数据不受影响。用例之间各自重建唯一的隔离库，重复运行与并行安全。
-
-覆盖清单（对应 TSK-182 可选资源切片）：
-- 全新数据库 upgrade head（0031）后运行真实播种命令：两个必需 Prompt
-  资源齐全，另加可选判定 Prompt 单行（值等于打包资产）；场景初始化已
-  退役，4 张退役场景表不得存在；
-- 重复初始化：判定 Prompt 正文/revision/updated_at 不变；
-- 部分已有：非空自定义字段保留，只按共享 helper 补齐空白字段；
-- 可选资产缺失/畸形：既有自定义判定行原样保留，必需资源照常初始化；
-- 全新库 + 可选资产缺失：必需资源仍完整初始化，判定行不写入；
-- 可选写入的真实 SQL 失败（临时触发器让写入后的校验失败）：必需资源已
-  提交、可选部分回滚、命令成功退出且只输出固定安全诊断，无正文/回溯泄漏；
-- 可选租约的真实归还失败（外部注入在共享连接池边界，仅作用于观察到判定
-  Prompt 查询的那次租约，且在底层真实 acquire 上下文结束后才报错）：必需
-  初始化仍成功、诊断固定、无原始异常/正文泄漏；
-- 必需 manifest 缺 Prompt 块：按既有规则失败且不写入任何数据。
-
-期望值一律来自打包资产（必需资源经 ``tsk197_gate_support.asset_values``，
-可选资源按契约的显式 ``decision_prompt`` 键读取），不复制生产正文。
+覆盖新建、只补空字段、保留管理员文案、幂等、缺失/畸形资产、事务失败
+与提交后租约归还失败。旧聊天和总结提示词表在所有场景中保持不存在。
+失败只输出固定安全诊断，不把未确认初始化报告为成功。
 """
 
 from __future__ import annotations
@@ -41,17 +19,12 @@ import pytest
 import yaml
 
 from komari_bot.config.typed_config import ensure_typed_prompt_model
-from komari_bot.db.seed_bootstrap import DEFAULT_DECISION_SEED_FILE, DEFAULT_SEED_FILE
-from tests.config.prompt_field_contract import (
-    PROMPT_RESOURCE_IDS,
-    prompt_resource_field_names,
-)
+from komari_bot.db.seed_bootstrap import DEFAULT_DECISION_SEED_FILE
 from tests.db.tsk197_gate_support import (
     POSTGRES_URL,
     SKIP_NO_POSTGRES,
     SQLALCHEMY_URL,
     drop_scratch_database,
-    fetch_prompt_row,
     recreate_scratch_database,
     run_bootstrap,
     same_database,
@@ -73,8 +46,8 @@ SENTINEL = "TSK182-DECISION-BODY-SENTINEL-91a4"
 #: 合成“连接归还失败”异常里的哨兵：失败路径不得将它回显给用户。
 RELEASE_SENTINEL = "TSK182-RELEASE-SENTINEL-4c1d"
 
-#: 当前迁移 head（TSK-191 review rework B 后为 0031）。
-TSK182_HEAD_REVISION = "0031"
+#: 当前迁移 head（TSK-200 后为 0032）。
+TSK182_HEAD_REVISION = "0033"
 
 #: 已退役的 4 张场景表（test-owned 字面量，来自 TSK-190 manifest）。
 RETIRED_SCENE_TABLES: tuple[str, ...] = (
@@ -311,17 +284,10 @@ async def _assert_retired_tables_absent(connection: asyncpg.Connection) -> None:
     assert not retired, f"播种不得重建已退役的场景表: {sorted(retired)}"
 
 
-async def _assert_required_prompt_rows_complete(
-    connection: asyncpg.Connection,
-) -> None:
-    """两个必需 Prompt 行存在且全字段非空（可选资源不得影响其完成度）。"""
-    for resource_id in PROMPT_RESOURCE_IDS:
-        row = await fetch_prompt_row(connection, resource_id)
-        assert row is not None, f"seed 后 {resource_id} Prompt 单行必须存在"
-        for field in sorted(prompt_resource_field_names(resource_id)):
-            assert str(row[field] or "").strip(), (
-                f"{resource_id} Prompt 字段 {field} 不得为空"
-            )
+async def _assert_legacy_prompts_absent(connection: asyncpg.Connection) -> None:
+    present = await _public_tables(connection)
+    assert "komari_prompt_komari_chat" not in present
+    assert "komari_prompt_group_history_summary" not in present
 
 
 def _write_decision_seed_file(
@@ -345,22 +311,8 @@ def _sentinel_values() -> dict[str, str]:
     }
 
 
-def _remove_key(node: object, key: str) -> bool:
-    """递归删除文档中第一个指定键（不锁定 manifest 布局）。"""
-    if isinstance(node, dict):
-        mapping: dict[str, Any] = node
-        if key in mapping:
-            del mapping[key]
-            return True
-        return any(_remove_key(value, key) for value in mapping.values())
-    if isinstance(node, list):
-        items: list[Any] = node
-        return any(_remove_key(value, key) for value in items)
-    return False
-
-
 async def test_fresh_database_seeds_required_and_decision_prompt() -> None:
-    """head 新库：真实播种写入必需资源 + 可选判定单行，值等于打包资产。"""
+    """head 新库：真实播种写入可选判定单行，值等于打包资产。"""
     scratch, url = await _prepare_head_scratch("_tsk182_decision_seed_fresh")
     try:
         result = _run_seed_cli(url)
@@ -379,7 +331,7 @@ async def test_fresh_database_seeds_required_and_decision_prompt() -> None:
                 f"隔离库必须位于迁移 head {TSK182_HEAD_REVISION}，实际 {version}"
             )
 
-            await _assert_required_prompt_rows_complete(connection)
+            await _assert_legacy_prompts_absent(connection)
 
             asset = _decision_asset_values()
             schema_fields = _decision_schema_fields()
@@ -479,7 +431,7 @@ async def test_initialization_preserves_custom_field_and_fills_blank_only() -> N
 async def test_missing_or_invalid_decision_file_keeps_existing_custom_row(
     tmp_path: Path,
 ) -> None:
-    """可选资产缺失/畸形：既有非空自定义判定行原样保留，必需资源照常初始化。"""
+    """可选资产缺失/畸形：既有非空自定义判定行原样保留，旧提示词表保持不存在。"""
     scratch, url = await _prepare_head_scratch("_tsk182_decision_seed_keepcustom")
     try:
         custom_values = {
@@ -525,7 +477,7 @@ async def test_missing_or_invalid_decision_file_keeps_existing_custom_row(
                 "畸形可选资产不得改动既有自定义判定行"
             )
 
-            await _assert_required_prompt_rows_complete(connection)
+            await _assert_legacy_prompts_absent(connection)
         finally:
             await connection.close()
     finally:
@@ -535,7 +487,7 @@ async def test_missing_or_invalid_decision_file_keeps_existing_custom_row(
 async def test_missing_decision_file_on_fresh_database_still_seeds_required(
     tmp_path: Path,
 ) -> None:
-    """全新库 + 可选资产缺失：必需资源完整初始化，判定行不写入。"""
+    """全新库 + 可选资产缺失：旧提示词表保持不存在，判定行不写入。"""
     scratch, url = await _prepare_head_scratch("_tsk182_decision_seed_missing")
     try:
         missing_path = tmp_path / "absent-decision.yaml"
@@ -550,7 +502,7 @@ async def test_missing_decision_file_on_fresh_database_still_seeds_required(
 
         connection = await asyncpg.connect(**scratch)
         try:
-            await _assert_required_prompt_rows_complete(connection)
+            await _assert_legacy_prompts_absent(connection)
             await _assert_retired_tables_absent(connection)
             assert await _fetch_decision_row(connection) is None, (
                 "可选资产缺失时不得写入判定 Prompt 行"
@@ -564,10 +516,10 @@ async def test_missing_decision_file_on_fresh_database_still_seeds_required(
 async def test_optional_write_failure_rolls_back_only_optional_work(
     tmp_path: Path,
 ) -> None:
-    """可选写入后的真实 SQL 层失败：必需资源已提交、可选回滚、命令成功。
+    """可选写入后的真实 SQL 层失败：可选事务回滚、命令不阻止独立服务。
 
     触发器在 INSERT 时把首个正文字段置空，让写入后的共享校验失败：这会
-    撤掉同一独立事务里已经写入的可选行，但不得影响已提交的必需资源。
+    撤掉同一独立事务里已经写入的可选行，且不得重建旧提示词表。
     """
     scratch, url = await _prepare_head_scratch("_tsk182_decision_seed_rollback")
     try:
@@ -611,7 +563,7 @@ async def test_optional_write_failure_rolls_back_only_optional_work(
             assert "Traceback" not in output, output
             assert blanked_field not in output, "可选失败诊断不得回显字段级校验细节"
 
-            await _assert_required_prompt_rows_complete(connection)
+            await _assert_legacy_prompts_absent(connection)
             await _assert_retired_tables_absent(connection)
             assert await _fetch_decision_row(connection) is None, (
                 "可选独立事务必须回滚：失败后不得留下部分写入的判定行"
@@ -625,12 +577,12 @@ async def test_optional_write_failure_rolls_back_only_optional_work(
 async def test_optional_lease_release_failure_after_mandatory_commit_is_isolated(
     tmp_path: Path,
 ) -> None:
-    """可选租约归还失败（提交后）：必需初始化仍成功，诊断固定、无异常外泄。
+    """可选租约归还失败（提交后）：命令不阻止独立服务，诊断固定、无异常外泄。
 
     真实隔离库 + 真实 CLI 入口，只在共享连接池边界注入外部故障：实际
     观察到判定 Prompt 查询的那次租约在底层真实 acquire 上下文结束之后
     抛出带哨兵的合成归还异常（真实 SQL 与事务不变）。可选阶段属于可选
-    错误边界，因此不得让已提交并校验通过的必需初始化变成失败，也不得
+    错误边界，因此不得让独立服务的启动变成失败，也不得
     把原始异常回显给用户。
     """
     scratch, url = await _prepare_head_scratch("_tsk182_decision_seed_release")
@@ -650,12 +602,11 @@ async def test_optional_lease_release_failure_after_mandatory_commit_is_isolated
         )
         output = _combined(result)
 
-        # 必需初始化必须已经提交且完整（未修复时也同样成立：这正是被归还
-        # 失败掩盖的必需成果）。先验证这一点，再验证命令与诊断。
+        # 可选租约失败不能重建旧提示词表。
         connection = await asyncpg.connect(**scratch)
         try:
             try:
-                await _assert_required_prompt_rows_complete(connection)
+                await _assert_legacy_prompts_absent(connection)
                 await _assert_retired_tables_absent(connection)
             except AssertionError as exc:
                 pytest.fail(f"{exc}\n--- CLI 输出 ---\n{output}")
@@ -669,53 +620,5 @@ async def test_optional_lease_release_failure_after_mandatory_commit_is_isolated
         assert RELEASE_SENTINEL not in output, "归还失败的原始异常不得外泄"
         assert SENTINEL not in output, "可选失败诊断不得回显判定正文"
         assert "Traceback" not in output, output
-    finally:
-        await drop_scratch_database(str(scratch["database"]))
-
-
-async def test_missing_required_prompt_block_still_fails_without_writes(
-    tmp_path: Path,
-) -> None:
-    """必需 manifest 缺 Prompt 块：按既有规则失败且不写入任何数据。"""
-    scratch, url = await _prepare_head_scratch("_tsk182_decision_seed_mandatory")
-    try:
-        raw = yaml.safe_load(DEFAULT_SEED_FILE.read_text(encoding="utf-8")) or {}
-        assert _remove_key(raw, "planning_system_prompt"), (
-            "默认 manifest 必须包含群总结 Prompt 判别键，夹具才有效"
-        )
-        bad_manifest = tmp_path / "missing-group-prompt.yaml"
-        bad_manifest.write_text(
-            yaml.safe_dump(raw, allow_unicode=True, sort_keys=False),
-            encoding="utf-8",
-        )
-        decision_path = _write_decision_seed_file(
-            tmp_path / "decision-valid.yaml",
-            _sentinel_values(),
-        )
-
-        result = _run_seed_cli(
-            url,
-            "--seed-file",
-            str(bad_manifest),
-            "--decision-seed-file",
-            str(decision_path),
-        )
-        output = _combined(result)
-        assert result.returncode != 0, output
-        assert "缺少 Prompt 初始数据块" in output, output
-        assert "group_history_summary" in output, output
-
-        connection = await asyncpg.connect(**scratch)
-        try:
-            for resource_id in PROMPT_RESOURCE_IDS:
-                assert await fetch_prompt_row(connection, resource_id) is None, (
-                    f"必需门禁失败时不得写入 {resource_id} Prompt 行"
-                )
-            assert await _fetch_decision_row(connection) is None, (
-                "必需门禁失败时不得写入可选判定 Prompt 行"
-            )
-            await _assert_retired_tables_absent(connection)
-        finally:
-            await connection.close()
     finally:
         await drop_scratch_database(str(scratch["database"]))

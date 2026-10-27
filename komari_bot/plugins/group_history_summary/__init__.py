@@ -26,6 +26,10 @@ from komari_bot.plugins.komari_decision import (
     get_decision_engine,
 )
 
+# The dependency declaration must precede history_tools' top-level import of
+# character_binding; the old planner also required it before that import.
+require("character_binding")
+
 from .admission_gate import effect_business_admitted
 from .config_schema import DynamicConfigSchema
 from .execution_service import (
@@ -45,9 +49,8 @@ require("config_manager")
 from komari_bot.plugins import config_manager as config_manager_plugin
 
 require("group_admission")
-require("agent_run_logger")
 
-require("character_binding")
+require("komari_agent")
 require("komari_decision")
 
 require("komari_context")

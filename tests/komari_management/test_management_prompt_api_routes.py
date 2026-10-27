@@ -156,7 +156,7 @@ def _build_app(
     *,
     stores: dict[str, _PromptStore] | None = None,
     audit_events: list[ManagementAuditEvent] | None = None,
-    resource_ids: tuple[str, ...] = ("komari_chat",),
+    resource_ids: tuple[str, ...] = ("komari_decision",),
 ) -> FastAPI:
     if stores is None:
         assert store is not None, "必须提供 store 或 stores"
@@ -192,10 +192,10 @@ def _build_app(
     return api_app
 
 
-def _chat_store() -> _PromptStore:
-    values = prompt_marker_values("komari_chat")
-    values["system_prompt"] = "你好"
-    values["memory_ack"] = "收到"
+def _decision_store() -> _PromptStore:
+    values = prompt_marker_values("komari_decision")
+    values["role_description"] = "你好"
+    values["reply_eligibility"] = "收到"
     return _PromptStore(values=values)
 
 
@@ -204,7 +204,7 @@ async def test_prompt_routes_require_token_and_list_resources(
     app: App,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    store = _chat_store()
+    store = _decision_store()
 
     async with app.test_server(asgi=cast("Any", _build_app(monkeypatch, store))) as ctx:
         client = ctx.get_client()
@@ -216,12 +216,12 @@ async def test_prompt_routes_require_token_and_list_resources(
 
     assert unauthorized.status_code == 401
     assert listed.status_code == 200
-    assert listed.json()["items"][0]["resource_id"] == "komari_chat"
+    assert listed.json()["items"][0]["resource_id"] == "komari_decision"
     assert listed.json()["items"][0]["file_path"] is None
-    assert listed.json()["items"][0]["storage_key"] == "komari_chat"
+    assert listed.json()["items"][0]["storage_key"] == "komari_decision"
     assert (
         listed.json()["items"][0]["config_source"]
-        == "postgresql:komari_prompt_komari_chat:komari_chat"
+        == "postgresql:komari_prompt_komari_decision:komari_decision"
     )
 
 
@@ -230,43 +230,43 @@ async def test_prompt_routes_support_detail_replace_and_field_update(
     app: App,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    store = _chat_store()
+    store = _decision_store()
 
     async with app.test_server(asgi=cast("Any", _build_app(monkeypatch, store))) as ctx:
         client = ctx.get_client()
         detail = await client.get(
-            f"{API_PREFIX}/resources/komari_chat", headers=_read_headers()
+            f"{API_PREFIX}/resources/komari_decision", headers=_read_headers()
         )
         updated = await client.patch(
-            f"{API_PREFIX}/resources/komari_chat/fields/system_prompt",
+            f"{API_PREFIX}/resources/komari_decision/fields/role_description",
             json={"value": "新的系统提示词"},
             headers=_write_headers("prompt-field-update", 1),
         )
         replaced = await client.put(
-            f"{API_PREFIX}/resources/komari_chat",
+            f"{API_PREFIX}/resources/komari_decision",
             json={
-                "system_prompt": "完整替换",
-                "memory_ack": "也替换",
+                "role_description": "完整替换",
+                "reply_eligibility": "也替换",
                 **{
                     field: f"填充-{field}"
-                    for field in sorted(prompt_resource_field_names("komari_chat"))
-                    if field not in {"system_prompt", "memory_ack"}
+                    for field in sorted(prompt_resource_field_names("komari_decision"))
+                    if field not in {"role_description", "reply_eligibility"}
                 },
             },
             headers=_write_headers("prompt-replace", 2),
         )
 
     assert detail.status_code == 200
-    assert detail.json()["values"]["system_prompt"] == "你好"
+    assert detail.json()["values"]["role_description"] == "你好"
     assert detail.json()["revision"] == 1
     assert (
         detail.json()["config_source"]
-        == "postgresql:komari_prompt_komari_chat:komari_chat"
+        == "postgresql:komari_prompt_komari_decision:komari_decision"
     )
     assert updated.status_code == 200
-    assert updated.json()["values"]["system_prompt"] == "新的系统提示词"
+    assert updated.json()["values"]["role_description"] == "新的系统提示词"
     assert replaced.status_code == 200
-    assert replaced.json()["values"]["memory_ack"] == "也替换"
+    assert replaced.json()["values"]["reply_eligibility"] == "也替换"
 
 
 @pytest.mark.asyncio
@@ -274,7 +274,7 @@ async def test_prompt_routes_report_validation_and_not_found(
     app: App,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    store = _chat_store()
+    store = _decision_store()
 
     async with app.test_server(asgi=cast("Any", _build_app(monkeypatch, store))) as ctx:
         client = ctx.get_client()
@@ -283,12 +283,12 @@ async def test_prompt_routes_report_validation_and_not_found(
             headers=_read_headers(),
         )
         missing_field = await client.patch(
-            f"{API_PREFIX}/resources/komari_chat/fields/missing_field",
+            f"{API_PREFIX}/resources/komari_decision/fields/missing_field",
             json={"value": "anything"},
             headers=_write_headers("prompt-missing-field", 1),
         )
         invalid_replace = await client.put(
-            f"{API_PREFIX}/resources/komari_chat",
+            f"{API_PREFIX}/resources/komari_decision",
             json={"unknown": "anything"},
             headers=_write_headers("prompt-invalid-replace", 1),
         )
@@ -303,12 +303,12 @@ async def test_prompt_writes_require_matching_revision(
     app: App,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    store = _chat_store()
+    store = _decision_store()
 
     async with app.test_server(asgi=cast("Any", _build_app(monkeypatch, store))) as ctx:
         client = ctx.get_client()
         missing_header = await client.patch(
-            f"{API_PREFIX}/resources/komari_chat/fields/system_prompt",
+            f"{API_PREFIX}/resources/komari_decision/fields/role_description",
             json={"value": "不会写入"},
             headers={
                 "Authorization": "Bearer secret-token-00000000",
@@ -316,14 +316,14 @@ async def test_prompt_writes_require_matching_revision(
             },
         )
         stale_revision = await client.patch(
-            f"{API_PREFIX}/resources/komari_chat/fields/system_prompt",
+            f"{API_PREFIX}/resources/komari_decision/fields/role_description",
             json={"value": "也不会写入"},
             headers=_write_headers("prompt-stale-revision", 0),
         )
 
     assert missing_header.status_code == 422
     assert stale_revision.status_code == 409
-    assert store.values["system_prompt"] == "你好"
+    assert store.values["role_description"] == "你好"
     assert store.revision == 1
 
 
@@ -333,12 +333,10 @@ async def test_prompt_routes_expose_chat_behavior_fields_and_hide_removed_field(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """AC8：管理 API 暴露新增行为字段，不再暴露已删除的 output_instruction。"""
-    from tests.config.chat_prompt_field_contract import (
-        REMOVED_FIELD,
-        REQUIRED_EXACT_FIELDS,
-    )
+    removed_field = "system_prompt"
+    required_exact_fields = ("role_description", "retention_purpose")
 
-    store = _chat_store()
+    store = _decision_store()
 
     async with app.test_server(
         asgi=cast("Any", _build_app(monkeypatch, store)),
@@ -347,16 +345,16 @@ async def test_prompt_routes_expose_chat_behavior_fields_and_hide_removed_field(
         headers = _read_headers()
         listed = await client.get(f"{API_PREFIX}/resources", headers=headers)
         detail = await client.get(
-            f"{API_PREFIX}/resources/komari_chat", headers=headers
+            f"{API_PREFIX}/resources/komari_decision", headers=headers
         )
 
     fields = set(listed.json()["items"][0]["fields"])
-    assert REMOVED_FIELD not in fields
-    for field in REQUIRED_EXACT_FIELDS:
+    assert removed_field not in fields
+    for field in required_exact_fields:
         assert field in fields, f"管理 API 必须暴露新字段 {field}"
     assert detail.status_code == 200
-    assert REMOVED_FIELD not in detail.json()["values"]
-    assert "tool_call_instruction" in detail.json()["values"]
+    assert removed_field not in detail.json()["values"]
+    assert "retention_purpose" in detail.json()["values"]
 
 
 @pytest.mark.asyncio
@@ -365,29 +363,29 @@ async def test_prompt_routes_update_new_field_and_reject_removed_field(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """AC8：可更新新增字段；已删除字段不可寻址（404）。"""
-    from tests.config.chat_prompt_field_contract import REMOVED_FIELD
+    removed_field = "system_prompt"
 
-    store = _chat_store()
+    store = _decision_store()
 
     async with app.test_server(
         asgi=cast("Any", _build_app(monkeypatch, store)),
     ) as ctx:
         client = ctx.get_client()
         updated = await client.patch(
-            f"{API_PREFIX}/resources/komari_chat/fields/tool_call_instruction",
+            f"{API_PREFIX}/resources/komari_decision/fields/retention_purpose",
             json={"value": "新的工具调用行为指引"},
             headers=_write_headers("prompt-tool-call-update", store.revision),
         )
         removed = await client.patch(
-            f"{API_PREFIX}/resources/komari_chat/fields/{REMOVED_FIELD}",
+            f"{API_PREFIX}/resources/komari_decision/fields/{removed_field}",
             json={"value": "不会写入"},
             headers=_write_headers("prompt-removed-field", store.revision + 1),
         )
 
     assert updated.status_code == 200
-    assert updated.json()["values"]["tool_call_instruction"] == "新的工具调用行为指引"
+    assert updated.json()["values"]["retention_purpose"] == "新的工具调用行为指引"
     assert removed.status_code == 404
-    assert store.values["tool_call_instruction"] == "新的工具调用行为指引"
+    assert store.values["retention_purpose"] == "新的工具调用行为指引"
 
 
 def _all_resource_stores() -> dict[str, _PromptStore]:

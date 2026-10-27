@@ -25,7 +25,7 @@ from tests.db.tsk197_gate_support import (
 
 pytestmark = [SKIP_NO_POSTGRES, pytest.mark.asyncio]
 
-HEAD = "0031"
+HEAD = "0033"
 PREVIOUS = "0028"
 UNFINISHED_CODE = "TSK195_UNFINISHED_REPLY_FULFILLMENT"
 PARENT = "komari_chat_reply_fulfillments"

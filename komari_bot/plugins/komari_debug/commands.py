@@ -22,7 +22,6 @@ from nonebot.params import CommandArg, Depends
 from nonebot.permission import SUPERUSER
 
 from komari_bot.onebot.onebot_messages import plain_text_message
-from komari_bot.plugins.agent_run_logger import create_collector, finalize_collector
 from komari_bot.plugins.character_binding import get_binding_manager
 from komari_bot.plugins.group_history_summary.config_schema import (
     DynamicConfigSchema as SummaryConfigSchema,
@@ -51,8 +50,6 @@ from .reporting import (
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
-
-    from komari_bot.plugins.agent_run_logger.diagnostic import LLMDiagnosticCollector
 
 FAVOR_MIN = 0
 FAVOR_MAX = 400
@@ -132,32 +129,34 @@ async def _deliver_debug_report(
     *,
     bot: Bot,
     event: GroupMessageEvent,
-    collector: LLMDiagnosticCollector,
+    request_id: str,
     result_type: str,
     succeeded: bool,
     public_requested: bool,
     error: str | None = None,
-    extra_info: Mapping[str, object] | None = None,
     final_result_info: Mapping[str, object] | None = None,
     private_artifact_delivered: bool = True,
 ) -> DiagnosticDeliveryResult:
-    """投递私聊完整报告、可选公开摘要，并始终发送安全群回执。"""
+    """投递私聊完整报告、可选公开摘要，并始终发送安全群回执。
+
+    TSK-200：报告只按显式 ``request_id`` 渲染请求身份、状态、安全固定错误码
+    与最终结果，不再接受采集器或累积诊断状态。
+    """
     try:
         delivery = await build_and_send_diagnostic_report(
             bot=bot,
             user_id=int(event.user_id),
-            collector=collector,
+            request_id=request_id,
             result_type=result_type,
             succeeded=succeeded,
             error=error,
-            extra_info=extra_info,
             final_result_info=final_result_info,
             public_group_id=int(event.group_id) if public_requested else None,
         )
     except Exception as exc:
         logger.warning(
             "[KomariDebug] 诊断报告构建失败: request_id={} error_type={}",
-            collector.request_id,
+            request_id,
             type(exc).__name__,
         )
         delivery = DiagnosticDeliveryResult(
@@ -167,7 +166,7 @@ async def _deliver_debug_report(
 
     private_delivered = delivery.private_delivered and private_artifact_delivered
     receipt = _build_group_receipt(
-        request_id=collector.request_id,
+        request_id=request_id,
         succeeded=succeeded,
         private_delivered=private_delivered,
         public_requested=public_requested,
@@ -650,23 +649,6 @@ async def handle_debug_reply(
     reply_context = _build_reply_context_from_event(event)
 
     request_trace_id = f"debug-reply-{uuid.uuid4().hex[:12]}"
-    collector = create_collector(
-        run_type="chat_reply",
-        task_kind="chat_reply",
-        trace_id=request_trace_id,
-        origin="debug",
-        input_data={
-            "group_id": group_id,
-            "user_id": user_id,
-            "content": debug_content,
-            "image_urls": image_urls,
-            "reply_context": reply_context,
-        },
-        force_collect=True,
-    )
-    if collector is None:
-        msg = "Agent Run debug 收集器创建失败"
-        raise RuntimeError(msg)
 
     try:
         result = await generate_debug_reply(
@@ -678,34 +660,24 @@ async def handle_debug_reply(
             image_urls=image_urls if image_urls else None,
             reply_context=reply_context,
             caller_is_superuser=True,
-            collector=collector,
+            request_trace_id=request_trace_id,
         )
     except FinishedException:
         raise
     except Exception as exc:
-        await finalize_collector(collector, status="error", error=exc)
         logger.error(
             "[KomariDebug] debug reply 执行失败: request_id={} error_type={}",
             request_trace_id,
             type(exc).__name__,
         )
-        collector.add_error(
-            phase="debug_reply",
-            error_type=type(exc).__name__,
-            message="内部执行失败，异常正文已隐藏",
-        )
         await _deliver_debug_report(
             bot=bot,
             event=event,
-            collector=collector,
+            request_id=request_trace_id,
             result_type="reply",
             succeeded=False,
             public_requested=public_requested,
             error="debug_reply_failed",
-            extra_info={
-                "user_id": user_id,
-                "content": debug_content[:200],
-            },
         )
         return
 
@@ -718,22 +690,29 @@ async def handle_debug_reply(
     if result.favorability_reason:
         favor_delta_str += f"（{result.favorability_reason}）"
 
+    final_result_info: dict[str, object] = {
+        "reply_text": reply_text,
+        "favorability_delta": favor_delta_str,
+        "reply_to_message_id": result.reply_to_message_id,
+    }
+    image_failure_summary = result.image_failure_summary
+    if image_failure_summary is not None:
+        # TSK-196/TSK-200：图片理解失败的安全汇总只进入私聊诊断的可渲染
+        # 白名单字段（模式/阶段/失败数量），不含 URL、base64 或视觉正文。
+        final_result_info["image_failure_mode"] = image_failure_summary.mode
+        final_result_info["image_failure_stages"] = (
+            ", ".join(image_failure_summary.stages) or "-"
+        )
+        final_result_info["image_failed_count"] = image_failure_summary.failed_images
+
     await _deliver_debug_report(
         bot=bot,
         event=event,
-        collector=result.collector,
+        request_id=result.request_id,
         result_type="reply",
         succeeded=True,
         public_requested=public_requested,
-        final_result_info={
-            "reply_text": reply_text,
-            "favorability_delta": favor_delta_str,
-            "reply_to_message_id": result.reply_to_message_id,
-        },
-        extra_info={
-            "user_id": user_id,
-            "content": debug_content[:200],
-        },
+        final_result_info=final_result_info,
     )
 
 
@@ -773,47 +752,25 @@ async def handle_debug_summary(
         )
 
     request_trace_id = f"debug-summary-{uuid.uuid4().hex[:12]}"
-    collector = create_collector(
-        run_type="group_history_summary",
-        task_kind="group_history_summary",
-        trace_id=request_trace_id,
-        origin="debug",
-        input_data={
-            "group_id": str(event.group_id),
-            "summary_request": summary_request,
-            "user_id": str(event.user_id),
-        },
-        force_collect=True,
-    )
-    if collector is None:
-        msg = "Agent Run debug 收集器创建失败"
-        raise RuntimeError(msg)
     group_id = str(event.group_id)
 
     try:
         config = _summary_config_mgr.get()
         summary_config = _cast_summary_config(config)
     except Exception as exc:
-        await finalize_collector(collector, status="error", error=exc)
         logger.error(
             "[KomariDebug] summary 配置读取失败: request_id={} error_type={}",
             request_trace_id,
             type(exc).__name__,
         )
-        collector.add_error(
-            phase="debug_summary_config",
-            error_type=type(exc).__name__,
-            message="配置读取失败，异常正文已隐藏",
-        )
         await _deliver_debug_report(
             bot=bot,
             event=event,
-            collector=collector,
+            request_id=request_trace_id,
             result_type="summary",
             succeeded=False,
             public_requested=public_requested,
             error="debug_summary_config_failed",
-            extra_info={"user_id": str(event.user_id)},
         )
         return
 
@@ -824,46 +781,28 @@ async def handle_debug_summary(
             bot_self_id=str(bot.self_id),
             user_request=summary_request,
             config=summary_config,
-            collector=collector,
+            request_trace_id=request_trace_id,
         )
     except SummaryBusyError:
-        collector.add_error(
-            phase="debug_summary",
-            error_type="SummaryBusyError",
-            message="同一群已有总结任务执行中",
-        )
         await _deliver_debug_report(
             bot=bot,
             event=event,
-            collector=collector,
+            request_id=request_trace_id,
             result_type="summary",
             succeeded=False,
             public_requested=public_requested,
             error="summary_busy",
-            extra_info={
-                "user_id": str(event.user_id),
-                "request": summary_request[:200],
-            },
         )
         return
     except CapabilityNotSupportedError:
-        collector.add_error(
-            phase="debug_summary",
-            error_type="CapabilityNotSupportedError",
-            message="当前 OneBot 实现不支持获取群聊记录",
-        )
         await _deliver_debug_report(
             bot=bot,
             event=event,
-            collector=collector,
+            request_id=request_trace_id,
             result_type="summary",
             succeeded=False,
             public_requested=public_requested,
             error="capability_not_supported",
-            extra_info={
-                "user_id": str(event.user_id),
-                "request": summary_request[:200],
-            },
         )
         return
     except FinishedException:
@@ -874,23 +813,14 @@ async def handle_debug_summary(
             request_trace_id,
             type(exc).__name__,
         )
-        collector.add_error(
-            phase="debug_summary",
-            error_type=type(exc).__name__,
-            message="内部执行失败，异常正文已隐藏",
-        )
         await _deliver_debug_report(
             bot=bot,
             event=event,
-            collector=collector,
+            request_id=request_trace_id,
             result_type="summary",
             succeeded=False,
             public_requested=public_requested,
             error="debug_summary_failed",
-            extra_info={
-                "user_id": str(event.user_id),
-                "request": summary_request[:200],
-            },
         )
         return
 
@@ -907,16 +837,13 @@ async def handle_debug_summary(
             )
             image_delivered = image_delivered and page_delivered
         if not image_delivered:
-            collector.add_error(
-                phase="debug_summary_image_send",
-                error_type="PrivateDeliveryError",
-                message="总结图片私聊投递失败",
+            logger.warning(
+                "[KomariDebug] 总结图片私聊投递失败: request_id={}",
+                request_trace_id,
             )
 
-    extra_info = {
-        "user_id": str(event.user_id),
-        "request": summary_request[:200],
-        "filtered_message_count": str(result.filtered_message_count),
+    final_result_info: dict[str, object] = {
+        "filtered_message_count": result.filtered_message_count,
         "filter_label": result.filter_label,
         "time_range": result.time_range,
         "image_page_count": str(
@@ -927,7 +854,7 @@ async def handle_debug_summary(
     }
     history_fetch = getattr(result, "history_fetch", None)
     if history_fetch is not None:
-        extra_info.update(
+        final_result_info.update(
             {
                 "history_status": str(history_fetch.status),
                 "history_coverage_ratio": f"{history_fetch.coverage_ratio:.2%}",
@@ -939,11 +866,11 @@ async def handle_debug_summary(
     await _deliver_debug_report(
         bot=bot,
         event=event,
-        collector=collector,
+        request_id=request_trace_id,
         result_type="summary",
         succeeded=True,
         public_requested=public_requested,
-        extra_info=extra_info,
+        final_result_info=final_result_info,
         private_artifact_delivered=image_delivered,
     )
 

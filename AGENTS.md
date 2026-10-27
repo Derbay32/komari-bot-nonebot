@@ -19,10 +19,10 @@ komari-bot 是基于 [NoneBot2](https://github.com/nonebot/nonebot2) 构建的 Q
 | Web | FastAPI（内嵌于 NoneBot2） | 管理 API、知识库 WebUI |
 | 数据库 | PostgreSQL + **pgvector**（HNSW 索引） | 连接/会话由 **nonebot-plugin-orm**（SQLAlchemy 2.x）托管，Schema 由 **Alembic 版本链**（`migrations/`）唯一管理；特殊 DDL 表保留 raw SQL |
 | 缓存 | Redis >=7.1.0 | `redis.asyncio`（**禁止**使用 `aioredis`） |
-| LLM | OpenAI 兼容接口 | DeepSeek / Gemini 双后端 |
-| 判定 | 官方 TypeSafe Python SDK | Jev / System One；独立于回复生成网关 |
+| Agent 执行 | DeepSeek Harness（DSH）+ Node.js | 聊天与总结独立预设，官方模型协议与内置重试 |
+| 判定 | 官方 TypeSafe Python SDK | Jev / System One；独立于 DSH 生成任务 |
 | Embedding | OpenAI 兼容 API（远程） | 默认 `BAAI/bge-small-zh-v1.5` |
-| 部署 | Docker + Docker Compose | Gunicorn + Uvicorn；prestart 自动 `upgrade head` |
+| 部署 | Docker + Docker Compose | 同容器运行 Python Bot 与长期存活的 Node 进程 |
 | CI/CD | GitHub Actions → GitHub Container Registry | 所有 PR 执行静态、无服务、PostgreSQL/Redis 集成与迁移验收；发布 tag 自动构建镜像 |
 | Lint | Ruff (py313) + Pyright `standard` | 零容忍类型错误 |
 
@@ -47,7 +47,9 @@ komari-bot/
 │       ├── 0024_jev_recent_settlement.py # 判定近期上下文结算
 │       ├── 0025_scene_storage_retirement.py # 不可逆删除旧场景存储
 │       ├── 0030_hindsight_memory_retirement.py # 旧记忆配置/Prompt 退役（不可逆）
-│       └── 0031_unused_memory_search_limit.py # 删除无调用方的召回数量配置（不可逆）
+│       ├── 0031_unused_memory_search_limit.py # 删除无调用方的召回数量配置（不可逆）
+│       ├── 0032_agent_run_retirement.py     # Agent Run 存储退役
+│       └── 0033_dsh_execution_retirement.py # 网关与旧提示词存储退役
 │
 ├── komari_bot/                           # ★ 核心代码
 │   ├── core/                             # 核心启动与平台基础件（依赖 NoneBot 运行时）
@@ -67,13 +69,11 @@ komari-bot/
 │   │   ├── jev.py                        #   请求、结果与诊断数据结构
 │   │   ├── engine_protocol.py            #   evaluate / claim_handoff / observe_delivered
 │   │   └── dispatch.py                   #   同次入站分发的共享判定载体
-│   ├── llm/                              # LLM 协议与安全上下文共享件（无 NoneBot 依赖）
-│   │   ├── llm_protocol.py               #   RequestApi 等协议类型（避免业务插件 import 网关）
+│   ├── llm/                              # 内容预算与安全上下文共享件（无 NoneBot 依赖）
 │   │   ├── untrusted_context.py          #   不可信上下文包装与渲染
 │   │   ├── content_budget.py             #   内容预算校验（字符/字节/估算 token）
 │   │   ├── token_counter.py              #   估算 token 计数
-│   │   ├── diagnostic_sanitizer.py       #   共享诊断脱敏（凭据与媒体载荷）
-│   │   └── dsv4_instruct.py              #   DSV4 指令注入
+│   │   └── diagnostic_sanitizer.py       #   共享诊断脱敏（凭据与媒体载荷）
 │   ├── context/                          # 近期上下文 Redis 键与中性存储操作（不依赖插件）
 │   │   ├── redis_keys.py                 #   共享近期上下文/履约证据键
 │   │   └── redis_store.py                #   RecentContextStore + MessageSchema
@@ -88,8 +88,8 @@ komari-bot/
 │   │   ├── onebot_messages.py            #   消息工具（plain_text_message 等）
 │   │   └── onebot_rules.py               #   group_message_rule() 等
 │   └── plugins/                          # NoneBot 插件模块
-│       ├── <插件>/config_schema.py       #   动态配置强类型表（SQLModel，15 个资源）
-│       ├── <插件>/prompt_schema.py       #   Prompt 强类型表（3 个必需资源 + 独立判定资源）
+│       ├── <插件>/config_schema.py       #   动态配置强类型表（SQLModel）
+│       ├── <插件>/prompt_schema.py       #   Prompt 强类型表（仅 Jev 判定资源）
 │       └── <插件>/orm_models.py          #   业务关系表 ORM 模型（user_ban/character_binding/
 │                                          #   user_data/komari_custom/komari_management/komari_decision）
 │
@@ -97,7 +97,8 @@ komari-bot/
 │   ├── adr/                              #   架构决策记录
 │
 ├── data/ / scripts/ / tools/ / tests/    # 数据 / 脚本 / 工具 / 测试
-└── logs/                                 # 运行时日志（含 Agent Run JSONL）
+├── dsh/                                  # 官方依赖、接入插件与聊天/总结预设
+└── logs/                                 # 普通运行时日志；历史 Agent Run 文件不自动清理
 ```
 
 ## 插件架构与依赖关系
@@ -115,8 +116,7 @@ komari-bot/
   permission_manager ───────── 权限检查（白名单、插件开关、SUPERUSER）
   user_ban ─────────────────── 全局 QQ 用户封禁（chat / command；ORM 表 + revision 缓存）
   embedding_provider ───────── 向量化 + Rerank 服务
-  llm_provider ─────────────── LLM 网关（DeepSeek/OpenAI 兼容）
-  agent_run_logger ─────────── 单任务 Agent Run JSONL + PostgreSQL 轻索引（共享引擎 raw 连接）
+  komari_agent ─────────────── DSH 进程、任务桥接与受鉴权管理入口
   komari_search ────────────── 联网搜索与网页抓取服务（Tavily / EXA 双提供者）
   user_data ────────────────── 当前好感度 PostgreSQL 服务（ORM 表）
 
@@ -150,8 +150,8 @@ komari-bot/
              ├─ 按保留用途交给既有消息保存流程
              ├─ 检查 chat 封禁与既有回复履约身份
              └─ 领取 chat 交接资格 → 读取记忆 → 生成回复 → 回复履约
-                 ├─ llm_provider 生成正文（可调用 komari_search 工具）
-                 ├─ agent_run_logger 记录回复任务
+                 ├─ DSH 聊天预设执行查询、好感度提案与最终回复提交
+                 ├─ Python 校验候选结果
                  └─ 确认送达后执行原有送达后承诺
 
 用户事件 → user_ban（run_preprocessor）
@@ -189,11 +189,13 @@ SUPERUSER 消息 → komari_debug（命令处理器）
 - **存储源**：业务插件动态配置统一存储在 PostgreSQL 强类型单行表 `komari_<插件>_config`（迁移 0002 建表、0004 为 komari_chat 补充、0026 新增 komari_context、0027 完成 chat/context 字段所有权迁移）；每张表固定主键 `id=1`、CAS 修订号 `revision`（写操作原子自增）、写入时间 `updated_at`（存储层显式赋值）；可扩展字段（列表/字典/嵌套配置）保留 JSONB 列
 - **聊天配置**：`komari_chat_config` 保存主动回复频控与回复履约策略。
 - 回复履约策略包括租约、批次、重试、新鲜度和墓碑保留。
-- `komari_chat_config` 保存回复 Agent 预算（`agent_max_rounds` / `agent_max_tool_calls_per_round` / `agent_max_total_tool_calls`）与 `agent_tool_call_mode`。
-- `komari_chat_config` 保存图片理解模式与 8 项下载预算。
-- 迁移 `0027` 将聊天生成槽位、常识库与上下文预算迁入聊天配置。
+- `komari_chat_config` 保存回复 Agent 预算（`agent_max_rounds` / `agent_max_tool_calls_per_round` / `agent_max_total_tool_calls`）。
+- `komari_chat_config` 保存 8 项 `vision_image_download_*` 安全预算。
+- 聊天配置继续拥有知识库开关与上下文预算。
 - 迁移 `0027` 将表情反应、聊天检索开关与聊天启用开关迁入聊天配置。
-- 查询重写使用独立的 `query_rewrite_*` 槽位。
+- `0033` 删除聊天与总结的模型连接字段。
+- 模型连接、绑定与系统提示词统一归 DSH。
+- 知识与帮助的 `query_rewrite_rules` 字符串替换规则继续保留。
 - **上下文配置**：`komari_context_config` 保存 `redis_db`、`bot_nickname` 与 `error_notify_enabled`。
 - TSK-195 的回复履约不再读取全局互动开关。
 - TSK-197 已删除 `global_interaction_enabled` 与 `global_interaction_trigger_size`。
@@ -203,7 +205,7 @@ SUPERUSER 消息 → komari_debug（命令处理器）
 - 聊天插件禁止导入 `komari_memory.services.config_interface`。
 - **结构真源**：各插件 `config_schema.py` 中的 SQLModel 元数据（`TypedConfigModel` 基类，见 `config/typed_config.py`）；Alembic 迁移环境只按源文件加载 schema（`load_all_typed_config_models()`），不执行插件包 `__init__`、不访问数据库
 - **旧 JSONB 表**：迁移 `0013` 已显式删除 `komari_plugin_configs`。运行时只使用强类型配置表。删除表必须使用手写迁移。
-- **Prompt 配置**：字符串 prompt 不存入配置表，统一使用独立强类型表（见 1.1 节）
+- **Prompt 配置**：Jev 使用独立强类型表，聊天与总结使用 DSH（见 1.1 节）。
 - **初始化**：PG 中缺失配置时，从 `.env` 环境变量 / Pydantic 默认值生成并写入 PG
 - **持久化**：`update_field()` → Pydantic 校验 → 写回 PostgreSQL（revision CAS，冲突时重载重试）
 - **跨进程刷新**：应用事件循环上亚秒级轮询各表 `revision` 检测变更；已移除 asyncpg LISTEN/NOTIFY
@@ -221,97 +223,82 @@ SUPERUSER 消息 → komari_debug（命令处理器）
   ```
 - 列表、字典等读改写字段必须使用 `mutate_field_async()`，变换函数会在 CAS 冲突后基于数据库最新值重跑；禁止先 `get_async()` 计算整份新值再 `update_field_async()` 覆盖
 
-### 1.1 Prompt 配置 (`komari_prompt_*`)
+### 1.1 提示词所有权与初始化
 
-运行时从 PostgreSQL 强类型单行表读取 Prompt。
-各插件 `prompt_schema.py` 是字段结构的真源。
-聊天、群总结的必需 Prompt 缺失会阻止冷启动。
-记忆总结 Prompt 已随 TSK-197 退役。
-判定 Prompt 使用独立的可选初始化步骤。
-判定 Prompt 不可用时，新判定报告 `failed`。
-已加载的 Prompt 在暂时读取失败时保留进程内有效快照。
-运行时不使用初始数据文件或 Python 长文本默认值回退。
+修改提示词所有权或切换流程前，读取 ADR-0016。
+修改 Jev 初始化前，同时读取 ADR-0011 的保留范围。
 
-`seed_bootstrap` 只插入缺失行或补齐空字段。
-初始化器保留非空管理员文案。
-`initial_data/scenes.yaml` 保留历史文件名，但只承载 2 组必需 Prompt。
-`initial_data/decision_prompt.yaml` 承载独立的判定 Prompt。
-场景播种与场景冷启动校验已退役。
-修改初始化行为前，读取 ADR-0011。
+DSH 是聊天与群总结系统提示词的唯一生效来源。
+管理 API 通过 `/api/v2/komari-agent/prompts/{kind}` 读写字面文本。
+Python 不拼接系统提示词，也不保存回退文案。
+模型绑定更新与启动初始化必须保留非空管理员文案。
 
-Prompt 管理写入使用强 `If-Match` 修订校验。
-提示词缓存沿用既有失效与跨进程刷新机制。
+Jev 提示词仍使用 PostgreSQL 资源 `komari_decision`。
+通用 `PromptStorage` 保留修订校验与缓存失效语义。
+`seed_bootstrap` 只初始化可选的 Jev 资源。
+默认资产是 `initial_data/decision_prompt.yaml`。
+初始化只插入缺失行或补齐空字段。
+
+缺失、畸形或数据库失败只输出固定安全诊断。
+初始化未确认时不能报告成功。
+取消继续传播，Alembic 失败仍中止 prestart。
+运行时不读取初始资产作为提示词回退。
+
+`0033` 删除旧聊天与总结提示词表。
+生产升级前先从旧部署私有导出全部字段与修订。
+操作者审阅后，通过新管理 API 显式写入每个预设。
+放行业务前必须逐字读回验证。
+生产备份、迁移与部署均需单独授权。
 
 ### 1.2 Komari Management v2
 
 - 管理路由统一使用 `/api/v2/<plugin>` 前缀，旧版路由、弃用别名和退役 stub 均不注册。
-- 鉴权只接受 `api_credentials` 具名凭据。启动检查仍使用 `llm_logs:read` 权限名的凭据时记录警告。
-- Agent Run 日志权限为 `agent_run_logs:read`；搜索提供者描述端点使用 `search:read`。
+- 鉴权只接受 `api_credentials` 具名凭据。
+- 搜索提供者描述端点使用 `search:read`。
+- Agent Run 的路由、权限与管理资源已退役。
 - Swagger 与 OpenAPI 入口分别为 `/api/docs` 和 `/api/openapi.json`。
 - `GET /api/v2/komari-search/provider-descriptors` 从 `komari_search` 配置 Schema 动态生成通用字段与 Tavily/EXA 专用字段描述。
 
-### 2. LLM 网关 (`llm_provider`)
+### 2. DSH 执行边界 (`komari_agent`)
 
-导出的核心函数（位于 `__init__.py`）：
-- `generate_text(prompt, model, ...)` → `str`
-- `generate_completion(...)` → `LLMCompletionResultSchema`（含 thinking 内容）
-- `generate_text_with_messages(messages, model, ...)` → `str`
-- `generate_messages_completion(messages, model, ...)` → `LLMCompletionResultSchema`
-- `test_connection()` → `bool`
+修改任务、模型配置、会话或重试边界前，读取 ADR-0016。
+Python 与 Node 在同一容器内运行。
+`AgentHost` 管理长期存活的 DSH 进程。
+每次聊天或总结使用独立的内存会话。
+任务终态清理会话，进程崩溃不恢复原任务。
+未就绪时拒绝新生成任务，但空配置仍支持管理。
 
-`LLMCompletionResultSchema` 新增字段：
-- `usage: UnifiedUsageSchema | None` — 后端实际返回的 token 用量
-- `duration_ms: float | None` — 网关测得的调用耗时（毫秒）
-- `continuation: LLMProviderContinuationSchema | None` — Responses 协议的不透明续接项（见下）
+DSH 拥有模型连接、凭据、模型绑定和系统提示词。
+首次配置也通过受鉴权的管理 API 完成。
+配置与凭据保存在持久化 profile，不增加 dotenv 项。
+连接写入在有任务时返回冲突。
+提示词与绑定修改只影响后续任务。
+管理写入要求强 ETag，未确认生效时明确失败。
 
-`UnifiedUsageSchema` 字段（全部 `int | None`，`None` 表示后端未报告）：
-- `input_tokens`、`cached_input_tokens`、`cache_miss_input_tokens`
-- `output_tokens`、`reasoning_output_tokens`、`total_tokens`
+Python 提供带身份、引用与来源的结构化上下文。
+DSH 将初始数据渲染为一条分区 user 消息。
+历史 Bot 发言保留为数据，不重建 assistant 回合。
+不可信正文不能提升为系统指令。
 
-用量提取（`openai_compatible_api.py`）：
-- 支持对象属性、普通字典、Pydantic `model_extra` 三种形式
-- DeepSeek `prompt_cache_hit_tokens` 优先于 OpenAI `prompt_tokens_details.cached_tokens`
-- `completion_tokens_details.reasoning_tokens` 映射到 `reasoning_output_tokens`
-- 缺失或异常字段不阻断解析，对应位置保留 `None`
+聊天完成需要有效的最终回复与好感度提案。
+两项提交顺序不限，提前正文只暂存。
+总结完成需要有效的最终总结提交。
+普通模型文本不能替代业务结果。
+任务起点冻结轮次、单轮工具数与总工具数预算。
+无效或失败的工具调用仍消费预算。
 
-双请求 API 与流式（issue #23）：
-- 四个 `generate_*` 公共入口与底层抽象接口均接受显式关键字参数 `request_api: RequestApi | None` 与 `stream_enabled: bool | None`；`RequestApi = Literal["chat_completions", "responses"]` 定义在 `komari_bot/llm/llm_protocol.py`（避免业务插件 import 网关触发 require 副作用）
-- 调用方传 `None` 时按网关默认槽位配置解析；业务插件必须按自己的槽位显式透传（见下「槽位配置」），禁止依赖默认解析
-- 流式只在网关内部聚合，业务侧永远拿到完整 `LLMCompletionResultSchema`；Chat 流式强制 `stream_options.include_usage=true` 并按工具 index 聚合增量 tool_calls；断流/取消丢弃部分结果并明确失败
-- Responses 协议翻译：安全边界合并入 `instructions`；tools 扁平化（strict 默认 false）；`store=false` 无状态；终态归一化（completed/incomplete/failed/refusal）；无映射参数（frequency_penalty、不兼容 extra_params 键）静默忽略
-- 明确失败、禁止静默降级或能力自动探测；连接指纹保持 token/base_url/timeout 三元组不变
+主请求、辅助请求和业务工具继续逐效果检查群准入。
+模型请求仅使用 DSH 内置的暂时性故障重试。
+单次请求最多尝试 3 次，外围不叠加重试。
+平台发送与送达后承诺继续归 Python 履约流程。
 
-续接项（continuation）传递机制：
-- `LLMProviderContinuationSchema`（`api="responses"` + 序列化 `output_items`，含加密推理项）只在当前业务任务的多轮工具循环内存活：不写入业务数据库、不跨 QQ 消息复用
-- assistant 消息统一经 `build_assistant_message(completion)` 构造；continuation 以内部元数据键 `_llm_continuation`（`CONTINUATION_METADATA_KEY`）附着在消息上
-- Chat 请求构建器剥离全部 `_` 前缀内部键（永不发往 Chat 端点）；Responses 构建器校验 `api=="responses"` 后原样展开 output items
-- 无工具但需重试的 assistant 输出同样经统一构造函数附着 continuation
+### 2.1 执行日志退役
 
-槽位配置（issue #23 新增，全部默认 `chat_completions` + 非流式，零行为变化）：
-- `llm_provider`：默认槽位 `request_api` / `stream_enabled`、`vision_request_api` / `vision_stream_enabled`
-- `komari_memory`：`llm_request_api_chat` / `llm_stream_enabled_chat`、`llm_request_api_summary` / `llm_stream_enabled_summary`
-- `group_history_summary`：`summary_planning_request_api` / `summary_planning_stream_enabled`、`summary_request_api` / `summary_stream_enabled`
-- 任务内配置冻结：同一业务任务（如 komari_chat 工具循环）在任务开始时读取一次协议/流式配置，任务执行期间的配置变更不影响进行中的任务；运维按槽位逐位灰度
-
-关键规则：
-- `llm_provider` 最底层通过 `apply_llm_security_boundary()` 强制追加不可覆盖的安全 system 边界；知识、网页、群历史、引用、画像、视觉描述和工具结果必须使用 `UntrustedContext` 或统一不可信标签传入，禁止拼进 system prompt
-- 不可信上下文必须保留来源类型、来源 ID、信任级别并限制正文长度；工具调用必须使用白名单、对象参数 schema、轮数与总调用预算
-- `max_tokens` 必须为 **`int`**（不能是 `float`），默认 8192
-- 知识库注入：`enable_knowledge=True` 时自动检索并注入到 system prompt
-- `request_trace_id` / `request_phase` 仅用于限流和普通运行日志；provider 不持久化 Agent Run，也不依赖日志插件
-
-### 2.1 Agent Run 日志 (`agent_run_logger`)
-
-- 配置资源只有 `log_enabled`（默认 `true`）与 `retention_days`（默认 `1`，范围 `1..90`）；不读取或继承 `llm_provider.llm_log_*` 旧字段。
-- `AgentRunCollector` 由 `komari_chat`、`komari_memory`、`group_history_summary` 和 `komari_debug` 显式下传；一个业务任务无论包含多少 LLM 轮次和工具调用，都只结束和落盘一次。
-- 日志类别固定为 `chat_reply`、`scheduled_summary`、`group_history_summary`；debug 复用对应类别并标记 `origin=debug`。日志关闭时普通任务不采集，debug 仍保留不落盘的内存诊断。
-- JSONL v3 写入 `logs/agent_run_logger/YYYY-MM-DD.jsonl`，目录固定 `0700`、文件固定 `0600`；保存完整输入、输出、prompt/messages、reasoning、工具参数/结果及异常，只移除显式凭据并把图片 URL、base64 与二进制替换为摘要。
-- 每次 LLM 调用（`LLMCallTrace`）额外记录最终生效的 `request_api` / `stream_enabled`（取自请求 kwargs，缺失保持 `null` 不伪造）；响应载荷完整保留 `continuation`（含加密推理项），与正文走同一脱敏管线。
-- PostgreSQL `UNLOGGED` 表 `komari_agent_run_log_index` 只保存 run/trace、分类、时间、文件字节定位、模型/方法集合、计数与 usage；禁止加入任何正文、预览、prompt、reasoning、工具正文或错误正文；协议标记只存在于 JSONL，不为它扩展索引结构。
-- 写入顺序是跨进程文件锁内追加 JSONL，再 upsert PG。PG 故障不撤销 JSONL；启动及每 5 分钟使用 advisory lock 对账，管理查询在 PG 不可用时降级扫描 JSONL。
-- 每日本地时间 04:00 清理，保留当前日志日及此前 `retention_days - 1` 日；日志关闭不停止清理。启动时删除废弃 SQLite 索引文件；旧 `llm_provider.llm_log_*` 配置字段不兼容、不迁移（agent_run_logger 不再执行 legacy 配置键清理）。
-- 管理接口为 `/api/v2/agent-run-logs/runs` 与 `/runs/{run_id}`，使用 `agent_run_logs:read`。
-- debug 报告必须继续走独立脱敏投影，绝不能直接复用完整 JSONL 正文。
+Agent Run 采集、索引、查询与后台清理已退役。
+DSH 不提供替代执行日志或会话持久化。
+保留普通错误日志、管理审计与安全通知。
+debug 只返回安全结果，不保留逐轮明细或用量聚合。
+历史 JSONL 的处置需要单独授权。
 
 ### 2.2 Embedding / Rerank 远程协议
 
@@ -418,7 +405,7 @@ TSK-197 已物理删除旧四层运行代码、专用配置列与记忆总结 Pr
 - 关闭只关闭自有客户端与在途会话；不关闭 Redis 或共享 ORM。
 - 聊天只执行一次自动召回；模型工具 `recall_memory` 复用同一会话。
 - 召回失败停止本次回复；空召回是成功。
-- 召回内容经 `UntrustedContext(source_type="memory")` 进入非 system 上下文。
+- 召回内容作为结构化 memory 数据交给 DSH 不可信数据渲染器。
 - 当前群准入在打开会话前和自动召回前各检查一次。
 - 近期上下文写入前重新检查当前群准入。
 - 聊天知识检索通过 `embedding_guard` 在实际向量化前检查当前群准入。
@@ -570,7 +557,7 @@ Jev 请求截止覆盖连接、发送、接收与响应校验。
 迁移 `0025` 永久删除旧场景四表与 38 个专用配置字段。
 `0025` 的 `downgrade` 拒绝回退。
 禁止恢复旧签名适配、双跑或故障回退。
-公共向量生成与重排继续服务记忆召回。
+公共向量生成与重排继续服务知识库与帮助检索。
 
 判定存储与迁移细节见插件 `orm_models.py` 和迁移 `0022` 至 `0025`。
 新组合效果验收使用固定模型与事前冻结的样例期望。
@@ -588,7 +575,7 @@ Jev 请求截止覆盖连接、发送、接收与响应校验。
 - `store_current` 控制当前消息入缓冲。
 - `_generate_reply_core()` 执行读取与生成，不执行记忆写入。
 - 生成包装层从实际 Hindsight 会话标注目标指纹。
-- 生成核心接受可选的 `AgentRunCollector`。
+- 生成核心只向 DSH 提交结构化数据。
 - `fulfill()` 在发送前冻结父身份与适用承诺。
 - 发送前登记 `mark_send_started()`。
 - 平台发送结果落为 `DELIVERED`、`PENDING_CONFIRMATION` 或 `NOT_DELIVERED`。
@@ -614,32 +601,54 @@ Jev 请求截止覆盖连接、发送、接收与响应校验。
 `process_message(..., reply_allowed=False)` 用于 chat 封禁：保留原消息的判定和缓冲写入，但在 `_attempt_reply()` 前返回，并记录 `blocked_by_user_ban`。
 
 公开 debug 入口：
-- `komari_chat.generate_debug_reply()` — 以命令发起者身份、当前群上下文执行纯读取/生成，完全跳过决策引擎、表情反应、Redis push、好感度 adjust、Hindsight 写入、冷却/频控；使用 `debug-reply-*` trace ID；返回 `DebugReplyResult`（含 collector）
+- `komari_chat.generate_debug_reply()` 使用发起者身份与当前群上下文。
+- debug 只执行读取与生成，跳过判定与业务副作用。
+- debug 使用 `debug-reply-*` 任务标识。
+- debug 返回 `DebugReplyResult` 安全生成结果。
 - 底层依赖未初始化时抛出 `RuntimeError`（可展示的错误信息）
 
-视觉服务与图片理解（`vision_service.py` / `image_understanding.py`，TSK-194/ADR-0010）：
-- 已移除绕过网关的独立 `AsyncOpenAI` 调用，改用 `llm_provider.generate_messages_completion()`；视觉调用作为 `read_image` 工具的子调用，通过 collector 记录同一 trace，最终请求携带任务起点快照冻结的 `thinking_mode` / `reasoning_effort`，任务内不重读
-- 图片理解模式（`image_understanding_mode`：`native` / `delegated`）与 8 项下载预算（`vision_image_download_*`）归 `komari_chat` 配置（迁移 0015 从 `komari_memory` 一次性迁入，TSK-192 phase B 后由 chat 配置拥有，不保留 alias / 双读 / 运行时 fallback）；模式与预算在任务起点从 chat 配置读取一次并冻结，任务执行期间配置变更只影响下一个任务
-- `native`：图片经安全下载与校验后作为多模态输入直接交给聊天主模型（chat 槽位），不声明 / 不调用 `read_image` 工具；聊天模型对带图请求报错或拒图时本任务明确失败，不自动降级、不切 delegated、不调用视觉服务
-- `delegated`：只向主回复 Agent 暴露稳定图片索引与 `read_image` 工具，主工具循环恒使用聊天模型与 chat 槽位；视觉子调用（`vision_service`）才使用独立视觉模型与 vision 槽位（含 `vision_thinking_mode` / `vision_reasoning_effort`）
-- TSK-195：delegated 任务起点零预下载，`ImageReadingSession`（任务级图片会话）持有稳定引用（引用消息在前、当前消息在后）、按索引成功/失败缓存与并发单飞（取消任意 waiter 不取消共享下载/视觉任务，任务完成结果仍缓存）、字节账本/并发信号量/累计总时限（跨多轮不重建；总时限为下载活动区间的并集耗时，并发重叠只计一次、空闲不消耗不重置，`download()` 与 `download_many()` 共用同一账本）、全失败安全摘要（`all_images_unavailable` + 归一化错误类型，TSK-196 消费）；只有首次 `read_image(image_index)` 才经安全下载器懒下载；原始 URL 只存在于会话内部私有映射→安全下载器边界（公开引用只含稳定 index/origin/source_label），不进主模型消息、工具结果、普通日志与 Agent Run/debug 投影；任务结束 `close()` 阻止新读取、取消并等待在途读取后再释放下载连接；视觉描述经既有 `UntrustedContext`（`source_type=vision`）回流；主 prompt 只含稳定索引/来源/范围（无 URL/base64）
-- 域名必须由 aiohttp 建连阶段的受控 resolver 解析并校验，禁止恢复“预解析后再由客户端重新解析”的 DNS 重绑定窗口；每一跳重定向都执行同样校验
-- 图片 MIME 必须来自 Pillow 对真实文件的识别与解码结果，禁止信任响应 `Content-Type` 或 URL 后缀；仅接受 JPEG、PNG、GIF、WebP，并执行累计像素限制
-- TSK-196：图片理解失败统一汇总与安全终止。delegated 部分失败（非全部可用索引均已尝试且失败）保留结构化 `read_image` 失败工具结果并允许 `final_response`，成功任务把聚合摘要附加到 `ReplyResult.image_failure_summary`；全部可用索引均已尝试且失败（含同轮 `read_image`+`final_response`、以及最后允许轮次仅 `read_image` 无 `final_response`）在每次 `read_image` 的 ToolExecutionTrace 写入后立即以 `ImageUnderstandingFailureError`（只携带 `ImageFailureSummary`，`str()` 仅含模式）终止（绝不落入 MaxRounds RuntimeError），最后一次失败工具 Trace 保留；同轮 `final_response` 排在 `read_image` 之前时 `final_response` 成功且后续 `read_image` 不执行（不预判失败）。native 全部下载失败在主 LLM 前终止；主 provider 多模态调用失败在 llm_service 的 `_call_llm_completion` except seam 收敛为窄 marker `NativeMultimodalRequestError`（离开 except 后 raise，`cause/context=None`，不携带原异常 cause/正文，Agent Run LLM trace 只记录归一化异常类型），message_handler 只捕获该 marker 并包装为 `mode=native` 摘要（不切 delegated），其他异常（MaxRounds/工具预算/协议校验/内部）即便 native 有图也原样传播；provider 整体失败时 `failed_count` 恒为 `total_images`（部分下载失败 + provider 失败时 error_types/stages 同时含 download+vision）；部分下载失败成功任务同样附带摘要；无图片的普通 LLM 错误原样传播。`_generate_reply_core` 对所有预期图片失败（native 全下载失败 / native provider 失败 / delegated 全部不可用）统一汇聚到单点安全抛出：先保存安全 `ImageFailureSummary`（delegated 原异常与 native marker 都在 except 内只保存摘要、不 raise），离开 except/finally 后抛新 `ImageUnderstandingFailureError`（`cause/context=None`，异常链彻底断开，不残留原 provider 异常对象）；抛前显式清空该 frame 的图片敏感 traceback locals（函数参数 `image_urls`/`reply_context`、`reply_sources`/`current_sources`/`combined_sources`、`aligned_images`/`reply_image_urls`/`base64_image_urls`、含 image_url 部件的 `prompt_messages`、已 close 后置 None 的 `image_session`、可能持 raw input_data 的 `collector`），只重绑本地名字不触碰调用者对象，最终异常 traceback 的 komari_chat 帧递归投影不含原 URL/base64/视觉描述（不依赖 Sentry sanitizer 后处理）；`generate_debug_reply` 图片失败重抛前在 collector 安全 finalize 与普通安全日志后同样清空其帧的 `image_urls`/`reply_context`/`refetched_context`/`collector` 局部再 re-raise，普通非图片 debug 错误语义不变。成功路径 `process_message` 经共享 `GroupTaskFailureNotifier` 最多提交一次 SUPERUSER 图片汇总卡（`group_text=None` 无群消息，`image_failure_reason_code` 稳定去重键，`error_notify_enabled` 关闭只静默私聊），失败路径 `report_reply_failure` 对图片失败只发一张汇总卡（`reaction_sent` → 群内固定错误文本），debug 干跑绝不通知（只把安全结果保留在 collector/output）；`ImageFailureSummary` 只在 message_handler 通知边界经本地窄 mapper 投影为 onebot `ImageFailureDiagnostic`（构造时运行时校验并确定性去重排序，mode/stage/error type 白名单、failed_count 正整数），summary→diagnostic 映射失败 fail-closed：静默 SUPERUSER 图片卡且不降级为可能泄漏的 generic 私聊摘要，但仍经共享 notifier 投递 `group_text`（reaction_sent 分流），不吞掉既有群内固定道歉；图片卡只渲染群/trace/模式/失败阶段/失败数量/错误类型（不含任务），无 URL/base64/正文/视觉描述
+#### 原生图片输入
+
+修改图片传输或安全诊断前，读取 ADR-0016。
+`NativeImageInput` 复用现有安全下载器。
+引用图片在前，当前图片在后，失败不重排索引。
+任务起点冻结 8 项下载预算。
+
+地址解析在受控 resolver 内校验，每跳重定向重复校验。
+真实格式由 Pillow 解码确定，只接受 JPEG、PNG、GIF、WebP。
+下载继续限制字节、像素、并发和累计活动时限。
+
+可信图片描述符与有界分块送入任务私有附件缓存。
+DSH 官方图片助手执行规范化与模型输入投影。
+文本模型使用官方占位内容，不探测能力或回退视觉服务。
+全部下载失败在提交 DSH 任务前终止。
+部分失败成功任务保留安全摘要。
+图片请求失败与通用任务故障保持不同分类。
+
+异常链与递归 traceback locals 不保留 URL、载荷或上游正文。
+任务确认停止后释放附件。
+子进程实际退出后才删除宿主附件根目录。
+通知仍复用共享权限、冷却与固定群道歉规则。
+debug 干跑不发送失败通知。
 
 ### 7. 群聊总结执行服务 (`group_history_summary`)
 
-`execution_service.py` 提供共享执行服务 `execute_group_summary()`：
-- 输入 bot、group ID、bot self ID、自然语言总结要求、动态配置、可选 collector
-- 复用 `_running_groups` 集合（非 TOCTOU）+ 共享 `_group_locks` 双重保障
-- 正常 handler 按“动态开关 → 群聊准入 → 运行时权限 → 平台能力 → Noul 判定”顺序检查。
-- matcher 默认 `block=False`。传播阻断与交接遵循第 5 节的单次判定契约。
-- debug 入口直接调用共享服务，跳过 Noul 判定与业务权限，但仍执行能力检查与群锁
-- 返回结构化 `SummaryExecutionResult`：正文、筛选数、规划结果、图片 base64、过滤标签、时间范围
+`execute_group_summary()` 冻结配置并持有 Redis 群租约。
+能力检查在创建 DSH 任务前完成。
+正常入口继续消费同次 Jev 总结判定与单次交接资格。
+debug 复用执行服务，保留能力检查与群锁。
 
-规划与总结阶段采集诊断：
-- 每轮传入 `request_trace_id` 和 `request_phase`
-- 规划工具结果摘要仅包含 source、matched count、filters，不含消息正文
+DSH 总结预设与聊天预设隔离提示词、工具和会话。
+模型只获得近期、用户、主题历史查询与最终总结提交工具。
+Python 历史工具保留数量限制、过滤规则与部分覆盖校验。
+历史分页仅供可信桥接，不向模型开放任意页面读取。
+空历史仍需最终提交，结果保持既有空历史提示。
+
+`summary_planning_round_limit` 继续作为任务预算输入。
+历史数量、锁设置与渲染布局保持原有配置所有权。
+最终结果经过校验后才进入纯渲染与既有输出流程。
+租约丢失时先取消并等待任务释放，再归还群锁。
+准入拒绝保持静默，不伪装为生成技术失败。
 
 ### 8. 编码规范（必须遵守）
 
@@ -714,7 +723,9 @@ poetry run python -m komari_bot.db.orm_bootstrap revision -m "描述"
 规则：
 
 - 新增/修改表结构一律走迁移：改 `config_schema.py` / `prompt_schema.py` / `orm_models.py` 等 SQLModel 元数据后 autogenerate，`check` 必须零 diff 通过；CI（`.github/workflows/pr-acceptance.yml`）执行 `upgrade head` + `check` 守门。
-- 含向量、触发器、`UNLOGGED`、advisory lock 等特殊 DDL 的表（知识库、帮助、`komari_agent_run_log_index`、`komari_search_index_versions`）以 `op.execute` 手写 revision，不依赖 autogenerate。
+- 使用 `op.execute` 手写特殊 DDL 的 revision。
+- 特殊 DDL 包括向量、触发器、`UNLOGGED` 与 advisory lock。
+- 特殊 DDL 不依赖 autogenerate。
 - `migrations/env.py` 合并 SQLModel.metadata，`include_object` 统一禁止 autogenerate 为 metadata 之外的表生成 drop；删除表必须手写迁移，绝不依赖 autogenerate。
 - 容器 `docker/prestart.sh` 在启动 Gunicorn 前自动 `upgrade head`，失败 fail fast；本地升级新代码前先跑一次 `upgrade head`。
 
@@ -761,10 +772,11 @@ KOMARI_TEST_POSTGRES_URL=postgresql+asyncpg://user:pass@host:5432/komari_bot_tes
 10. **诊断结构与投递**：完整报告绝不包含完整 prompt、reasoning content、base64、历史或画像正文，且只私聊已鉴权 SUPERUSER；群内默认仅返回 request ID/状态，`--public` 仍必须隐藏输入、输出、用户标识、异常正文与工具参数
 11. **用户封禁边界**：`chat` 只压制 `komari_chat` 的实际回复；其他用户 matcher 统一属于 `command`，封禁时必须静默且保留原 matcher 的传播阻断语义
 12. **内容预算**：用户/管理入口可写文本必须复用 `komari_bot.llm.content_budget`；同时检查字符、UTF-8 字节、估算 token 与关键词组合，不得在各插件复制限额或静默截断
-13. **fetch_page 脱敏**：`komari_debug` 诊断报告的 `_build_safe_tool_arguments` 对 `fetch_page` 只记录 `url_count`，绝不记录 URL 内容；`komari_search` 抓取失败日志只记录 URL 数量与 URL 集合 SHA-256 指纹
+13. **fetch_page 脱敏**：保持查询结果的不可信数据边界。
+    抓取失败日志只记录 URL 数量与 URL 集合 SHA-256 指纹。
 
 14. **QQ 按钮协议**：显式配置权限，现有绑定/轮盘公开群命令按钮使用 `permission.type=2`；仅指定用户入口才使用 `type=0` + 真实 QQ 群成员 OpenID 非空名单，禁止缺失权限、空名单或身份缺失时放宽权限。按钮可点击性不替代服务端授权。按官方字段表完整输出 `label` / `visited_label` / `style` / `action.type` / `action.permission.type` / `data` / `unsupport_tips`，群命令保持 `enter=false` / `reply=false`；在真实 SDK 最终序列化层验收，不依赖客户端或 SDK 的宽松默认。设计、历史审计与修复说明见 `docs/adr/0013-qq-button-permission-policy.md`（TSK-296～299）；生产物化层已补齐字段，真实客户端展示仍须按实际运行版本记录样本。
 
 ---
 
-*本文件由 AI 生成于 2026-04-26，最后更新于 2026-10-25（TSK-197）。发现不一致请以实际代码为准并更新本文档。*
+*本文件由 AI 生成于 2026-04-26，最后更新于 DSH 执行退役（TSK-207）。发现不一致请以实际代码为准并更新本文档。*

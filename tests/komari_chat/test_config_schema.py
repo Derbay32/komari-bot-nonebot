@@ -193,54 +193,12 @@ EXPECTED_AGENT_TOOL_CALL_MODE_DEFAULT = "required"
 EXPECTED_AGENT_TOOL_CALL_MODE_CHOICES = ("required", "prompt_guided")
 
 
-def test_agent_tool_call_mode_is_typed_enum_with_default_required() -> None:
-    """AC1：agent_tool_call_mode 是强类型枚举，默认 required。"""
-    assert "agent_tool_call_mode" in KomariChatConfigSchema.model_fields
-    schema = KomariChatConfigSchema.model_json_schema()
-    property_schema = schema["properties"]["agent_tool_call_mode"]
-    assert property_schema.get("enum") == list(EXPECTED_AGENT_TOOL_CALL_MODE_CHOICES)
-    assert (
-        KomariChatConfigSchema.model_fields["agent_tool_call_mode"].default
-        == EXPECTED_AGENT_TOOL_CALL_MODE_DEFAULT
-    )
 
 
-@pytest.mark.parametrize("mode", EXPECTED_AGENT_TOOL_CALL_MODE_CHOICES)
-def test_agent_tool_call_mode_accepts_enum_values(mode: str) -> None:
-    """AC1：两个枚举值都可配置。"""
-    config = KomariChatConfigSchema(agent_tool_call_mode=mode)
-    assert config.model_dump().get("agent_tool_call_mode") == mode
 
 
-@pytest.mark.parametrize(
-    "invalid",
-    [
-        "auto",
-        "none",
-        "None",
-        "required ",
-        "Required",
-        "prompt_guided_extra",
-        "",
-    ],
-)
-def test_agent_tool_call_mode_rejects_invalid_values(invalid: str) -> None:
-    """AC1：枚举之外的值必须被 Pydantic 拒绝。"""
-    with pytest.raises(ValidationError):
-        KomariChatConfigSchema(agent_tool_call_mode=invalid)
 
 
-def test_agent_tool_call_mode_apply_mode_is_immediate() -> None:
-    """TSK-193：工具约束模式按管理元数据即时生效（无重启/重建）。"""
-    field = KomariChatConfigSchema.model_fields.get("agent_tool_call_mode")
-    assert field is not None, "agent_tool_call_mode 字段缺失"
-    extra = field.json_schema_extra
-    if isinstance(extra, dict) and "apply_mode" in extra:
-        assert extra["apply_mode"] == "immediate"
-    # 模型级默认 apply_mode 也必须保持 immediate，字段未声明覆盖时同样即时生效
-    assert KomariChatConfigSchema.model_config.get("json_schema_extra") == {
-        "default_apply_mode": "immediate"
-    }
 
 
 # ── TSK-194：图片理解模式与下载预算字段（AC1/AC2） ───────────────────
@@ -271,51 +229,12 @@ EXPECTED_IMAGE_BUDGET_BOUNDS: dict[str, tuple[int | float, int | float]] = {
 }
 
 
-def test_image_understanding_mode_is_typed_enum_with_default_delegated() -> None:
-    """AC1：image_understanding_mode 是强类型枚举，默认 delegated。"""
-    assert "image_understanding_mode" in KomariChatConfigSchema.model_fields
-    schema = KomariChatConfigSchema.model_json_schema()
-    property_schema = schema["properties"]["image_understanding_mode"]
-    assert property_schema.get("enum") == list(
-        EXPECTED_IMAGE_UNDERSTANDING_MODE_CHOICES
-    )
-    assert (
-        KomariChatConfigSchema.model_fields["image_understanding_mode"].default
-        == EXPECTED_IMAGE_UNDERSTANDING_MODE_DEFAULT
-    )
 
 
-@pytest.mark.parametrize("mode", EXPECTED_IMAGE_UNDERSTANDING_MODE_CHOICES)
-def test_image_understanding_mode_accepts_enum_values(mode: str) -> None:
-    """AC1：native / delegated 都可配置。"""
-    config = KomariChatConfigSchema(image_understanding_mode=mode)
-    assert config.model_dump().get("image_understanding_mode") == mode
 
 
-@pytest.mark.parametrize(
-    "invalid",
-    [
-        "auto",
-        "disabled",
-        "None",
-        "native ",
-        "delegated_extra",
-        "",
-    ],
-)
-def test_image_understanding_mode_rejects_invalid_values(invalid: str) -> None:
-    """AC1：枚举之外的值必须被 Pydantic 拒绝（无兼容值/宽松规范化）。"""
-    with pytest.raises(ValidationError):
-        KomariChatConfigSchema(image_understanding_mode=invalid)
 
 
-def test_image_understanding_mode_apply_mode_is_immediate() -> None:
-    """AC1：图片理解模式按管理元数据即时生效。"""
-    field = KomariChatConfigSchema.model_fields.get("image_understanding_mode")
-    assert field is not None, "image_understanding_mode 字段缺失"
-    extra = field.json_schema_extra
-    if isinstance(extra, dict) and "apply_mode" in extra:
-        assert extra["apply_mode"] == "immediate"
 
 
 def test_image_budget_fields_expose_expected_defaults() -> None:
@@ -443,15 +362,6 @@ def test_komari_chat_does_not_import_komari_memory_config_interface() -> None:
 # ── TSK-192 phase B：chat/context configuration ownership ───────────────
 
 TSK192_CHAT_OWNED_FIELDS = {
-    "llm_model_chat": "gemini-3-flash-preview",
-    "llm_temperature_chat": 1.0,
-    "llm_max_tokens_chat": 4000,
-    "llm_request_api_chat": "chat_completions",
-    "llm_stream_enabled_chat": False,
-    "llm_thinking_mode_chat": False,
-    "llm_reasoning_effort_chat": "",
-    "assistant_prefill_enabled": False,
-    "dsv4_roleplay_instruct_mode": "auto",
     "knowledge_enabled": True,
     "knowledge_limit": 3,
     "context_messages_limit": 10,
@@ -461,23 +371,12 @@ TSK192_CHAT_OWNED_FIELDS = {
     "face_reaction_id": "76",
 }
 
-TSK192_QUERY_REWRITE_FIELDS = {
-    "query_rewrite_model": "deepseek-v4-flash",
-    "query_rewrite_request_api": "chat_completions",
-    "query_rewrite_stream_enabled": False,
-    "query_rewrite_thinking_mode": False,
-    "query_rewrite_reasoning_effort": "",
-}
-
 
 def test_phase_b_fields_have_one_chat_owner_with_original_defaults() -> None:
     config = KomariChatConfigSchema()
 
     assert config.plugin_enable is False
     for field_name, expected in TSK192_CHAT_OWNED_FIELDS.items():
-        assert field_name in KomariChatConfigSchema.model_fields, field_name
-        assert getattr(config, field_name) == expected, field_name
-    for field_name, expected in TSK192_QUERY_REWRITE_FIELDS.items():
         assert field_name in KomariChatConfigSchema.model_fields, field_name
         assert getattr(config, field_name) == expected, field_name
 
@@ -496,8 +395,6 @@ def test_phase_b_fields_preserve_validation_and_apply_metadata() -> None:
     assert plugin_field.json_schema_extra == {"apply_mode": "restart"}
 
     bounds = {
-        "llm_temperature_chat": (-0.1, 2.1),
-        "llm_max_tokens_chat": (19, 8193),
         "knowledge_limit": (0, 11),
         "context_messages_limit": (4, 51),
         "context_max_utf8_bytes": (1023, 131_073),
@@ -509,19 +406,6 @@ def test_phase_b_fields_preserve_validation_and_apply_metadata() -> None:
         with pytest.raises(ValidationError):
             KomariChatConfigSchema(**{field_name: upper})
 
-    normalized = KomariChatConfigSchema(dsv4_roleplay_instruct_mode=" INNER_OS ")
-    assert normalized.dsv4_roleplay_instruct_mode == "inner_os"
-    invalid = KomariChatConfigSchema(dsv4_roleplay_instruct_mode="unknown")
-    assert invalid.dsv4_roleplay_instruct_mode == "auto"
-
-
-def test_query_rewrite_fields_use_summary_validation_not_temperature_copy() -> None:
-    config = KomariChatConfigSchema(query_rewrite_request_api="responses")
-    assert config.query_rewrite_request_api == "responses"
-    with pytest.raises(ValidationError):
-        KomariChatConfigSchema(query_rewrite_request_api="websocket")
-    assert not hasattr(config, "query_rewrite_temperature")
-    assert not hasattr(config, "query_rewrite_max_tokens")
 
 
 def test_chat_config_interface_has_no_memory_config_dependency() -> None:

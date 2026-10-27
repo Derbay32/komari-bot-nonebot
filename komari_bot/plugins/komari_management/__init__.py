@@ -8,22 +8,13 @@ from nonebot import get_driver, logger
 from nonebot.plugin import PluginMetadata, require
 
 from komari_bot.config.prompt_storage import close_prompt_storage_if_created
-from komari_bot.plugins.agent_run_logger.config_schema import (
-    AgentRunLoggerConfigSchema,
-)
 from komari_bot.plugins.embedding_provider.config_schema import (
     DynamicConfigSchema as EmbeddingProviderConfigSchema,
 )
 from komari_bot.plugins.group_history_summary.config_schema import (
     DynamicConfigSchema as GroupHistorySummaryConfigSchema,
 )
-from komari_bot.plugins.group_history_summary.prompt_schema import (
-    DISPLAY_NAME as GROUP_HISTORY_PROMPT_DISPLAY_NAME,
-)
 from komari_bot.plugins.komari_chat.config_schema import KomariChatConfigSchema
-from komari_bot.plugins.komari_chat.prompt_schema import (
-    DISPLAY_NAME as KOMARI_CHAT_PROMPT_DISPLAY_NAME,
-)
 from komari_bot.plugins.komari_context.config_schema import (
     KomariContextConfigSchema,
 )
@@ -42,9 +33,6 @@ from komari_bot.plugins.komari_roulette.config_schema import (
     DynamicConfigSchema as RouletteConfigSchema,
 )
 from komari_bot.plugins.komari_sentry.config_schema import KomariSentryConfigSchema
-from komari_bot.plugins.llm_provider.config_schema import (
-    DynamicConfigSchema as LlmProviderConfigSchema,
-)
 from komari_bot.plugins.sr.config_schema import (
     DynamicConfigSchema as SrConfigSchema,
 )
@@ -93,9 +81,6 @@ def _load_management_components() -> ManagementApiComponents:
     require("komari_help")
     from komari_bot.plugins import komari_help as help_plugin
 
-    require("agent_run_logger")
-    from komari_bot.plugins import agent_run_logger as agent_run_logger_plugin
-
     require("komari_search")
     from komari_bot.plugins import komari_search as search_plugin
 
@@ -117,13 +102,14 @@ def _load_management_components() -> ManagementApiComponents:
     require("komari_decision")
     from komari_bot.plugins import komari_decision as decision_plugin
 
+    require("komari_agent")
+    from komari_bot.plugins import komari_agent as agent_plugin
+
     return ManagementApiComponents(
         register_knowledge_api=knowledge_plugin.register_knowledge_api,
         knowledge_engine_getter=knowledge_plugin.get_engine,
         register_help_api=help_plugin.register_help_api,
         help_engine_getter=help_plugin.get_engine,
-        register_agent_run_log_api=agent_run_logger_plugin.register_agent_run_log_api,
-        agent_run_log_reader_getter=agent_run_logger_plugin.get_agent_run_log_reader,
         register_search_api=search_plugin.register_search_api,
         register_user_ban_api=user_ban_plugin.register_user_ban_api,
         user_ban_service_getter=user_ban_plugin.get_service,
@@ -134,6 +120,7 @@ def _load_management_components() -> ManagementApiComponents:
         register_roulette_management_api=roulette_plugin.register_roulette_management_api,
         roulette_observation_getter=roulette_plugin.get_roulette_observation,
         register_decision_api=decision_plugin.register_decision_api,
+        dsh_management_client_getter=agent_plugin.get_management_client,
         config_resources=(
             ManagedConfigResource(
                 resource_id="komari_management",
@@ -178,22 +165,6 @@ def _load_management_components() -> ManagementApiComponents:
                 manager_getter=lambda: config_manager_plugin.get_config_manager(
                     "komari_help",
                     HelpConfigSchema,
-                ),
-            ),
-            ManagedConfigResource(
-                resource_id="agent_run_logger",
-                display_name="Agent Run Logger",
-                manager_getter=lambda: config_manager_plugin.get_config_manager(
-                    "agent_run_logger",
-                    AgentRunLoggerConfigSchema,
-                ),
-            ),
-            ManagedConfigResource(
-                resource_id="llm_provider",
-                display_name="LLM Provider",
-                manager_getter=lambda: config_manager_plugin.get_config_manager(
-                    "llm_provider",
-                    LlmProviderConfigSchema,
                 ),
             ),
             ManagedConfigResource(
@@ -254,14 +225,6 @@ def _load_management_components() -> ManagementApiComponents:
             ),
         ),
         prompt_resources=(
-            ManagedPromptResource(
-                resource_id="komari_chat",
-                display_name=KOMARI_CHAT_PROMPT_DISPLAY_NAME,
-            ),
-            ManagedPromptResource(
-                resource_id="group_history_summary",
-                display_name=GROUP_HISTORY_PROMPT_DISPLAY_NAME,
-            ),
             ManagedPromptResource(
                 resource_id="komari_decision",
                 display_name=KOMARI_DECISION_PROMPT_DISPLAY_NAME,

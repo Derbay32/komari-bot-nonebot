@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal
 
 from nonebot import logger
@@ -372,13 +371,3 @@ async def fetch_group_history_messages(
             failure_code=failure_code,
         ),
     )
-
-
-def format_message_for_prompt(message: HistoryMessage) -> str:
-    """将历史消息格式化为 LLM 输入文本。"""
-    dt = (
-        datetime.fromtimestamp(message.timestamp, tz=UTC)
-        .astimezone()
-        .strftime("%m-%d %H:%M")
-    )
-    return f"[{dt}] {message.nickname}({message.user_id}): {message.content}"

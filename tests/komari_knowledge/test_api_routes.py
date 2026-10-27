@@ -13,6 +13,8 @@ from komari_bot.plugins.komari_knowledge.engine import UNSET, SearchResult
 from komari_bot.plugins.komari_knowledge.models import KnowledgeCategory, KnowledgeEntry
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from nonebug import App
 
 
@@ -125,8 +127,11 @@ class _FakeEngine:
         query: str,
         limit: int | None = None,
         query_vec: list[float] | None = None,
+        *,
+        embedding_guard: Callable[[], bool] | None = None,
+        raw_query: bool = False,
     ) -> list[SearchResult]:
-        del query_vec
+        del query_vec, embedding_guard, raw_query
         self.search_calls.append((query, limit))
         return [
             SearchResult(

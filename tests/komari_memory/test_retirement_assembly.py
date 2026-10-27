@@ -76,10 +76,6 @@ try:
 
     from komari_bot.context.redis_store import MessageSchema
     from komari_bot.plugins import komari_context, komari_memory, user_data
-    from komari_bot.plugins.komari_chat.prompt_schema import KomariChatPromptSchema
-    from komari_bot.plugins.group_history_summary.prompt_schema import (
-        GroupHistorySummaryPromptSchema,
-    )
     from komari_bot.plugins.komari_decision.prompt_schema import (
         KomariDecisionPromptSchema,
     )
@@ -138,8 +134,6 @@ try:
         prompt_ids = sorted(item["resource_id"] for item in prompts.json()["items"])
         expected_prompt_ids = sorted(
             {
-                KomariChatPromptSchema.prompt_resource_id,
-                GroupHistorySummaryPromptSchema.prompt_resource_id,
                 KomariDecisionPromptSchema.prompt_resource_id,
             }
         )
@@ -597,8 +591,6 @@ async def test_real_assembly_retires_old_memory_surfaces_and_keeps_independent_r
         )
         assert payload["required_plugins_loaded"] == sorted(REQUIRED_PLUGINS)
         assert payload["prompt_resource_ids"] == [
-            "group_history_summary",
-            "komari_chat",
             "komari_decision",
         ]
         assert payload["memory_config_fields"] == [

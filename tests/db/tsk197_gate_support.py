@@ -35,12 +35,6 @@ import pytest
 import yaml
 from asyncpg.exceptions import InsufficientPrivilegeError
 
-from komari_bot.db.seed_bootstrap import DEFAULT_SEED_FILE
-from tests.config.prompt_field_contract import (
-    find_prompt_mapping,
-    prompt_table_name,
-)
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 POSTGRES_URL = os.getenv("KOMARI_TEST_POSTGRES_URL", "")
@@ -52,7 +46,7 @@ SKIP_NO_POSTGRES = pytest.mark.skipif(
     reason="未设置 KOMARI_TEST_POSTGRES_URL，跳过集成测试",
 )
 
-HEAD_REVISION = "0031"
+HEAD_REVISION = "0033"
 
 #: 0013 引入的三项回复 Agent 预算列（仅让这些列走数据库默认值）。
 AGENT_BUDGET_COLUMNS = (
@@ -275,7 +269,11 @@ async def drop_scratch_database(database: str) -> None:
 
 def asset_values(resource_id: str) -> dict[str, str]:
     """从默认 seed 资产读取指定 Prompt 资源的初始值（通用定位，不锁定布局）。"""
-    raw = yaml.safe_load(DEFAULT_SEED_FILE.read_text(encoding="utf-8")) or {}
+    from komari_bot.db.seed_bootstrap import DEFAULT_DECISION_SEED_FILE
+    from tests.config.prompt_field_contract import find_prompt_mapping
+
+    seed_file = DEFAULT_DECISION_SEED_FILE
+    raw = yaml.safe_load(seed_file.read_text(encoding="utf-8")) or {}
     mapping = find_prompt_mapping(raw, resource_id)
     assert mapping is not None, f"默认 seed 资产缺少 {resource_id} Prompt 初始数据块"
     return {str(field): str(value) for field, value in mapping.items()}
@@ -286,6 +284,8 @@ async def fetch_prompt_row(
     resource_id: str,
 ) -> dict[str, Any] | None:
     """读取指定 Prompt 资源 id=1 单行；无行返回 ``None``。"""
+    from tests.config.prompt_field_contract import prompt_table_name
+
     table = prompt_table_name(resource_id)
     row = await connection.fetchrow(f"SELECT * FROM {table} WHERE id = 1")
     return None if row is None else dict(row)

@@ -62,6 +62,9 @@ class KnowledgeEngineProtocol(Protocol):
         query: str,
         limit: int | None = None,
         query_vec: list[float] | None = None,
+        *,
+        embedding_guard: Callable[[], bool] | None = None,
+        raw_query: bool = False,
     ) -> list[KnowledgeSearchHit]: ...
 
 

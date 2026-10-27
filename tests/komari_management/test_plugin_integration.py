@@ -12,7 +12,6 @@ import nonebot
 import pytest
 from pydantic import BaseModel
 
-from komari_bot.plugins.agent_run_logger.api import register_agent_run_log_api
 from komari_bot.plugins.character_binding.management_api import (
     register_character_binding_repair_api,
 )
@@ -85,8 +84,6 @@ def _build_components() -> ManagementApiComponents:
         knowledge_engine_getter=lambda: None,
         register_help_api=register_help_api,
         help_engine_getter=lambda: None,
-        register_agent_run_log_api=register_agent_run_log_api,
-        agent_run_log_reader_getter=lambda: None,
         register_search_api=register_search_api,
         register_user_ban_api=register_user_ban_api,
         user_ban_service_getter=lambda: None,
@@ -105,8 +102,8 @@ def _build_components() -> ManagementApiComponents:
         ),
         prompt_resources=(
             make_managed_prompt_resource(
-                "komari_chat",
-                prompt_display_name("komari_chat"),
+                "komari_decision",
+                prompt_display_name("komari_decision"),
             ),
         ),
     )
@@ -150,10 +147,13 @@ async def test_nonebot_fastapi_driver_exposes_docs_and_management_routes(
     assert "/api/v2/komari-knowledge/knowledge" in schema["paths"]
     assert "/api/v2/komari-help/help" in schema["paths"]
     assert "/api/v2/komari-memory/conversations" not in schema["paths"]
-    assert "/api/v2/agent-run-logs/runs" in schema["paths"]
+    assert "/api/v2/agent-run-logs/runs" not in schema["paths"]
     assert "/api/v2/komari-search/provider-descriptors" in schema["paths"]
     assert "/api/v2/komari-management-config/resources" in schema["paths"]
     assert "/api/v2/komari-management-prompt/resources" in schema["paths"]
+    assert "/api/v2/komari-agent/providers" in schema["paths"]
+    assert "/api/v2/komari-agent/bindings/{kind}" in schema["paths"]
+    assert "/api/v2/komari-agent/prompts/{kind}" in schema["paths"]
     assert "/api/v2/komari-user-bans/bans" in schema["paths"]
     assert "/api/v2/reply-fulfillments/fulfillments" in schema["paths"]
     assert "/api/v2/character-bindings/repair/diagnose" in schema["paths"]
@@ -167,10 +167,10 @@ async def test_nonebot_fastapi_driver_exposes_docs_and_management_routes(
     assert {
         "komari-knowledge",
         "komari-help",
-        "agent-run-logs",
         "komari-search",
         "komari-management-config",
         "komari-management-prompt",
+        "komari-agent",
         "komari-user-bans",
         "reply-fulfillments",
         "character-binding-repair",
@@ -199,7 +199,6 @@ _REAL_MANAGEMENT_INIT = (
 #: Symbols the production loader reads off plugin tops the suite shims.
 _LOADER_DEPENDENCY_SYMBOLS: dict[str, tuple[str, ...]] = {
     "komari_knowledge": ("register_knowledge_api", "get_engine"),
-    "agent_run_logger": ("register_agent_run_log_api", "get_agent_run_log_reader"),
     "user_ban": ("register_user_ban_api", "get_service"),
     "komari_chat": ("get_reply_fulfillment_ops_service",),
     "character_binding": (
@@ -286,6 +285,21 @@ def real_management_loader(
     )
 
 
+def test_production_loader_has_no_agent_run_logger_components(
+    real_management_loader: SimpleNamespace,
+) -> None:
+    """TSK-200：真实 loader 不再装配 Agent Run 路由、读取器或配置资源。"""
+
+    components = real_management_loader.load_components()
+
+    assert "agent_run_logger" not in real_management_loader.required_plugins
+    resource_ids = {resource.resource_id for resource in components.config_resources}
+    assert "agent_run_logger" not in resource_ids
+    fields = components.__dataclass_fields__
+    assert "register_agent_run_log_api" not in fields
+    assert "agent_run_log_reader_getter" not in fields
+
+
 def test_production_loader_carries_real_roulette_symbols(
     real_management_loader: SimpleNamespace,
 ) -> None:
@@ -296,6 +310,7 @@ def test_production_loader_carries_real_roulette_symbols(
     components = real_management_loader.load_components()
 
     assert "komari_roulette" in real_management_loader.required_plugins
+    assert "komari_agent" in real_management_loader.required_plugins
     assert "komari_memory" not in real_management_loader.required_plugins
     assert (
         components.register_roulette_management_api

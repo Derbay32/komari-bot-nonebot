@@ -16,15 +16,14 @@ from komari_bot.onebot import (
     ImageFailureDiagnostic,
     image_failure_reason_code,
 )
+from komari_bot.plugins.komari_chat.services.image_failure import (
+    ImageFailureSummary,
+)
 from tests.komari_chat.hindsight_recall_support import (
     FakeHindsightMemory,
     fake_recall_session,
 )
 
-image_reading_session_module = import_module(
-    "komari_bot.plugins.komari_chat.services.image_reading_session"
-)
-ImageFailureSummary = image_reading_session_module.ImageFailureSummary
 message_handler_module = import_module(
     "komari_bot.plugins.komari_chat.handlers.message_handler"
 )
@@ -645,7 +644,7 @@ async def test_process_message_success_with_image_failures_notifies_once(
     )
 
     summary = _image_summary()
-    reply_result = message_handler_module.ReplyResult(
+    reply_result = import_module("komari_bot.plugins.komari_chat.services.chat_result").ReplyResult(
         content="回复内容",
         favorability_delta=0,
         favorability_reason="无变化",

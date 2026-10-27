@@ -10,12 +10,13 @@ from komari_bot.management.management_api import resolve_management_settings
 from .announce_api import register_announce_api
 from .config_api import register_config_api
 from .config_schema import DEFAULT_ANNOUNCE_STATUS_PAGE_URL
+from .dsh_api import API_PREFIX as AGENT_API_PREFIX
+from .dsh_api import register_dsh_management_api
 from .prompt_api import register_prompt_api
 from .reply_fulfillment_api import register_reply_fulfillment_api
 
 KNOWLEDGE_API_PREFIX = "/api/v2/komari-knowledge"
 HELP_API_PREFIX = "/api/v2/komari-help"
-AGENT_RUN_LOG_API_PREFIX = "/api/v2/agent-run-logs"
 SEARCH_API_PREFIX = "/api/v2/komari-search"
 ANNOUNCE_API_PREFIX = "/api/v2/komari-announce"
 MANAGEMENT_CONFIG_API_PREFIX = "/api/v2/komari-management-config"
@@ -42,8 +43,6 @@ class ManagementApiComponents:
     knowledge_engine_getter: Callable[[], object | None]
     register_help_api: Callable[..., None]
     help_engine_getter: Callable[[], object | None]
-    register_agent_run_log_api: Callable[..., None]
-    agent_run_log_reader_getter: Callable[[], object | None]
     register_search_api: Callable[..., None]
     register_user_ban_api: Callable[..., None]
     user_ban_service_getter: Callable[[], object]
@@ -56,6 +55,7 @@ class ManagementApiComponents:
     register_roulette_management_api: Callable[..., None]
     roulette_observation_getter: Callable[[], object | None]
     register_decision_api: Callable[..., None]
+    dsh_management_client_getter: Callable[[], object | None] | None = None
 
 
 def register_management_api_for_driver(
@@ -100,12 +100,6 @@ def register_management_api_for_driver(
         api_token=token_source,
         allowed_origins=settings.allowed_origins,
         engine_getter=components.help_engine_getter,
-    )
-    components.register_agent_run_log_api(
-        server_app,
-        api_token=token_source,
-        allowed_origins=settings.allowed_origins,
-        reader_getter=components.agent_run_log_reader_getter,
     )
     components.register_search_api(
         server_app,
@@ -158,6 +152,12 @@ def register_management_api_for_driver(
         allowed_origins=settings.allowed_origins,
         resources=components.prompt_resources,
     )
+    register_dsh_management_api(
+        server_app,
+        api_token=token_source,
+        allowed_origins=settings.allowed_origins,
+        client_getter=components.dsh_management_client_getter or (lambda: None),
+    )
     register_announce_api(
         server_app,
         api_token=token_source,
@@ -184,8 +184,9 @@ def register_management_api_for_driver(
     logger.info(
         "[Komari Management] 管理 API 已注册: "
         f"{KNOWLEDGE_API_PREFIX}, {HELP_API_PREFIX}, "
-        f"{AGENT_RUN_LOG_API_PREFIX}, {SEARCH_API_PREFIX}, "
+        f"{SEARCH_API_PREFIX}, "
         f"{MANAGEMENT_CONFIG_API_PREFIX}, {MANAGEMENT_PROMPT_API_PREFIX}, {ANNOUNCE_API_PREFIX}, "
+        f"{AGENT_API_PREFIX}, "
         f"{USER_BAN_API_PREFIX}, "
         f"{GROUP_ADMISSION_API_PREFIX}, "
         f"{REPLY_FULFILLMENT_API_PREFIX}"

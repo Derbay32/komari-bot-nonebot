@@ -10,7 +10,6 @@ import pytest
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-from komari_bot.plugins.agent_run_logger.api import register_agent_run_log_api
 from komari_bot.plugins.character_binding.management_api import (
     register_character_binding_repair_api,
 )
@@ -123,8 +122,6 @@ def _build_components() -> ManagementApiComponents:
         knowledge_engine_getter=lambda: None,
         register_help_api=register_help_api,
         help_engine_getter=lambda: None,
-        register_agent_run_log_api=register_agent_run_log_api,
-        agent_run_log_reader_getter=lambda: None,
         register_search_api=register_search_api,
         register_user_ban_api=register_user_ban_api,
         user_ban_service_getter=lambda: None,
@@ -143,8 +140,8 @@ def _build_components() -> ManagementApiComponents:
         ),
         prompt_resources=(
             make_managed_prompt_resource(
-                "komari_chat",
-                prompt_display_name("komari_chat"),
+                "komari_decision",
+                prompt_display_name("komari_decision"),
             ),
         ),
     )
@@ -210,10 +207,15 @@ async def test_register_management_api_for_fastapi_driver(app: App) -> None:
     assert retired_scene_sync.status_code == 404
     assert "/api/v2/komari-knowledge/knowledge" in schema["paths"]
     assert "/api/v2/komari-help/help" in schema["paths"]
-    assert "/api/v2/agent-run-logs/runs" in schema["paths"]
+    assert "/api/v2/agent-run-logs/runs" not in schema["paths"]
     assert "/api/v2/komari-search/provider-descriptors" in schema["paths"]
     assert "/api/v2/komari-management-config/resources" in schema["paths"]
     assert "/api/v2/komari-management-prompt/resources" in schema["paths"]
+    assert "/api/v2/komari-agent/providers" in schema["paths"]
+    assert "/api/v2/komari-agent/providers/{provider}" in schema["paths"]
+    assert "/api/v2/komari-agent/providers/{provider}/credential" in schema["paths"]
+    assert "/api/v2/komari-agent/bindings/{kind}" in schema["paths"]
+    assert "/api/v2/komari-agent/prompts/{kind}" in schema["paths"]
     assert "/api/v2/komari-announce/groups" in schema["paths"]
     assert "/api/v2/komari-announce/maintenance" in schema["paths"]
     assert "/api/v2/komari-decision/health" in schema["paths"]
@@ -234,9 +236,10 @@ async def test_register_management_api_for_fastapi_driver(app: App) -> None:
     assert logger.info_messages[-2] == (
         "[Komari Management] 管理 API 已注册: "
         "/api/v2/komari-knowledge, /api/v2/komari-help, "
-        "/api/v2/agent-run-logs, /api/v2/komari-search, "
+        "/api/v2/komari-search, "
         "/api/v2/komari-management-config, /api/v2/komari-management-prompt, "
         "/api/v2/komari-announce, "
+        "/api/v2/komari-agent, "
         "/api/v2/komari-user-bans, /api/v2/group-admission, /api/v2/reply-fulfillments"
     )
     assert logger.info_messages[-1] == (
@@ -302,7 +305,6 @@ async def test_read_only_credential_cannot_mutate_any_management_resource(
                 "permissions": [
                     "knowledge:read",
                     "help:read",
-                    "agent_run_logs:read",
                     "search:read",
                     "config:read",
                     "prompt:read",
@@ -345,7 +347,7 @@ async def test_read_only_credential_cannot_mutate_any_management_resource(
                 json={"value": False},
             ),
             await client.patch(
-                "/api/v2/komari-management-prompt/resources/komari_chat/fields/system_prompt",
+                "/api/v2/komari-management-prompt/resources/komari_decision/fields/role_description",
                 headers=headers,
                 json={"value": "测试"},
             ),

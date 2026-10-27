@@ -297,8 +297,8 @@ ADMISSION_EFFECT_CASES: tuple[AdmissionEffectCase, ...] = (
     AdmissionEffectCase(
         effect_id="group_admission.effect.chat.llm_round",
         owner_module="komari_bot.plugins.komari_chat",
-        source_symbol="_execute_tool_loop/_call_llm_completion",
-        sink_kind="llm_provider_round",
+        source_symbol="DshChatService.generate",
+        sink_kind="dsh_chat_task",
         intent="business",
         attribution_source="komari_chat_message_group_id",
         work_category="transient_interaction",
@@ -544,20 +544,20 @@ ADMISSION_EFFECT_CASES += (
     AdmissionEffectCase(
         effect_id="group_admission.effect.chat.tool_dispatch",
         owner_module="komari_bot.plugins.komari_chat",
-        source_symbol="_execute_business_tool",
+        source_symbol="ChatQueryTools.callbacks",
         sink_kind="tool_body_execution",
         intent="business",
         attribution_source="komari_chat_message_group_id",
         work_category="transient_interaction",
         acceptance_anchor=(
             "tests/group_admission/test_chat_effect_admission.py"
-            "::test_tool_dispatch_restricted_blocks_tool_body"
+            "::test_tool_dispatch_restricted_blocks_tool_body[chat.search_web]"
         ),
     ),
     AdmissionEffectCase(
         effect_id="group_admission.effect.chat.tool_search",
         owner_module="komari_bot.plugins.komari_chat",
-        source_symbol="_build_search_tool_result",
+        source_symbol="ChatQueryTools._search_web_tool",
         sink_kind="komari_search_http",
         intent="business",
         attribution_source="komari_chat_message_group_id",
@@ -647,7 +647,7 @@ ADMISSION_EFFECT_CASES += (
     AdmissionEffectCase(
         effect_id="group_admission.effect.chat.tool_fetch_page",
         owner_module="komari_bot.plugins.komari_chat",
-        source_symbol="_build_fetch_tool_result",
+        source_symbol="ChatQueryTools._fetch_page_tool",
         sink_kind="komari_search_http",
         intent="business",
         attribution_source="komari_chat_message_group_id",
@@ -662,22 +662,9 @@ ADMISSION_EFFECT_CASES += (
 
 ADMISSION_EFFECT_CASES += (
     AdmissionEffectCase(
-        effect_id="group_admission.effect.chat.vision_completion",
-        owner_module="komari_bot.plugins.komari_chat",
-        source_symbol="vision_service.read_image",
-        sink_kind="vision_llm_round",
-        intent="business",
-        attribution_source="komari_chat_message_group_id",
-        work_category="transient_interaction",
-        acceptance_anchor=(
-            "tests/group_admission/test_chat_seam_admission.py"
-            "::test_vision_completion_restricted_blocks_vision_llm"
-        ),
-    ),
-    AdmissionEffectCase(
         effect_id="group_admission.effect.chat.image_download",
         owner_module="komari_bot.plugins.komari_chat",
-        source_symbol="image_downloader.download_images",
+        source_symbol="NativeImageInput.prepare",
         sink_kind="image_http_download",
         intent="business",
         attribution_source="komari_chat_message_group_id",
@@ -719,16 +706,18 @@ ADMISSION_EFFECT_CASES += (
 # TSK-229 群历史总结 (group_history_summary) 与调试总结的逐效果准入登记。
 #
 # 总结是瞬时互动 (transient_interaction, 见 ADR-0012「瞬时互动被拒绝后立即
-# 终止，恢复准入后不复活」)：群历史平台读取、planning LLM、summary LLM、
-# 图片渲染与平台输出各自拥有独立 effect ID 前缀 group_admission.effect.summary.，
-# 归属来自总结命令所在群 group_history_summary_group_id，intent 均为 business。
+# 终止，恢复准入后不复活」)：群历史平台读取、DSH 模型请求、图片渲染与平台
+# 输出各自拥有独立 effect ID 前缀 group_admission.effect.summary.，归属来自
+# 总结命令所在群 group_history_summary_group_id，intent 均为 business。
+# TSK-206 起规划/总结两次自有 LLM 调用退役为单个 DSH 任务请求；Node 运行时
+# 在每次模型请求（含重试与辅助请求）前调用共享 admission 回调。
 # ``summary.group_output`` 约束普通总结在群内逐条输出（文本/图片）的平台发送；
 # ``summary.debug_public`` 约束 ``.debug summary --public`` 群公开脱敏结果。
 ADMISSION_EFFECT_CASES += (
     AdmissionEffectCase(
         effect_id="group_admission.effect.summary.history_read",
         owner_module="komari_bot.plugins.group_history_summary",
-        source_symbol="history_service.fetch_group_history_messages",
+        source_symbol="history_tools.fetch_history_window",
         sink_kind="onebot_get_group_msg_history",
         intent="business",
         attribution_source="group_history_summary_group_id",
@@ -739,29 +728,16 @@ ADMISSION_EFFECT_CASES += (
         ),
     ),
     AdmissionEffectCase(
-        effect_id="group_admission.effect.summary.planning_llm",
+        effect_id="group_admission.effect.summary.dsh_model_request",
         owner_module="komari_bot.plugins.group_history_summary",
-        source_symbol="planner_service.plan_summary_request",
-        sink_kind="llm_provider_round",
+        source_symbol="dsh_summary_service.DshSummaryService",
+        sink_kind="dsh_model_request",
         intent="business",
         attribution_source="group_history_summary_group_id",
         work_category="transient_interaction",
         acceptance_anchor=(
             "tests/group_admission/test_summary_admission.py"
-            "::test_planning_llm_restricted_blocks_provider"
-        ),
-    ),
-    AdmissionEffectCase(
-        effect_id="group_admission.effect.summary.summary_llm",
-        owner_module="komari_bot.plugins.group_history_summary",
-        source_symbol="summarize_service.summarize_history_messages",
-        sink_kind="llm_provider_round",
-        intent="business",
-        attribution_source="group_history_summary_group_id",
-        work_category="transient_interaction",
-        acceptance_anchor=(
-            "tests/group_admission/test_summary_admission.py"
-            "::test_summary_llm_restricted_blocks_provider"
+            "::test_model_request_admission_denied_is_normal_control_flow"
         ),
     ),
     AdmissionEffectCase(

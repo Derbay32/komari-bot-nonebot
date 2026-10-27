@@ -147,7 +147,7 @@ def _stored(
     prompt_data: dict[str, str],
     *,
     revision: int = 1,
-    resource_id: str = "komari_chat",
+    resource_id: str = "komari_decision",
 ) -> StoredPrompt:
     return StoredPrompt(
         resource_id=resource_id,
@@ -158,7 +158,7 @@ def _stored(
 
 
 def _complete_row(
-    resource_id: str = "komari_chat",
+    resource_id: str = "komari_decision",
     **overrides: str,
 ) -> dict[str, str]:
     """该资源 Schema 完整的 marker 行（机制测试输入，不复制 seed/正文）。"""
@@ -169,7 +169,7 @@ def _complete_row(
 
 def _loader(
     *,
-    resource_id: str = "komari_chat",
+    resource_id: str = "komari_decision",
     display_name: str = "Komari Chat Prompt",
 ) -> PromptTemplateLoader:
     """构造无 ``defaults`` 参数的 loader（TSK-191 后统一形态，AC8）。
@@ -213,7 +213,7 @@ def test_validate_prompt_values_uses_schema_field_set_not_defaults() -> None:
     resource.resource_id)`` 决定。旧实现以 defaults 键集作白名单且资源
     无 ``defaults`` 属性，因此本用例是 TSK-191 的可解释 RED。
     """
-    resource = _resource("komari_chat")
+    resource = _resource("komari_decision")
     field_name = sorted(prompt_resource_field_names(resource.resource_id))[0]
 
     assert validate_prompt_values(resource, {field_name: "新值\n"}) == {
@@ -228,7 +228,7 @@ def test_validate_prompt_values_rejects_unknown_and_blank_fields() -> None:
     defaults），因此本用例整体是 TSK-191 的可解释 RED；实现后空白/预算
     断言必须命中正文校验语义，而不是被当作「未知字段」。
     """
-    resource = _resource("komari_chat")
+    resource = _resource("komari_decision")
     field_name = sorted(prompt_resource_field_names(resource.resource_id))[0]
 
     assert validate_prompt_values(resource, {field_name: "新值"}) == {
@@ -296,7 +296,7 @@ def test_prompt_template_loader_falls_back_to_cache_on_storage_error(
     clock = {"now": 1000.0}
     monkeypatch.setattr(prompt_storage, "monotonic", lambda: clock["now"])
 
-    v1 = _complete_row(system_prompt="PG 值")
+    v1 = _complete_row(role_description="PG 值")
     storage = _ScriptedStorage([_stored(v1), RuntimeError("PG 故障")])
     monkeypatch.setattr(prompt_storage, "get_prompt_storage", lambda: storage)
     loader = _loader()
@@ -312,8 +312,8 @@ async def test_async_prompt_loader_uses_cache_and_notification_invalidation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """缓存命中零 SQL；本进程写入失效回调后重读。"""
-    v1 = _complete_row(system_prompt="PG 值 1")
-    v2 = _complete_row(system_prompt="PG 值 2")
+    v1 = _complete_row(role_description="PG 值 1")
+    v2 = _complete_row(role_description="PG 值 2")
     storage = _ScriptedStorage([_stored(v1, revision=1), _stored(v2, revision=2)])
     monkeypatch.setattr(prompt_storage, "get_prompt_storage", lambda: storage)
     loader = _loader()
@@ -388,8 +388,8 @@ def test_prompt_loader_refetches_after_staleness_ceiling(
     clock = {"now": 1000.0}
     monkeypatch.setattr(prompt_storage, "monotonic", lambda: clock["now"])
 
-    v1 = _complete_row(system_prompt="第一版")
-    v2 = _complete_row(system_prompt="第二版")
+    v1 = _complete_row(role_description="第一版")
+    v2 = _complete_row(role_description="第二版")
     storage = _ScriptedStorage([_stored(v1, revision=1), _stored(v2, revision=2)])
     monkeypatch.setattr(prompt_storage, "get_prompt_storage", lambda: storage)
     loader = _loader()
@@ -409,7 +409,7 @@ def test_sync_operations_inside_event_loop_raise() -> None:
 
     async def _caller() -> None:
         with pytest.raises(RuntimeError, match="请改用对应的 _async"):
-            storage.fetch("komari_chat")
+            storage.fetch("komari_decision")
 
     try:
         asyncio.run(_caller())
@@ -422,7 +422,7 @@ def test_closed_storage_rejects_new_operations() -> None:
     storage.close()
 
     with pytest.raises(RuntimeError, match="Prompt 存储已关闭"):
-        storage.fetch("komari_chat")
+        storage.fetch("komari_decision")
 
 
 def test_close_prompt_storage_if_created_does_not_create_storage() -> None:
@@ -504,8 +504,8 @@ def test_async_loader_keeps_last_valid_cache_on_db_failure_and_refreshes(
     clock = {"now": 1000.0}
     monkeypatch.setattr(prompt_storage, "monotonic", lambda: clock["now"])
 
-    v1 = _complete_row(system_prompt="PG 值 v1")
-    v2 = _complete_row(system_prompt="PG 值 v2")
+    v1 = _complete_row(role_description="PG 值 v1")
+    v2 = _complete_row(role_description="PG 值 v2")
     storage = _ScriptedStorage(
         [_stored(v1, revision=1), RuntimeError("PG 暂时故障（测试模拟）"), _stored(v2, revision=2)]
     )

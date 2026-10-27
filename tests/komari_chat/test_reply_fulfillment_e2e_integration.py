@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import os
 from contextlib import asynccontextmanager, suppress
+from importlib import import_module
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlsplit
@@ -349,7 +350,7 @@ def _pending_reply(
         reply="端到端角色回复",
         reply_to_message_id=f"message-{run_id}",
         message=message,
-        reply_result=handler_module.ReplyResult(
+        reply_result=import_module("komari_bot.plugins.komari_chat.services.chat_result").ReplyResult(
             content="端到端角色回复",
             favorability_delta=5,
             favorability_reason="端到端互动",

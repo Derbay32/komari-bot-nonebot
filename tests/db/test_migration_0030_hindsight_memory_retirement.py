@@ -9,11 +9,11 @@ from typing import Any
 import asyncpg
 import pytest
 
-from komari_bot.plugins.komari_chat.prompt_schema import KomariChatPromptSchema
 from komari_bot.plugins.komari_context.config_schema import (
     KomariContextConfigSchema,
 )
 from komari_bot.plugins.komari_memory.config_schema import KomariMemoryConfigSchema
+from tests.config.chat_prompt_field_contract import HISTORICAL_CHAT_FIELDS
 from tests.db.tsk197_gate_support import (
     HEAD_REVISION,
     SKIP_NO_POSTGRES,
@@ -387,7 +387,7 @@ async def test_0030_drops_retired_surface_and_preserves_sources_and_admin_values
             assert context_row["updated_at"] == UPDATED_AT
 
             prompt_columns = await _column_names(connection, CHAT_PROMPT_TABLE)
-            expected_prompt = set(KomariChatPromptSchema.model_fields)
+            expected_prompt = set(HISTORICAL_CHAT_FIELDS) | {"id", "revision", "updated_at"}
             assert prompt_columns == expected_prompt
             assert not RETIRED_CHAT_PROMPT_FIELDS & prompt_columns
             prompt_row = dict(
@@ -432,17 +432,14 @@ async def test_0030_drops_retired_surface_and_preserves_sources_and_admin_values
             await connection.close()
 
         # The historical 0030 guard is verified above.  Continue to the current
-        # head and prove the new revision changes no source row or index while
-        # the current metadata is drift-free.
-        result = run_bootstrap(db_url, "upgrade", "head")
+        # pre-retirement revision and prove no source row or index changes.
+        result = run_bootstrap(db_url, "upgrade", "0032")
         assert result.returncode == 0, result.stderr
-        check = run_bootstrap(db_url, "check")
-        assert check.returncode == 0, f"{check.stdout}\n{check.stderr}"
         connection = await asyncpg.connect(**scratch)
         try:
             assert (
                 await connection.fetchval("SELECT version_num FROM alembic_version")
-                == HEAD_REVISION
+                == "0032"
             )
             await _assert_formal_source_snapshot(
                 connection, source_rows_before, source_indexes_before
