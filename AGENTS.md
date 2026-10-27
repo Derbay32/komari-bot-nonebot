@@ -252,6 +252,17 @@ Jev 提示词仍使用 PostgreSQL 资源 `komari_decision`。
 
 ### 1.2 Komari Management v2
 
+修改管理启动配置前，读取 ADR-0017。
+管理插件自身的全部配置只读取 NoneBot dotenv／进程环境变量。
+环境变量统一使用 `KOMARI_MANAGEMENT_` 前缀。
+凭据与 Origin 使用 JSON 数组。
+全部自身配置重启生效，已加载凭据的定时撤销仍按请求检查。
+管理插件不注册自身动态配置资源。
+迁移 `0034` 不可逆删除 `komari_management_config`。
+升级前必须准备私有环境配置，代码不自动导出凭据或回退数据库。
+其他插件动态配置与公告业务存储不受影响。
+示例见 `.env.example`。
+
 - 管理路由统一使用 `/api/v2/<plugin>` 前缀，旧版路由、弃用别名和退役 stub 均不注册。
 - 鉴权只接受 `api_credentials` 具名凭据。
 - 搜索提供者描述端点使用 `search:read`。
