@@ -42,6 +42,7 @@ from .execution_service import (
 from .execution_service import (
     SummaryExecutionResult as SummaryExecutionResult,
 )
+from .font_asset import ensure_font_asset
 from .group_lock import close_group_summary_lock_manager
 from .history_service import check_group_history_supported
 
@@ -99,6 +100,11 @@ except ValueError:
     driver = None
 
 if driver is not None:
+
+    @driver.on_startup
+    async def _ensure_group_summary_font() -> None:
+        """插件加载后准备固定字体；失败必须中止应用启动。"""
+        await ensure_font_asset()
 
     @driver.on_shutdown
     async def _close_group_summary_resources() -> None:

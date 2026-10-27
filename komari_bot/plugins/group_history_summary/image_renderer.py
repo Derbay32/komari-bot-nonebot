@@ -7,16 +7,15 @@ import io
 from dataclasses import dataclass
 from typing import Any
 
-from nonebot import logger
 from PIL import Image, ImageDraw, ImageFont
 
 from komari_bot.core.project_paths import DATA_DIR
 
+from .font_asset import FONT_PATH
+
 FontLike = ImageFont.FreeTypeFont | ImageFont.ImageFont
 
 CHARACTER_IMAGE_PATH = DATA_DIR / "image-summary.png"
-FONT_DIR = DATA_DIR / "fonts"
-FONT_EXTENSIONS = (".ttf", ".otf", ".ttc")
 MAX_IMAGE_PAGES = 8
 DEFAULT_LAYOUT_PARAMS: dict[str, Any] = {
     "canvas_width": 1365,
@@ -51,21 +50,8 @@ class SummaryImageRenderResult:
 
 
 def _load_font(size: int) -> FontLike:
-    """统一从 data/fonts 加载自定义字体。"""
-    if FONT_DIR.exists() and FONT_DIR.is_dir():
-        for font_path in sorted(FONT_DIR.iterdir()):
-            if font_path.suffix.lower() not in FONT_EXTENSIONS:
-                continue
-            try:
-                return ImageFont.truetype(str(font_path), size=size)
-            except OSError:
-                continue
-
-    logger.warning(
-        "[GroupHistorySummary] 未在 {} 找到可用自定义字体，降级为默认字体",
-        FONT_DIR,
-    )
-    return ImageFont.load_default()
+    """只加载固定字体；缺失或损坏时让字体错误向上传播。"""
+    return ImageFont.truetype(str(FONT_PATH), size=size)
 
 
 def _text_width(draw: ImageDraw.ImageDraw, text: str, font: FontLike) -> int:

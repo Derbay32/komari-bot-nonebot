@@ -179,3 +179,7 @@ skills-lock.json
 /dsh/node_modules/
 /dsh/runtime/dist-test/
 /data/dsh
+
+# 群聊总结字体：初始化时按需下载，不纳入版本控制
+/data/fonts/LXGWWenKaiGBScreen.ttf
+/data/fonts/.LXGWWenKaiGBScreen.ttf.*.tmp
