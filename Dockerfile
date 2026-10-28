@@ -1,5 +1,5 @@
 # 第一阶段：按 poetry.lock 构建运行时虚拟环境
-FROM python:3.13-slim AS dependencies_stage
+FROM python:3.13.18-slim AS dependencies_stage
 
 ARG POETRY_VERSION=2.2.1
 ENV VIRTUAL_ENV=/opt/venv
