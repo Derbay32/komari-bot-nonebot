@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from typing import ClassVar
 
-from komari_bot.config.typed_config import Field, TypedConfigModel
+from komari_bot.config.typed_config import (
+    Field,
+    TypedConfigModel,
+    typed_model_config,
+)
 
 
 class DynamicConfigSchema(TypedConfigModel, table=True):
@@ -13,18 +17,42 @@ class DynamicConfigSchema(TypedConfigModel, table=True):
     plugin_name: ClassVar[str] = "komari_custom"
     __tablename__ = "komari_custom_config"
 
+    model_config = typed_model_config(
+        json_schema_extra={"default_apply_mode": "immediate"}
+    )
+
     knowledge_proposals_enabled: bool = Field(
         default=False,
         description="是否处理新的知识库提案与投票",
         json_schema_extra={"apply_mode": "immediate"},
     )
-    required_votes: int = Field(default=5, ge=2, le=50, description="提案通过所需票数")
-    vote_emoji_id: str = Field(default="76", description="投票使用的 QQ 表情 ID")
+    required_votes: int = Field(
+        default=5,
+        ge=2,
+        le=50,
+        description="提案通过所需票数。系统在发布提案时读取此票数。系统不把新值应用到已在投票中的提案。",
+    )
+    vote_emoji_id: str = Field(
+        default="76",
+        description=(
+            "投票使用的 QQ 表情 ID。更改后，系统按新表情统计进行中的提案。"
+            "旧表情的投票可能不再计数。"
+        ),
+    )
     proposal_expire_hours: int = Field(
-        default=2, ge=1, le=720, description="投票提案过期时间（小时）"
+        default=2,
+        ge=1,
+        le=720,
+        description="投票提案过期时间（小时）。系统在发布提案时读取此过期时间。系统不把新值应用到已在投票中的提案。",
     )
     list_chunk_size: int = Field(default=20, ge=5, le=50, description="列表每页数量")
     max_proposals_per_user: int = Field(
         default=5, ge=1, le=20, description="单个用户同时进行的最大提案数"
     )
-    redis_db: int = Field(default=0, ge=0, le=15, description="Redis 数据库编号")
+    redis_db: int = Field(
+        default=0,
+        ge=0,
+        le=15,
+        description="Redis 数据库编号。修改后必须重启才生效。切换数据库后，系统不迁移已有编辑会话。",
+        json_schema_extra={"apply_mode": "restart"},
+    )

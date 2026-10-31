@@ -16,6 +16,9 @@ from komari_bot.plugins.komari_chat.config_schema import KomariChatConfigSchema
 from komari_bot.plugins.komari_context.config_schema import (
     KomariContextConfigSchema,
 )
+from komari_bot.plugins.komari_custom.config_schema import (
+    DynamicConfigSchema as CustomConfigSchema,
+)
 from komari_bot.plugins.komari_decision.config_schema import KomariDecisionConfigSchema
 from komari_bot.plugins.komari_decision.prompt_schema import (
     DISPLAY_NAME as KOMARI_DECISION_PROMPT_DISPLAY_NAME,
@@ -29,6 +32,9 @@ from komari_bot.plugins.komari_knowledge.config_schema import (
 from komari_bot.plugins.komari_memory.config_schema import KomariMemoryConfigSchema
 from komari_bot.plugins.komari_roulette.config_schema import (
     DynamicConfigSchema as RouletteConfigSchema,
+)
+from komari_bot.plugins.komari_search.config_schema import (
+    DynamicConfigSchema as SearchConfigSchema,
 )
 from komari_bot.plugins.komari_sentry.config_schema import KomariSentryConfigSchema
 from komari_bot.plugins.sr.config_schema import (
@@ -210,6 +216,22 @@ def _load_management_components() -> ManagementApiComponents:
                 manager_getter=lambda: config_manager_plugin.get_config_manager(
                     "user_data",
                     UserDataConfigSchema,
+                ),
+            ),
+            ManagedConfigResource(
+                resource_id="komari_search",
+                display_name="Komari Search",
+                manager_getter=lambda: config_manager_plugin.get_config_manager(
+                    "komari_search",
+                    SearchConfigSchema,
+                ),
+            ),
+            ManagedConfigResource(
+                resource_id="komari_custom",
+                display_name="Komari Custom",
+                manager_getter=lambda: config_manager_plugin.get_config_manager(
+                    "komari_custom",
+                    CustomConfigSchema,
                 ),
             ),
         ),

@@ -50,6 +50,8 @@ def _load_schema_class(plugin_name: str, class_name: str) -> type[Any]:
         ("komari_help", "DynamicConfigSchema", "immediate"),
         ("komari_knowledge", "DynamicConfigSchema", "immediate"),
         ("sr", "DynamicConfigSchema", "immediate"),
+        ("komari_search", "DynamicConfigSchema", "immediate"),
+        ("komari_custom", "DynamicConfigSchema", "immediate"),
     ],
 )
 def test_managed_config_schemas_declare_default_apply_mode(
@@ -70,6 +72,7 @@ def test_managed_config_schemas_declare_default_apply_mode(
         ("embedding_provider", "DynamicConfigSchema", "embedding_api_key"),
         ("embedding_provider", "DynamicConfigSchema", "rerank_api_key"),
         ("komari_memory", "KomariMemoryConfigSchema", "hindsight_api_key"),
+        ("komari_search", "DynamicConfigSchema", "search_api_key"),
         ("komari_sentry", "KomariSentryConfigSchema", "dsn"),
     ],
 )
@@ -83,6 +86,47 @@ def test_managed_secret_fields_use_explicit_schema_metadata(
 
     assert isinstance(field_extra, dict)
     assert field_extra["secret"] is True
+
+
+def test_komari_custom_only_redis_db_overrides_restart_apply_mode() -> None:
+    """Redis 客户端在会话管理器内缓存，只有 redis_db 需要重启生效。"""
+    schema = _load_schema_class("komari_custom", "DynamicConfigSchema")
+
+    overrides: dict[str, object] = {}
+    for field_name, field_info in schema.model_fields.items():
+        field_extra = field_info.json_schema_extra
+        if isinstance(field_extra, dict) and "apply_mode" in field_extra:
+            overrides[field_name] = field_extra["apply_mode"]
+    assert overrides == {
+        "knowledge_proposals_enabled": "immediate",
+        "redis_db": "restart",
+    }
+
+    redis_db_description = schema.model_fields["redis_db"].description
+    assert redis_db_description is not None
+    assert "重启" in redis_db_description
+    assert "不迁移" in redis_db_description
+
+
+@pytest.mark.parametrize(
+    ("field_name", "expected_tokens"),
+    [
+        ("required_votes", ("发布提案时", "已在投票中的提案")),
+        ("proposal_expire_hours", ("发布提案时", "已在投票中的提案")),
+        ("vote_emoji_id", ("进行中的提案", "新表情", "旧表情")),
+    ],
+)
+def test_komari_custom_field_descriptions_expose_runtime_caveats(
+    field_name: str,
+    expected_tokens: tuple[str, ...],
+) -> None:
+    """用户可见字段说明必须披露发布时取值与表情切换语义。"""
+    schema = _load_schema_class("komari_custom", "DynamicConfigSchema")
+    description = schema.model_fields[field_name].description
+
+    assert description is not None
+    for token in expected_tokens:
+        assert token in description, (field_name, token)
 
 
 def test_management_registers_komari_context_config_resource() -> None:

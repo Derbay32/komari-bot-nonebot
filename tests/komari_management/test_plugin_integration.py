@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import httpx
 import nonebot
@@ -22,6 +24,9 @@ from komari_bot.plugins.character_binding.management_api import (
     register_character_binding_repair_api,
 )
 from komari_bot.plugins.group_admission import register_group_admission_api
+from komari_bot.plugins.komari_custom.config_schema import (
+    DynamicConfigSchema as CustomConfigSchema,
+)
 from komari_bot.plugins.komari_decision import register_decision_api
 from komari_bot.plugins.komari_help.api import register_help_api
 from komari_bot.plugins.komari_knowledge.api import register_knowledge_api
@@ -34,11 +39,17 @@ from komari_bot.plugins.komari_management.managed_resources import (
     ManagedConfigResource,
 )
 from komari_bot.plugins.komari_search.api import register_search_api
+from komari_bot.plugins.komari_search.config_schema import (
+    DynamicConfigSchema as SearchConfigSchema,
+)
 from komari_bot.plugins.user_ban.api import register_user_ban_api
 from tests.config.prompt_field_contract import (
     make_managed_prompt_resource,
     prompt_display_name,
 )
+
+if TYPE_CHECKING:
+    from komari_bot.management.management_audit import ManagementAuditEvent
 
 
 class _FakeLogger:
@@ -420,6 +431,8 @@ def test_production_startup_uses_dotenv_without_management_storage(
         "komari_context",
         "komari_decision",
         "komari_knowledge",
+        "komari_search",
+        "komari_custom",
     } <= resource_ids
     assert "komari_management" not in real_management_loader.manager_requests
     assert all(
@@ -464,3 +477,236 @@ async def test_production_config_routes_do_not_expose_management_credentials(
     assert detail.status_code == 404
     assert write.status_code == 404
     assert reload_response.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# FIX-SEARCH-CUSTOM-CONFIG: the production loader must expose the search and
+# custom config resources, and the real routes must manage them end to end.
+# The manager factory is the only storage seam replaced here; every Schema is
+# the production class, so default construction and PATCH validation are real.
+# ---------------------------------------------------------------------------
+
+_SEARCH_CONFIG_FIELDS = frozenset(
+    {
+        "search_provider",
+        "search_api_key",
+        "search_enabled",
+        "max_results",
+        "result_content_limit",
+        "search_timeout_seconds",
+        "fetch_enabled",
+        "fetch_max_urls",
+        "fetch_content_limit",
+        "fetch_timeout_seconds",
+        "tavily_search_depth",
+        "tavily_include_answer",
+        "exa_search_type",
+        "exa_fetch_format",
+        "circuit_breaker_failure_threshold",
+        "circuit_breaker_recovery_seconds",
+    }
+)
+_CUSTOM_CONFIG_FIELDS = frozenset(
+    {
+        "knowledge_proposals_enabled",
+        "required_votes",
+        "vote_emoji_id",
+        "proposal_expire_hours",
+        "list_chunk_size",
+        "max_proposals_per_user",
+        "redis_db",
+    }
+)
+_CUSTOM_IMMEDIATE_FIELDS = (
+    "knowledge_proposals_enabled",
+    "required_votes",
+    "vote_emoji_id",
+    "proposal_expire_hours",
+    "list_chunk_size",
+    "max_proposals_per_user",
+)
+_SENTINEL_SEARCH_API_KEY = "sentinel-search-key-0123456789"
+
+
+class _InMemoryConfigManager:
+    """用真实 Schema 实例校验写入的内存配置管理器，不访问存储。"""
+
+    def __init__(self, schema: type[BaseModel], *, source: str) -> None:
+        self._schema = schema
+        self._config = schema()
+        self._source = source
+        self.update_calls: list[tuple[str, object]] = []
+        self.reload_count = 0
+
+    @property
+    def config_source(self) -> str:
+        return self._source
+
+    async def get_async(self) -> BaseModel:
+        return self._config
+
+    async def update_field_async(self, field_name: str, value: object) -> BaseModel:
+        data = self._config.model_dump()
+        if field_name not in data:
+            msg = f"未知的配置字段: {field_name}"
+            raise ValueError(msg)
+        data[field_name] = value
+        self._config = self._schema.model_validate(data)
+        self.update_calls.append((field_name, value))
+        return self._config
+
+    async def reload_async(self) -> BaseModel:
+        self.reload_count += 1
+        return self._config
+
+
+def _config_headers(*, request_id: str | None = None) -> dict[str, str]:
+    headers = {"Authorization": "Bearer test-startup-token-0123456789"}
+    if request_id is not None:
+        headers["X-Komari-Change-Reason"] = "verify config resource registration"
+        headers["X-Request-ID"] = request_id
+    return headers
+
+
+@pytest.mark.asyncio
+async def test_production_config_routes_manage_search_and_custom_resources(
+    real_management_loader: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """两个资源必须可列、可读、可写、可重载，且秘密值全程只露掩码。"""
+
+    from fastapi import FastAPI
+
+    import komari_bot.plugins.config_manager as manager_plugin
+    from komari_bot.plugins.komari_management.config_api import register_config_api
+
+    factory_calls: list[tuple[str, type[BaseModel]]] = []
+    managers: dict[str, _InMemoryConfigManager] = {}
+
+    def fake_get_config_manager(
+        name: str,
+        schema: type[BaseModel],
+    ) -> _InMemoryConfigManager:
+        factory_calls.append((name, schema))
+        manager = managers.get(name)
+        if manager is None:
+            manager = _InMemoryConfigManager(schema, source=f"memory:{name}")
+            managers[name] = manager
+        return manager
+
+    monkeypatch.setattr(manager_plugin, "get_config_manager", fake_get_config_manager)
+
+    components = real_management_loader.load_components()
+    resource_ids = {resource.resource_id for resource in components.config_resources}
+    assert {"komari_search", "komari_custom"} <= resource_ids
+
+    config = real_management_loader.registration["config"]
+    audit_events: list[ManagementAuditEvent] = []
+
+    async def _record_audit(event: ManagementAuditEvent) -> None:
+        audit_events.append(event)
+
+    api_app = FastAPI()
+    register_config_api(
+        api_app,
+        api_token=config.komari_management_api_credentials,
+        allowed_origins=[],
+        resources=components.config_resources,
+        audit_recorder=_record_audit,
+    )
+    prefix = "/api/v2/komari-management-config/resources"
+    search_base = f"{prefix}/komari_search"
+    custom_base = f"{prefix}/komari_custom"
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=api_app),
+        base_url="http://management.test",
+    ) as client:
+        listed = await client.get(prefix, headers=_config_headers())
+        search_detail = await client.get(search_base, headers=_config_headers())
+        custom_detail = await client.get(custom_base, headers=_config_headers())
+        search_updated = await client.patch(
+            f"{search_base}/fields/max_results",
+            headers=_config_headers(request_id="search-field-update"),
+            json={"value": 7},
+        )
+        custom_updated = await client.patch(
+            f"{custom_base}/fields/list_chunk_size",
+            headers=_config_headers(request_id="custom-field-update"),
+            json={"value": 37},
+        )
+        search_refetched = await client.get(search_base, headers=_config_headers())
+        custom_refetched = await client.get(custom_base, headers=_config_headers())
+        key_updated = await client.patch(
+            f"{search_base}/fields/search_api_key",
+            headers=_config_headers(request_id="search-secret-update"),
+            json={"value": _SENTINEL_SEARCH_API_KEY},
+        )
+        key_refetched = await client.get(search_base, headers=_config_headers())
+        search_reload = await client.post(
+            f"{search_base}/reload",
+            headers=_config_headers(request_id="search-reload"),
+        )
+        custom_reload = await client.post(
+            f"{custom_base}/reload",
+            headers=_config_headers(request_id="custom-reload"),
+        )
+
+    assert listed.status_code == 200
+    items = {item["resource_id"]: item for item in listed.json()["items"]}
+    assert set(items["komari_search"]["fields"]) == _SEARCH_CONFIG_FIELDS
+    assert set(items["komari_custom"]["fields"]) == _CUSTOM_CONFIG_FIELDS
+    assert items["komari_search"]["display_name"] == "Komari Search"
+    assert items["komari_custom"]["display_name"] == "Komari Custom"
+
+    # The loader must ask for each resource name with its own production Schema.
+    assert ("komari_search", SearchConfigSchema) in factory_calls
+    assert ("komari_custom", CustomConfigSchema) in factory_calls
+    assert search_detail.status_code == 200
+    assert custom_detail.status_code == 200
+    assert search_detail.json()["config_source"] == "memory:komari_search"
+    assert custom_detail.json()["config_source"] == "memory:komari_custom"
+
+    assert search_updated.status_code == 200
+    assert search_updated.json()["values"]["max_results"] == 7
+    assert search_refetched.json()["values"]["max_results"] == 7
+    assert custom_updated.status_code == 200
+    assert custom_updated.json()["values"]["list_chunk_size"] == 37
+    assert custom_refetched.json()["values"]["list_chunk_size"] == 37
+
+    assert key_updated.status_code == 200
+    assert ("search_api_key", _SENTINEL_SEARCH_API_KEY) in (
+        managers["komari_search"].update_calls
+    )
+    assert key_updated.json()["values"]["search_api_key"] == "******"
+    key_state = key_updated.json()["field_states"]["search_api_key"]
+    assert key_state["configured_value"] == "******"
+    assert key_state["effective_value"] == "******"
+    assert key_refetched.json()["values"]["search_api_key"] == "******"
+    serialized_audit = json.dumps(
+        [event.to_dict() for event in audit_events],
+        ensure_ascii=False,
+    )
+    assert _SENTINEL_SEARCH_API_KEY not in serialized_audit
+
+    custom_states = custom_detail.json()["field_states"]
+    for field_name in _CUSTOM_IMMEDIATE_FIELDS:
+        assert custom_states[field_name]["apply_mode"] == "immediate"
+        assert custom_states[field_name]["effective_source"] == "dynamic_config"
+        assert custom_states[field_name]["restart_required"] is False
+    assert custom_states["redis_db"]["apply_mode"] == "restart"
+    assert custom_states["redis_db"]["effective_value"] is None
+    assert custom_states["redis_db"]["effective_source"] == "process_startup_snapshot"
+    assert custom_states["redis_db"]["restart_required"] is True
+
+    custom_descriptions = custom_detail.json()["field_descriptions"]
+    assert "已在投票中的提案" in custom_descriptions["required_votes"]
+    assert "已在投票中的提案" in custom_descriptions["proposal_expire_hours"]
+    assert "旧表情" in custom_descriptions["vote_emoji_id"]
+    assert "重启" in custom_descriptions["redis_db"]
+    assert "不迁移" in custom_descriptions["redis_db"]
+
+    assert search_reload.status_code == 200
+    assert custom_reload.status_code == 200
+    assert managers["komari_search"].reload_count == 1
+    assert managers["komari_custom"].reload_count == 1
