@@ -11,10 +11,11 @@
 
 ## 配置说明
 
-配置由 `config_manager` 管理：
+配置由 `config_manager` 管理。
+用户数据是聊天的必需依赖，不提供停用开关。
+读取好感度失败时，聊天继续遵守既有失败边界。
 
 ```python
-plugin_enable = True
 initial_favorability = 0              # 新用户初始当前好感度
 max_favorability_delta_per_reply = 5  # 单次回复最大变化绝对值
 ```

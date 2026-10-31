@@ -176,7 +176,7 @@ async def test_register_management_api_for_fastapi_driver(app: App) -> None:
     logger = _FakeLogger()
     config = ManagementConfig.model_validate(
         {
-            "komari_management_plugin_enable": True,
+            "komari_management_api_enabled": True,
             "komari_management_api_credentials": _credentials(),
             "komari_management_api_allowed_origins": ["https://ui.example.com"],
         }
@@ -257,7 +257,7 @@ async def test_registered_api_keeps_startup_credentials_until_restart(app: App) 
     logger = _FakeLogger()
     config = ManagementConfig.model_validate(
         {
-            "komari_management_plugin_enable": True,
+            "komari_management_api_enabled": True,
             "komari_management_api_credentials": _credentials("old-token-00000000"),
             "komari_management_api_allowed_origins": [],
         }
@@ -325,7 +325,7 @@ async def test_read_only_credential_cannot_mutate_any_management_resource(
     logger = _FakeLogger()
     config = ManagementConfig.model_validate(
         {
-            "komari_management_plugin_enable": True,
+            "komari_management_api_enabled": True,
             "komari_management_api_credentials": [
                 {
                     "credential_id": "dashboard-reader",
@@ -411,7 +411,7 @@ def test_register_management_api_skips_disabled_config() -> None:
         driver=_FakeDriver("fastapi", _build_api_app()),
         config=ManagementConfig.model_validate(
             {
-                "komari_management_plugin_enable": False,
+                "komari_management_api_enabled": False,
                 "komari_management_api_credentials": _credentials(),
                 "komari_management_api_allowed_origins": [],
             }
@@ -421,7 +421,7 @@ def test_register_management_api_skips_disabled_config() -> None:
     )
 
     assert registered is False
-    assert logger.info_messages == ["[Komari Management] 插件未启用，跳过管理 API 注册"]
+    assert logger.info_messages == ["[Komari Management] 管理 API 未启用，跳过注册"]
 
 
 def test_register_management_api_skips_missing_token_and_non_fastapi() -> None:
@@ -431,7 +431,7 @@ def test_register_management_api_skips_missing_token_and_non_fastapi() -> None:
         driver=_FakeDriver("fastapi", _build_api_app()),
         config=ManagementConfig.model_validate(
             {
-                "komari_management_plugin_enable": True,
+                "komari_management_api_enabled": True,
                 "komari_management_api_credentials": [],
                 "komari_management_api_allowed_origins": [],
             }
@@ -447,7 +447,7 @@ def test_register_management_api_skips_missing_token_and_non_fastapi() -> None:
         driver=_FakeDriver("aiohttp"),
         config=ManagementConfig.model_validate(
             {
-                "komari_management_plugin_enable": True,
+                "komari_management_api_enabled": True,
                 "komari_management_api_credentials": _credentials(),
                 "komari_management_api_allowed_origins": [],
             }
@@ -472,7 +472,7 @@ def test_driver_type_label_cannot_substitute_for_fastapi_app(server_app: object)
     registered = register_management_api_for_driver(
         driver=SimpleNamespace(type="fastapi", server_app=server_app),
         config=ManagementConfig.model_validate({
-            "komari_management_plugin_enable": True,
+            "komari_management_api_enabled": True,
             "komari_management_api_credentials": _credentials(),
         }),
         component_loader=unexpected_component_load,

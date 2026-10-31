@@ -76,7 +76,7 @@ async def handle_emoji_like(bot: Bot, event: NoticeEvent) -> None:
     if state.repository is None or state.config_manager is None:
         return
     config = state.config_manager.get()
-    if not config.plugin_enable:
+    if not config.knowledge_proposals_enabled:
         return
 
     message_id = _get_int_attr(event, "message_id")
@@ -235,7 +235,7 @@ async def recover_pending_approvals() -> int:
         or state.knowledge_plugin is None
     ):
         return 0
-    if not state.config_manager.get().plugin_enable:
+    if not state.config_manager.get().knowledge_proposals_enabled:
         return 0
 
     bots = get_bots()

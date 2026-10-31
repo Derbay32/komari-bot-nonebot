@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 class _ConfigManager:
     @staticmethod
     def get() -> object:
-        return SimpleNamespace(plugin_enable=True, vote_emoji_id="128077")
+        return SimpleNamespace(knowledge_proposals_enabled=True, vote_emoji_id="128077")
 
 
 class _Bot:

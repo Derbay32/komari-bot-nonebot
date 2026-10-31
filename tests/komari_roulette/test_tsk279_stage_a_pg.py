@@ -220,7 +220,7 @@ async def _read_config_row(harness: Any) -> Mapping[str, Any] | None:
     async with harness.session_factory() as session:
         result = await session.execute(
             text(
-                "SELECT revision, plugin_enable, item_weight_magnifier,"
+                "SELECT revision, roulette_enabled, item_weight_magnifier,"
                 " item_weight_beer, item_weight_burst, item_weight_lock,"
                 " action_copy_pool::text AS action_copy_pool,"
                 " final_copy_pool::text AS final_copy_pool"
@@ -237,7 +237,7 @@ async def test_config_manager_initializes_jsonb_defaults_and_field_update(
     manager = ConfigManager("komari_roulette", DynamicConfigSchema)
     try:
         config = cast("DynamicConfigSchema", await manager.initialize_async())
-        assert config.plugin_enable is False
+        assert config.roulette_enabled is False
         assert config.item_weights() == {
             ItemType.MAGNIFIER: 1,
             ItemType.BEER: 1,
@@ -248,7 +248,7 @@ async def test_config_manager_initializes_jsonb_defaults_and_field_update(
         row = await _read_config_row(harness)
         assert row is not None
         assert int(row["revision"]) == 1
-        assert row["plugin_enable"] is False
+        assert row["roulette_enabled"] is False
         # JSONB default writeback: the persisted pools equal the code defaults.
         assert json.loads(str(row["action_copy_pool"])) == {
             key: list(templates)

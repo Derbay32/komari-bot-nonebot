@@ -24,7 +24,7 @@ def _config() -> SimpleNamespace:
         layer1_limit=3,
         layer2_limit=3,
         query_rewrite_rules={"你": "小鞠"},
-        plugin_enable=True,
+        knowledge_enabled=True,
     )
 
 

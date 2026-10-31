@@ -4,7 +4,7 @@ Importing this subpackage registers the single QQ group-@ entry matcher.  The
 matcher owns no policy: it delegates to a runtime installed by the application
 composition root (TSK-279, which owns the roulette configuration and
 lifecycle), and does nothing at all while that runtime is absent.  Roulette
-``plugin_enable`` defaults to ``false``, so failing closed is the contract
+``roulette_enabled`` defaults to ``false``, so failing closed is the contract
 default rather than a degraded mode.
 
 Installation requires explicit ``business_gate``, ``runtime_check`` and

@@ -390,7 +390,6 @@ class _ConfigState:
 
 def _config(**overrides: Any) -> SimpleNamespace:
     values: dict[str, Any] = {
-        "plugin_enable": True,
         "hindsight_base_url": "http://127.0.0.1:9999",
         "hindsight_api_key": SECRET,
         "hindsight_bank_id": BANK_ID,

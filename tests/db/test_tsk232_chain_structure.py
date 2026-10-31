@@ -159,7 +159,7 @@ def test_chain_is_single_trunk_head_0034() -> None:
     revisions = list(script.walk_revisions())
     heads = script.get_heads()
     assert len(heads) == 1
-    assert heads[0] == "0034"
+    assert heads[0] == "0035"
 
     baselines = [rev for rev in revisions if rev.down_revision is None]
     assert len(baselines) == 1

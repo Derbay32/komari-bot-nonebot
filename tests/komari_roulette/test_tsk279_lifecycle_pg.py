@@ -11,7 +11,7 @@ pins the **assembly** the production ``lifecycle.py`` will build:
   in one run;
 * maintenance admission translates the canonical ``(app_id, group_openid)`` to
   the numeric group and consults ``group_admission`` - it never gates on the
-  business ``plugin_enable`` switch;
+  business ``roulette_enabled`` switch;
 * ``maintenance.close()`` is bounded but does not return while an in-flight
   cleanup round is still running.
 
@@ -350,7 +350,7 @@ async def test_maintenance_admission_is_canonical_and_ignores_business_switch(
         async with lifecycle_context(monkeypatch) as ctx:
             await invoke_hook(require_single_startup_hook(ctx))
             app = _application()
-            assert app.runtime.get_state().plugin_enable is False
+            assert app.runtime.get_state().roulette_enabled is False
             assert app.runtime.accepting is False
 
             async with harness.scope("maintenance-admission") as current:
@@ -496,7 +496,7 @@ async def _installed_lifecycle_qq_authority(
     harness: Tsk279Harness,
     monkeypatch: pytest.MonkeyPatch,
     *,
-    plugin_enable: bool,
+    roulette_enabled: bool,
     numeric_group: int,
 ) -> AsyncIterator[_InstalledQQAuthority]:
     """Install the real lifecycle and real authority; never install a QQ runtime.
@@ -594,10 +594,10 @@ async def _installed_lifecycle_qq_authority(
                     app = _application()
                     manager = ctx.config_managers["komari_roulette"]
                     # 5. Legal live switch through the real manager (real PG).
-                    await manager.update_field_async("plugin_enable", plugin_enable)
-                    if plugin_enable:
+                    await manager.update_field_async("roulette_enabled", roulette_enabled)
+                    if roulette_enabled:
                         await app.runtime.run_recovery_tick()
-                    assert app.runtime.get_state().plugin_enable is plugin_enable, (
+                    assert app.runtime.get_state().roulette_enabled is roulette_enabled, (
                         "the lifecycle config manager must carry the requested "
                         "live switch"
                     )
@@ -731,10 +731,10 @@ async def test_restoring_config_storage_factory_keeps_admission_fake_live_and_ro
         # A real manager built after the restore uses real PostgreSQL.
         roulette_manager = ConfigManager("komari_roulette", DynamicConfigSchema)
         await roulette_manager.initialize_async()
-        await roulette_manager.update_field_async("plugin_enable", value=True)
+        await roulette_manager.update_field_async("roulette_enabled", value=True)
         async with harness.session_factory() as session:
             stored = await session.scalar(
-                text("SELECT plugin_enable FROM komari_roulette_config WHERE id = 1")
+                text("SELECT roulette_enabled FROM komari_roulette_config WHERE id = 1")
             )
         assert stored is True, (
             "a ConfigManager built after the factory restore must persist to the "
@@ -756,7 +756,7 @@ async def test_lifecycle_installed_qq_handler_commits_valid_token_and_captures_r
     async with _installed_lifecycle_qq_authority(
         harness,
         monkeypatch,
-        plugin_enable=True,
+        roulette_enabled=True,
         numeric_group=279501,
     ) as authority:
         qq = __import__(QQ_MODULE, fromlist=["handle_roulette_qq"])
@@ -803,7 +803,7 @@ async def test_lifecycle_installed_qq_handler_rejects_revoked_authority_before_e
     async with _installed_lifecycle_qq_authority(
         harness,
         monkeypatch,
-        plugin_enable=mutation != "plugin_disabled",
+        roulette_enabled=mutation != "plugin_disabled",
         numeric_group=279510,
     ) as authority:
         qq = __import__(QQ_MODULE, fromlist=["handle_roulette_qq"])
@@ -942,7 +942,7 @@ async def test_lifecycle_installed_delivery_post_claim_revocation_blocks_network
     async with _installed_lifecycle_qq_authority(
         harness,
         monkeypatch,
-        plugin_enable=True,
+        roulette_enabled=True,
         numeric_group=279520,
     ) as authority:
         qq = __import__(QQ_MODULE, fromlist=["handle_roulette_qq"])
@@ -1019,7 +1019,7 @@ async def test_lifecycle_installed_qq_handler_group_lock_wait_then_plugin_false_
     async with _installed_lifecycle_qq_authority(
         harness,
         monkeypatch,
-        plugin_enable=True,
+        roulette_enabled=True,
         numeric_group=279530,
     ) as authority:
         qq = __import__(QQ_MODULE, fromlist=["handle_roulette_qq"])
@@ -1037,7 +1037,7 @@ async def test_lifecycle_installed_qq_handler_group_lock_wait_then_plugin_false_
             try:
                 await wait_for_blocked(harness.session_factory, blocker_pid)
                 await authority.manager.update_field_async(
-                    "plugin_enable", value=False
+                    "roulette_enabled", value=False
                 )
             finally:
                 await blocker.commit()
@@ -1084,7 +1084,7 @@ async def test_lifecycle_stop_rejects_the_old_installed_gate_before_maintenance_
     async with _installed_lifecycle_qq_authority(
         harness,
         monkeypatch,
-        plugin_enable=True,
+        roulette_enabled=True,
         numeric_group=279550,
     ) as authority:
         token, _mint_bot, event = await _mint_business_token(
@@ -1200,7 +1200,7 @@ async def test_lifecycle_business_gate_rechecks_local_switch_after_the_recheck(
 
     ``recheck_qq_effect`` is wrapped only to control timing (an ``Event``) and
     still delegates to the real helper, so no remote verdict is fabricated.  The
-    live ``plugin_enable`` is flipped while the gate is suspended inside the
+    live ``roulette_enabled`` is flipped while the gate is suspended inside the
     await; the gate must not release the effect (or the send) afterwards.
     """
 
@@ -1212,7 +1212,7 @@ async def test_lifecycle_business_gate_rechecks_local_switch_after_the_recheck(
     async with _installed_lifecycle_qq_authority(
         harness,
         monkeypatch,
-        plugin_enable=True,
+        roulette_enabled=True,
         numeric_group=279560,
     ) as authority:
         qq = __import__(QQ_MODULE, fromlist=["handle_roulette_qq"])
@@ -1242,7 +1242,7 @@ async def test_lifecycle_business_gate_rechecks_local_switch_after_the_recheck(
                 await recheck_entered.wait()
             # The live switch turns off while the gate waits on the authority.
             await authority.manager.update_field_async(
-                "plugin_enable", value=False
+                "roulette_enabled", value=False
             )
         finally:
             recheck_release.set()

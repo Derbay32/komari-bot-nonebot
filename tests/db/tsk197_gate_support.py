@@ -46,7 +46,7 @@ SKIP_NO_POSTGRES = pytest.mark.skipif(
     reason="未设置 KOMARI_TEST_POSTGRES_URL，跳过集成测试",
 )
 
-HEAD_REVISION = "0034"
+HEAD_REVISION = "0035"
 
 #: 0013 引入的三项回复 Agent 预算列（仅让这些列走数据库默认值）。
 AGENT_BUDGET_COLUMNS = (
@@ -86,7 +86,7 @@ NON_BUDGET_COLUMN_DEFAULTS: dict[str, object] = {
     "vision_image_download_read_timeout_seconds": 30.0,
     "vision_image_download_total_timeout_seconds": 45.0,
     # TSK-192 phase B：chat/context 配置所有权迁入的非空 chat 列。
-    "plugin_enable": False,
+    "chat_enabled": False,
     "llm_model_chat": "gemini-3-flash-preview",
     "llm_temperature_chat": 1.0,
     "llm_max_tokens_chat": 4000,

@@ -107,7 +107,6 @@ def test_real_user_data_error_classes_expose_error_code(
     user_data_module: Any,
 ) -> None:
     """真实 user_data 异常类暴露 error_code 类属性（与持久化列同一取值集合）。"""
-    assert user_data_module.UserDataDisabledError.error_code == "service_unavailable"
     assert user_data_module.UserDataStoppingError.error_code == "service_unavailable"
 
 
@@ -116,9 +115,6 @@ def test_real_user_data_exceptions_still_classify_service_unavailable(
     user_data_module: Any,
 ) -> None:
     """真实 user_data 异常无论正文措辞如何都分类为 service_unavailable（行为锚点）。"""
-    assert workflow_module._classify_error(
-        user_data_module.UserDataDisabledError("完全无关的文本")
-    ) == (False, "service_unavailable")
     assert workflow_module._classify_error(
         user_data_module.UserDataStoppingError("完全无关的文本")
     ) == (False, "service_unavailable")

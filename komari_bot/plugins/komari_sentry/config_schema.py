@@ -29,7 +29,9 @@ class KomariSentryConfigSchema(TypedConfigModel, table=True):
         json_schema_extra={"default_apply_mode": "restart"},
     )
 
-    plugin_enable: bool = Field(default=False, description="是否启用 Sentry 插件")
+    sentry_enabled: bool = Field(
+        default=False, description="是否启用 Sentry 错误上报"
+    )
     dsn: str = Field(
         default="",
         description="Sentry DSN（为空时不会初始化）",

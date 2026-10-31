@@ -12,7 +12,7 @@ The runtime is a deep module with a deliberately small interface:
   ``nonebot_plugin_orm`` engine (it does not own it);
 * :meth:`RouletteRuntime.authorize` resolves admission from the *arguments of
   that call* (scope + group ids), never from a process-global "current event";
-* the ``plugin_enable`` switch is re-read live on every authoritative read, so a
+* the ``roulette_enabled`` switch is re-read live on every authoritative read, so a
   persisted flip stops new business/send immediately without a restart, while a
   live read failure is recorded as ``config_unavailable`` instead of keeping a
   stale ``READY``.
@@ -110,7 +110,7 @@ class RouletteRuntimeState:
     status: RouletteRuntimeStatus
     reason_code: str | None
     recovery_completed: bool
-    plugin_enable: bool
+    roulette_enabled: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,15 +135,15 @@ def _retrieve_background_error(task: asyncio.Task[Any]) -> None:
         task.exception()
 
 
-def _snapshot_plugin_enable(snapshot: object) -> bool | None:
-    """Return the snapshot's ``plugin_enable`` only when it is a real ``bool``.
+def _snapshot_roulette_enabled(snapshot: object) -> bool | None:
+    """Return the snapshot's ``roulette_enabled`` only when it is a real ``bool``.
 
     A missing field, ``None`` or any other shape (e.g. the string ``"false"``)
     is *not* coerced; it means the config cannot be trusted and the caller must
     fail closed.
     """
 
-    value = getattr(snapshot, "plugin_enable", None)
+    value = getattr(snapshot, "roulette_enabled", None)
     if not isinstance(value, bool):
         return None
     return value
@@ -201,7 +201,7 @@ class RouletteRuntime:
         self._status = RouletteRuntimeStatus.FAILED
         self._reason_code: str | None = NOT_READY_REASON
         self._recovery_completed = False
-        self._plugin_enable = False
+        self._roulette_enabled = False
         self._closed = False
         self._start_done = False
         self._tick_task: asyncio.Task[Any] | None = None
@@ -242,12 +242,12 @@ class RouletteRuntime:
             if self._closed:
                 self._start_done = True
                 return
-            enabled = _snapshot_plugin_enable(snapshot)
+            enabled = _snapshot_roulette_enabled(snapshot)
             if enabled is None:
                 self._set_failed(CONFIG_UNAVAILABLE_REASON)
                 self._start_done = True
                 return
-            self._plugin_enable = enabled
+            self._roulette_enabled = enabled
             task = self._ensure_tick_task()
             try:
                 await asyncio.shield(task)
@@ -329,13 +329,13 @@ class RouletteRuntime:
         self._refresh_safe_state()
         if self._status is RouletteRuntimeStatus.FAILED:
             return False
-        return self._plugin_enable
+        return self._roulette_enabled
 
     def get_state(self) -> RouletteRuntimeState:
         """Refresh the safe state, then return an immutable snapshot.
 
         The live read is applied *before* the snapshot is built, so the status
-        and the ``plugin_enable`` flag can never come from different points in
+        and the ``roulette_enabled`` flag can never come from different points in
         time; a live read failure downgrades the state to ``FAILED`` /
         ``config_unavailable`` instead of reporting ``READY`` alongside an
         unavailable config.
@@ -346,7 +346,7 @@ class RouletteRuntime:
             status=self._status,
             reason_code=self._reason_code,
             recovery_completed=self._recovery_completed,
-            plugin_enable=self._plugin_enable,
+            roulette_enabled=self._roulette_enabled,
         )
 
     async def run_recovery_tick(self) -> RouletteRuntimeState:
@@ -475,19 +475,19 @@ class RouletteRuntime:
         if failures is None or failures > 0:
             self._set_failed(RECOVERY_FAILED_REASON)
             return
-        enabled = self._try_read_plugin_enable()
+        enabled = self._try_read_roulette_enabled()
         if enabled is None:
-            self._plugin_enable = False
+            self._roulette_enabled = False
             self._set_failed(CONFIG_UNAVAILABLE_REASON)
             return
-        self._plugin_enable = enabled
+        self._roulette_enabled = enabled
         self._recovery_completed = True
         self._publish_lifecycle()
 
     def _publish_lifecycle(self) -> None:
         if self._closed:
             return
-        if self._plugin_enable:
+        if self._roulette_enabled:
             self._status = RouletteRuntimeStatus.READY
             self._reason_code = None
         else:
@@ -498,18 +498,18 @@ class RouletteRuntime:
         """Apply a live read, downgrading on failure and **never** upgrading.
 
         A readable config alone never clears a recorded failure: only a clean
-        recovery tick does that.  Returns the live ``plugin_enable`` or ``None``
+        recovery tick does that.  Returns the live ``roulette_enabled`` or ``None``
         when the config cannot be trusted.
         """
 
         if self._closed:
             return None
-        enabled = self._try_read_plugin_enable()
+        enabled = self._try_read_roulette_enabled()
         if enabled is None:
-            self._plugin_enable = False
+            self._roulette_enabled = False
             self._set_failed(CONFIG_UNAVAILABLE_REASON)
             return None
-        self._plugin_enable = enabled
+        self._roulette_enabled = enabled
         return enabled
 
     def _set_failed(self, reason: str) -> None:
@@ -517,8 +517,8 @@ class RouletteRuntime:
         self._reason_code = reason
         self._recovery_completed = False
 
-    def _try_read_plugin_enable(self) -> bool | None:
-        """Read the live ``plugin_enable`` flag; ``None`` means untrustworthy.
+    def _try_read_roulette_enabled(self) -> bool | None:
+        """Read the live ``roulette_enabled`` flag; ``None`` means untrustworthy.
 
         The real ``ConfigManager.get`` and the test double both expose this
         synchronous read.  Only an actual ``bool`` is accepted; a missing or
@@ -529,7 +529,7 @@ class RouletteRuntime:
             snapshot = self._config_manager.get()
         except Exception:
             return None
-        return _snapshot_plugin_enable(snapshot)
+        return _snapshot_roulette_enabled(snapshot)
 
 
 def _qualifies_for_business(outcome: object) -> bool:

@@ -625,7 +625,7 @@ def build_control_plane(
 
 
 class _FakeConfigSchema(BaseModel):
-    plugin_enable: bool = True
+    roulette_enabled: bool = True
 
 
 class _FakeConfigManager:

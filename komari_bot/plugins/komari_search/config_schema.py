@@ -15,7 +15,6 @@ class DynamicConfigSchema(TypedConfigModel, table=True):
 
     model_config = typed_model_config(json_schema_extra={"default_apply_mode": "immediate"})
 
-    plugin_enable: bool = Field(default=False, description="插件启用状态")
     search_provider: Literal["tavily", "exa"] = Field(
         default="tavily",
         sa_column=Column(String(16), nullable=False, default="tavily"),
@@ -28,7 +27,7 @@ class DynamicConfigSchema(TypedConfigModel, table=True):
     )
 
     # --- 搜索 ---
-    search_enabled: bool = Field(default=True, description="是否启用联网搜索")
+    search_enabled: bool = Field(default=False, description="是否启用联网搜索")
     max_results: int = Field(default=5, ge=1, le=10, description="最大搜索结果数")
     result_content_limit: int = Field(
         default=300,
@@ -44,7 +43,7 @@ class DynamicConfigSchema(TypedConfigModel, table=True):
     )
 
     # --- 抓取 ---
-    fetch_enabled: bool = Field(default=True, description="是否启用网页抓取")
+    fetch_enabled: bool = Field(default=False, description="是否启用网页抓取")
     fetch_max_urls: int = Field(
         default=3,
         ge=1,

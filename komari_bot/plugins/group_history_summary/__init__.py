@@ -203,7 +203,7 @@ async def _evaluate_summary_candidate(  # noqa: PLR0911 - 每个停止分支都�
         summary_enabled = False
         try:
             summary_config = cast("DynamicConfigSchema", config_manager.get())
-            summary_enabled = bool(summary_config.plugin_enable)
+            summary_enabled = bool(summary_config.summary_enabled)
         except Exception:
             logger.debug("[GroupHistorySummary] 失败通知前总结开关读取失败，抑制通知")
         # 通知前最后复检：总结插件开关与目标群 BUSINESS 准入（受限即抑制）。
@@ -252,7 +252,7 @@ async def handle_group_history_summary(  # noqa: PLR0911 - 每个门禁都是独
     config = cast("DynamicConfigSchema", config_manager.get())
     group_id = getattr(event, "group_id", None)
     if (
-        not config.plugin_enable
+        not config.summary_enabled
         or not isinstance(group_id, int)
         or group_id <= 0
         or adjudicate([group_id]).qualification is not AdmissionQualification.BUSINESS

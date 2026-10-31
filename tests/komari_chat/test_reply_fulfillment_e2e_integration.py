@@ -770,7 +770,6 @@ async def test_e2e_actual_hindsight_service_retries_identical_sdk_envelope_witho
 
     async def _hindsight_config() -> SimpleNamespace:
         return SimpleNamespace(
-            plugin_enable=True,
             hindsight_base_url=base_url,
             hindsight_api_key=api_key,
             hindsight_bank_id=BANK_ID,

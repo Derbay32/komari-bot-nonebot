@@ -141,7 +141,7 @@ async def test_nonebot_fastapi_driver_exposes_docs_and_management_routes(
         driver=driver,
         config=ManagementConfig.model_validate(
             {
-                "komari_management_plugin_enable": True,
+                "komari_management_api_enabled": True,
                 "komari_management_api_credentials": [
                     {
                         "credential_id": "test-operator",
@@ -271,7 +271,7 @@ def real_management_loader(
     import komari_bot.plugins.config_manager as manager_plugin
     from komari_bot.plugins.komari_management import api_runtime
 
-    monkeypatch.setenv("KOMARI_MANAGEMENT_PLUGIN_ENABLE", "true")
+    monkeypatch.setenv("KOMARI_MANAGEMENT_API_ENABLED", "true")
     monkeypatch.setenv(
         "KOMARI_MANAGEMENT_API_CREDENTIALS",
         '[{"credential_id":"startup-test","token":"test-startup-token-0123456789","permissions":["*"]}]',
@@ -409,7 +409,7 @@ def test_production_startup_uses_dotenv_without_management_storage(
 ) -> None:
     config = real_management_loader.registration["config"]
     assert isinstance(config, ManagementConfig)
-    assert config.komari_management_plugin_enable is True
+    assert config.komari_management_api_enabled is True
     assert config.komari_management_api_credentials[0].credential_id == "startup-test"
     assert "api_token_getter" not in real_management_loader.registration
     components = real_management_loader.load_components()

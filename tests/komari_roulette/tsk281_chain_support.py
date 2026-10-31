@@ -939,11 +939,11 @@ async def _assemble_roulette(
     )
     config_manager = cache["komari_roulette"]
     holder["config_manager"] = config_manager
-    holder["original_plugin_enable"] = bool(config_manager.get().plugin_enable)
-    await config_manager.update_field_async("plugin_enable", value=True)
+    holder["original_roulette_enabled"] = bool(config_manager.get().roulette_enabled)
+    await config_manager.update_field_async("roulette_enabled", value=True)
     await app.runtime.run_recovery_tick()
     assert app.runtime.accepting, (
-        "启用 plugin_enable 并跑一次真实 recovery tick 后 runtime 必须接受业务"
+        "启用 roulette_enabled 并跑一次真实 recovery tick 后 runtime 必须接受业务"
     )
 
 
@@ -970,10 +970,10 @@ async def _teardown_roulette(holder: dict[str, Any]) -> None:
             errors.append(error)
 
     config_manager = holder.get("config_manager")
-    original = holder.get("original_plugin_enable")
+    original = holder.get("original_roulette_enabled")
     if config_manager is not None and original is not None:
         await _run_async(
-            config_manager.update_field_async("plugin_enable", value=original)
+            config_manager.update_field_async("roulette_enabled", value=original)
         )
 
     if holder.get("reloaded"):

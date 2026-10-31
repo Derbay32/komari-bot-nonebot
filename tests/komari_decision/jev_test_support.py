@@ -325,7 +325,6 @@ def _config_schema(overrides: Mapping[str, Any] | None = None) -> Any:
     )
 
     values: dict[str, Any] = {
-        "plugin_enable": True,
         "jev_base_url": CONFIGURED_BASE_URL,
         "jev_api_key": CONFIGURED_API_KEY,
         "jev_model": CONFIGURED_MODEL,
@@ -1039,7 +1038,6 @@ def worker_payload(
 ) -> dict[str, Any]:
     """组装一个子进程载荷（显式带与主夹具相同的 SDK 配置）。"""
     full_config: dict[str, Any] = {
-        "plugin_enable": True,
         "jev_base_url": CONFIGURED_BASE_URL,
         "jev_api_key": CONFIGURED_API_KEY,
         "jev_model": CONFIGURED_MODEL,

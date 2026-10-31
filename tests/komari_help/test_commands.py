@@ -201,7 +201,7 @@ async def test_docs_user_entries_apply_runtime_permission_before_engine_access(
     message_text: str,
 ) -> None:
     config = SimpleNamespace(
-        plugin_enable=False,
+        help_enabled=False,
         user_whitelist=[],
         group_whitelist=[],
     )
@@ -215,7 +215,7 @@ async def test_docs_user_entries_apply_runtime_permission_before_engine_access(
         "config_manager",
         _StubConfigManager(config),
     )
-    # 准入裁决放行，只验证本插件 plugin_enable=false 走静默跳过
+    # 准入裁决放行，只验证本插件 help_enabled=false 走静默跳过
     monkeypatch.setattr(commands_module, "adjudicate", _adjudicate_business)
     monkeypatch.setattr(commands_module, "get_engine", fail_get_engine)
 
@@ -264,7 +264,7 @@ async def test_docs_refresh_applies_runtime_plugin_status_after_superuser_check(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = SimpleNamespace(
-        plugin_enable=False,
+        help_enabled=False,
         user_whitelist=[],
         group_whitelist=[],
     )
@@ -277,7 +277,7 @@ async def test_docs_refresh_applies_runtime_plugin_status_after_superuser_check(
         "config_manager",
         _StubConfigManager(config),
     )
-    # 准入裁决放行，只验证 SUPERUSER 通过后 plugin_enable=false 仍静默跳过
+    # 准入裁决放行，只验证 SUPERUSER 通过后 help_enabled=false 仍静默跳过
     monkeypatch.setattr(commands_module, "adjudicate", _adjudicate_business)
     monkeypatch.setattr(commands_module, "SUPERUSER", allow_superuser)
 

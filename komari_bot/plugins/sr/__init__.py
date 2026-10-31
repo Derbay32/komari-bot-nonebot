@@ -1,7 +1,7 @@
 from random import randint
 from typing import cast
 
-from nonebot import get_driver, get_plugin_config, logger, on_command
+from nonebot import get_driver, logger, on_command
 from nonebot.adapters.onebot.v11 import Bot, Message, MessageEvent
 from nonebot.exception import FinishedException
 from nonebot.params import Command, CommandArg
@@ -13,7 +13,6 @@ from komari_bot.onebot.onebot_messages import plain_text_message
 from komari_bot.plugins.group_admission import AdmissionQualification, adjudicate
 
 from .commands import AddCommand, DeleteCommand
-from .config import Config
 from .config_schema import DynamicConfigSchema
 from .redis_undo_stack import (
     close_redis,
@@ -37,10 +36,7 @@ __plugin_meta__ = PluginMetadata(
     .sr status 查看插件运行情况
     .sr on/off 开关本插件
     """,
-    config=Config,
 )
-
-config = get_plugin_config(Config)
 
 # 依赖配置管理插件
 require("config_manager")
@@ -61,8 +57,8 @@ async def _admission_gate(event: MessageEvent) -> bool:
     """统一准入复查与本插件自有开关的前置门。
 
     先由 ``group_admission`` 裁决关联群（命令只会在群内触发）：获准后继续读
-    取本插件自身 ``plugin_enable`` 进一步收窄；任一环节不满足都静默跳过，
-    不提示、不响应。``plugin_enable`` 只收窄不扩张：准入资格始终由裁决决定。
+    取本插件自身 ``sr_enabled`` 进一步收窄；任一环节不满足都静默跳过，
+    不提示、不响应。``sr_enabled`` 只收窄不扩张：准入资格始终由裁决决定。
     """
     group_id = getattr(event, "group_id", None)
     if not isinstance(group_id, int) or group_id <= 0:
@@ -70,7 +66,7 @@ async def _admission_gate(event: MessageEvent) -> bool:
     if adjudicate([group_id]).qualification is not AdmissionQualification.BUSINESS:
         return False
     config = await config_manager.get_async()
-    return bool(getattr(config, "plugin_enable", True))
+    return bool(getattr(config, "sr_enabled", True))
 
 
 async def _record_undo_or_warn(user_id: str, command: object, result: str) -> str:
@@ -168,14 +164,14 @@ async def sr_switch(
 
     match action:
         case "status":
-            # 显示插件自身开关状态
-            status_text = "已启用" if config.plugin_enable else "已禁用"
+            # 显示神人榜业务开关状态
+            status_text = "已启用" if config.sr_enabled else "已禁用"
             await sr_manage.finish(plain_text_message(f"SR {status_text}"))
 
         case "on" | "off":
-            # 切换插件开关
+            # 切换神人榜业务开关
             new_status = action == "on"
-            old_status = config.plugin_enable
+            old_status = config.sr_enabled
 
             if old_status == new_status:
                 await sr_manage.finish(
@@ -184,7 +180,7 @@ async def sr_switch(
                     )
                 )
 
-            await config_manager.update_field_async("plugin_enable", new_status)
+            await config_manager.update_field_async("sr_enabled", new_status)
 
             status_text = "开启" if new_status else "关闭"
             await sr_manage.finish(plain_text_message(f"SR 插件已{status_text}"))

@@ -112,8 +112,8 @@ async def startup() -> None:
     global _initialized_by_plugin  # noqa: PLW0603
 
     config = await get_config_async()
-    if not config.plugin_enable:
-        logger.info("[KomariSentry] 插件未启用，跳过初始化")
+    if not config.sentry_enabled:
+        logger.info("[KomariSentry] Sentry 上报未启用，跳过初始化")
         return
 
     if sentry_sdk is None:

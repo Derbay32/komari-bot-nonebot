@@ -10,7 +10,6 @@ from .config_schema import DynamicConfigSchema
 from .database import UserDataDB
 from .errors import (
     FavorabilityIdempotencyConflictError,
-    UserDataDisabledError,
     UserDataStoppingError,
     UserDataUnavailableError,
 )
@@ -75,10 +74,6 @@ async def _get_config_async() -> DynamicConfigSchema:
 async def get_db() -> UserDataDB:
     """获取数据库实例。"""
     global _db, _lifecycle_state  # noqa: PLW0603
-    config = await _get_config_async()
-    if not config.plugin_enable:
-        msg = "user_data 插件已禁用"
-        raise UserDataDisabledError(msg)
     if _lifecycle_state in {"stopping", "stopped"}:
         msg = "user_data 正在或已经关闭"
         raise UserDataStoppingError(msg)
@@ -89,9 +84,6 @@ async def get_db() -> UserDataDB:
                 msg = "user_data 正在或已经关闭"
                 raise UserDataStoppingError(msg)
             config = await _get_config_async()
-            if not config.plugin_enable:
-                msg = "user_data 插件已禁用"
-                raise UserDataDisabledError(msg)
             if _db is None:
                 logger.debug("[UserData] 首次获取数据库实例，开始初始化")
                 previous_state = _lifecycle_state
@@ -122,11 +114,6 @@ async def on_startup() -> None:
         msg = "user_data 已完成 shutdown，不能在同一生命周期内重启"
         raise UserDataStoppingError(msg)
     _lifecycle_state = "starting"
-    config = await _get_config_async()
-    if not config.plugin_enable:
-        _lifecycle_state = "running"
-        logger.info("[UserData] 插件未启用，跳过初始化")
-        return
 
     try:
         await get_db()
@@ -240,7 +227,6 @@ __all__ = [
     "FavorabilityIdempotencyConflictError",
     "FavorabilitySetResult",
     "FavorabilityStage",
-    "UserDataDisabledError",
     "UserDataStoppingError",
     "UserDataUnavailableError",
     "UserFavorability",

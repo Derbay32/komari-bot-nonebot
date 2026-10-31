@@ -38,11 +38,10 @@ prompt_schema 与旧服务文件。
 ## 配置
 
 配置表为 `komari_memory_config`。
-正文只有 6 个字段：
+正文只有 5 个字段：
 
 | 字段 | 默认值 | 说明 |
 | --- | --- | --- |
-| `plugin_enable` | `false` | 插件启用状态 |
 | `hindsight_base_url` | `""` | Hindsight 服务基础地址 |
 | `hindsight_api_key` | `""` | Hindsight 服务凭据 |
 | `hindsight_bank_id` | `""` | 共享记忆库标识 |
@@ -50,7 +49,7 @@ prompt_schema 与旧服务文件。
 | `hindsight_recovery_interval_seconds` | `30.0` | 失败后恢复探测最小间隔 |
 
 `hindsight_api_key` 标记为秘密字段。
-`plugin_enable` 使用即时生效模式。
+共享记忆是聊天的必需依赖，不提供停用开关。
 `startup_required=False` 保留。
 
 ## 召回

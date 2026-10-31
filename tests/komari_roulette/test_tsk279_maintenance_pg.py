@@ -1906,13 +1906,13 @@ class _EnabledConfig:
     """Minimal read API mirroring ``ConfigManager`` for runtime start/close."""
 
     def get(self) -> Any:
-        return SimpleNamespace(plugin_enable=True)
+        return SimpleNamespace(roulette_enabled=True)
 
     async def get_async(self) -> Any:
-        return SimpleNamespace(plugin_enable=True)
+        return SimpleNamespace(roulette_enabled=True)
 
     async def initialize_async(self) -> Any:
-        return SimpleNamespace(plugin_enable=True)
+        return SimpleNamespace(roulette_enabled=True)
 
 
 class _NoopRecovery:
@@ -2075,7 +2075,7 @@ async def test_maintenance_rechecks_closed_runtime_after_group_lock_wait(
 
         # Test port for the True→close transition only: ``runtime.accepting``
         # stands in for "runtime still alive".  Production maintenance must NOT
-        # gate on the business ``plugin_enable`` switch (see TSK-279-contract
+        # gate on the business ``roulette_enabled`` switch (see TSK-279-contract
         # §10.2): a disabled business switch still requires maintenance.  The
         # real shutdown / dependency-ready / group-admission combination is a
         # Stage-C concern.

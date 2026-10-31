@@ -20,8 +20,8 @@ Design rules pinned by the Stage-C1 contract:
   is always obtained through the config_manager top-level registry, so the
   installed service reads the *real* live config;
 * no gate is ever fabricated: the installed QQ runtime receives real
-  ``plugin_enable`` + ``recheck_qq_effect`` gates, the post-lock / post-claim
-  authority recheck is the same per-call closure, and ``plugin_enable`` defaults
+  ``roulette_enabled`` + ``recheck_qq_effect`` gates, the post-lock / post-claim
+  authority recheck is the same per-call closure, and ``roulette_enabled`` defaults
   to ``false`` so failing closed is the contract default;
 * ``nonebot_plugin_orm`` is imported lazily inside functions (its plugin entry
   touches ``get_driver()`` / plugin config and must not run at module import);
@@ -125,7 +125,7 @@ class _LazyConfigPort:
 
     Every read fails closed until the periodic recovery entry acquires the real
     manager; a successful acquisition is cached and later reads delegate to the
-    real manager, so the runtime's live ``plugin_enable`` read stays
+    real manager, so the runtime's live ``roulette_enabled`` read stays
     authoritative (this port never fabricates a switch value).
     """
 
@@ -440,7 +440,7 @@ def _admission_port(
 async def _maintenance_admission(app_id: str, group_openid: str) -> bool:
     """Resolve the canonical numeric group, then consult the real admission.
 
-    Maintenance never gates on the business ``plugin_enable`` switch: it must
+    Maintenance never gates on the business ``roulette_enabled`` switch: it must
     keep advancing while business is disabled.  An unresolvable / malformed
     canonical group fails closed.
     """
@@ -627,7 +627,7 @@ async def _recovery_entry() -> None:
             # A not-ready binding/admission dependency must never be mistaken
             # for a clean empty scan: revoke business authority instead of
             # leaving a stale ``READY`` published.  This is not gated by the
-            # business ``plugin_enable`` switch.
+            # business ``roulette_enabled`` switch.
             logger.warning("[Roulette] 依赖尚未就绪，故障关闭")
             app.runtime.mark_unavailable(NOT_READY_REASON)
             return

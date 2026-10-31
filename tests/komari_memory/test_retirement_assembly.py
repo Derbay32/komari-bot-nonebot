@@ -437,7 +437,7 @@ def _child_env(
     env["SQLALCHEMY_DATABASE_URL"] = database_url
     env["PYTHONPATH"] = str(PROJECT_ROOT)
     env["LOG_LEVEL"] = "INFO"
-    env["KOMARI_MANAGEMENT_PLUGIN_ENABLE"] = "true"
+    env["KOMARI_MANAGEMENT_API_ENABLED"] = "true"
     env["KOMARI_MANAGEMENT_API_CREDENTIALS"] = json.dumps(
         [
             {
@@ -515,13 +515,13 @@ async def _insert_assembly_configs(
     )
     await connection.execute(
         "INSERT INTO komari_memory_config "
-        "(id, revision, updated_at, plugin_enable, hindsight_base_url, "
+        "(id, revision, updated_at, hindsight_base_url, "
         " hindsight_api_key, hindsight_bank_id, "
         " hindsight_request_timeout_seconds, hindsight_recovery_interval_seconds) "
-        "VALUES (1, 1, NOW(), TRUE, 'https://hindsight.invalid', "
+        "VALUES (1, 1, NOW(), 'https://hindsight.invalid', "
         "        'local-test-key-not-real', 'assembly-bank', 1.0, 0.01) "
         "ON CONFLICT (id) DO UPDATE SET "
-        "plugin_enable = TRUE, hindsight_base_url = EXCLUDED.hindsight_base_url",
+        "hindsight_base_url = EXCLUDED.hindsight_base_url",
     )
 
 
@@ -591,7 +591,6 @@ async def test_real_assembly_retires_old_memory_surfaces_and_keeps_independent_r
             "hindsight_base_url",
             "hindsight_recovery_interval_seconds",
             "hindsight_request_timeout_seconds",
-            "plugin_enable",
         ]
         assert payload["config_memory_present"] is True
         assert payload["old_memory_route_absent"] is True

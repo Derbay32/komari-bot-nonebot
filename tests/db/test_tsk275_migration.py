@@ -23,7 +23,7 @@ from tests.db.tsk197_gate_support import (
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MIGRATIONS_DIR = PROJECT_ROOT / "migrations"
 SQLALCHEMY_URL = os.getenv("SQLALCHEMY_DATABASE_URL", "")
-HEAD = "0034"
+HEAD = "0035"
 ROULETTE_TABLES = {
     "komari_roulette_games",
     "komari_roulette_players",
@@ -36,7 +36,7 @@ ROULETTE_CONFIG_COLUMNS = (
     "id",
     "revision",
     "updated_at",
-    "plugin_enable",
+    "roulette_enabled",
     "item_weight_magnifier",
     "item_weight_beer",
     "item_weight_burst",
@@ -129,7 +129,7 @@ async def test_fresh_database_upgrade_head_and_check_include_roulette_schema() -
             assert set(config_columns) == set(ROULETTE_CONFIG_COLUMNS)
             assert config_columns["action_copy_pool"] == "jsonb"
             assert config_columns["final_copy_pool"] == "jsonb"
-            assert config_columns["plugin_enable"] == "boolean"
+            assert config_columns["roulette_enabled"] == "boolean"
             assert config_columns["revision"] == "integer"
             # 迁移只建表，不播种配置行（运行时以 config_manager 首次读取
             # 的 Pydantic 默认值回写）。

@@ -29,7 +29,7 @@ def _install_allowed_entry_dependencies(
     workflow: object | None = None,
 ) -> SimpleNamespace:
     config = SimpleNamespace(
-        plugin_enable=True,
+        chat_enabled=True,
         group_whitelist=[],
         error_notify_enabled=False,
         face_reaction_enabled=False,
@@ -166,7 +166,7 @@ async def test_admission_gate_controls_group_message_processing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls = SimpleNamespace(process=False, dispatch=None)
-    config = SimpleNamespace(plugin_enable=True)
+    config = SimpleNamespace(chat_enabled=True)
 
     def _adjudicate_allowed(_groups: object) -> object:
         return SimpleNamespace(

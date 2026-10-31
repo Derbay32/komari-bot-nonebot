@@ -75,7 +75,8 @@ _NON_BUDGET_COLUMN_DEFAULTS: dict[str, object] = {
     "vision_image_download_read_timeout_seconds": 30.0,
     "vision_image_download_total_timeout_seconds": 45.0,
     # TSK-192 phase B：0027 新增 chat 列在 head 下需要显式填充。
-    "plugin_enable": False,
+    # ADR-0018 / 0035：聊天开关改名为 chat_enabled。
+    "chat_enabled": False,
     "llm_model_chat": "gemini-3-flash-preview",
     "llm_temperature_chat": 1.0,
     "llm_max_tokens_chat": 4000,

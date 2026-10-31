@@ -38,7 +38,6 @@ class _ConfigState:
 
 def _config(**overrides: Any) -> SimpleNamespace:
     values: dict[str, Any] = {
-        "plugin_enable": True,
         "hindsight_base_url": "http://127.0.0.1:9999",
         "hindsight_api_key": SECRET,
         "hindsight_bank_id": BANK_ID,
@@ -515,7 +514,6 @@ async def test_configuration_failures_do_not_build_clients_or_abort_startup(
     await service.close()
 
     cases = (
-        (_config(plugin_enable=False), "configuration_disabled"),
         (_config(hindsight_base_url=""), "configuration_incomplete"),
         (_config(hindsight_api_key=""), "configuration_incomplete"),
         (_config(hindsight_bank_id=""), "configuration_incomplete"),

@@ -4,13 +4,11 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import UTC, datetime
 from uuid import uuid4
 
 import asyncpg
 import pytest
 
-from komari_bot.config.typed_config import ensure_typed_config_model
 from tests.db.tsk190_legacy_config_support import (
     RETAINED_DECISION_CONFIG_FIELDS,
     STORAGE_COLUMNS,
@@ -45,7 +43,8 @@ EXECUTION_DEFAULTS = {
 #: TSK-190（0025）之后判定配置表的列集合：3 个存储字段 + 13 个保留字段。
 SURVIVING_CONFIG_COLUMNS = frozenset(
     (*STORAGE_COLUMNS, *RETAINED_DECISION_CONFIG_FIELDS)
-)
+) - frozenset({"plugin_enable"})
+"""head 形状：0024 保留字段中除去 0035 退役的停用开关。"""
 
 
 @pytest.mark.skipif(not POSTGRES_URL, reason="未设置 KOMARI_TEST_POSTGRES_URL")
@@ -199,93 +198,9 @@ async def test_decision_storage_upgrade_downgrade_preserves_existing_configurati
                 assert {
                     name: tail_record[name] for name in EXECUTION_DEFAULTS
                 } == EXECUTION_DEFAULTS
-                assert tail_record["plugin_enable"] is False
         finally:
             await connection.close()
         checked = run_bootstrap(database_url, "check")
         assert checked.returncode == 0, checked.stdout + checked.stderr
-    finally:
-        await drop_scratch_database(str(scratch["database"]))
-
-
-@pytest.mark.skipif(not POSTGRES_URL, reason="未设置 KOMARI_TEST_POSTGRES_URL")
-@pytest.mark.asyncio
-async def test_disable_transition_fences_unhanded_work_without_freeing_live_slots() -> (
-    None
-):
-    """关闭再开启仍撤销旧资格，但保留在途名额和已交接的业务事实。"""
-    if not same_database(POSTGRES_URL, SQLALCHEMY_URL):
-        pytest.skip("KOMARI_TEST_POSTGRES_URL 与 SQLALCHEMY_DATABASE_URL 不一致")
-    scratch = await recreate_scratch_database(f"_jev182f_{uuid4().hex[:10]}")
-    database_url = scratch_url(str(scratch["database"]))
-    try:
-        upgraded = run_bootstrap(database_url, "upgrade", "head")
-        assert upgraded.returncode == 0, upgraded.stdout + upgraded.stderr
-        connection = await asyncpg.connect(**scratch)
-        try:
-            schema = ensure_typed_config_model("komari_decision")
-            assert schema is not None
-            values = schema(plugin_enable=True).model_dump(mode="json")
-            values.update(id=1, revision=1, updated_at=datetime.now(UTC).isoformat())
-            await connection.execute(
-                "INSERT INTO komari_decision_config "
-                "SELECT * FROM json_populate_record(NULL::komari_decision_config, $1::json)",
-                json.dumps(values),
-            )
-            await connection.execute(
-                "INSERT INTO komari_decision_scheduler (id,pseudonym_salt) VALUES (1,$1)",
-                b"x" * 32,
-            )
-            owner = await connection.fetchval(
-                "INSERT INTO komari_decision_processes DEFAULT VALUES RETURNING id"
-            )
-            for index, state in enumerate(
-                ["queued", "running", "success", "bypass", "failed", "success"]
-            ):
-                await connection.execute(
-                    "INSERT INTO komari_decision_dispatches "
-                    "(decision_id,protocol,account_id,group_id,message_id,owner_process_id,dispatch_id,"
-                    "generation,state,reason_code,enqueued_at,queue_deadline,slot_held,business_route,"
-                    "handed_off_at,notification_eligible) "
-                    "VALUES ($1,'onebot_v11','synthetic-account','synthetic-group',$2,$3,$4,"
-                    "0,$5,'fixture',clock_timestamp(),clock_timestamp()+interval '3 seconds',$6,$7,"
-                    "CASE WHEN $8 THEN clock_timestamp() ELSE NULL END,$9)",
-                    uuid4(),
-                    str(index),
-                    owner,
-                    uuid4(),
-                    state,
-                    state == "running",
-                    "chat" if state in {"success", "bypass"} else "none",
-                    index == 5,
-                    state == "failed",
-                )
-            await connection.execute(
-                "UPDATE komari_decision_config SET plugin_enable=false,revision=revision+1 WHERE id=1"
-            )
-            await connection.execute(
-                "UPDATE komari_decision_config SET plugin_enable=true,revision=revision+1 WHERE id=1"
-            )
-            rows = await connection.fetch(
-                "SELECT * FROM komari_decision_dispatches ORDER BY message_id"
-            )
-            for row in rows[:5]:
-                assert row["state"] == "cancelled"
-                assert row["reason_code"] == "disabled"
-                assert row["business_route"] == "none"
-                assert row["notification_eligible"] is False
-                assert row["finished_at"] is not None
-            assert rows[1]["slot_held"] is True
-            assert rows[5]["state"] == "success"
-            assert rows[5]["business_route"] == "chat"
-            assert rows[5]["handed_off_at"] is not None
-            assert (
-                await connection.fetchval(
-                    "SELECT generation FROM komari_decision_scheduler WHERE id=1"
-                )
-                == 1
-            )
-        finally:
-            await connection.close()
     finally:
         await drop_scratch_database(str(scratch["database"]))

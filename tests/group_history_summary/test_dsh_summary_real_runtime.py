@@ -120,7 +120,7 @@ def _history_items(count: int) -> list[dict[str, Any]]:
 def _config() -> DynamicConfigSchema:
     return DynamicConfigSchema(
         version="1.0",
-        plugin_enable=True,
+        summary_enabled=True,
         min_summary_count=10,
         max_summary_count=200,
         fetch_batch_size=50,

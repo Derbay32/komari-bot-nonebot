@@ -114,7 +114,7 @@ def test_startup_cleanup_no_longer_refers_legacy_table() -> None:
 
 
 def test_three_plugins_no_old_permission_runtime_call() -> None:
-    """三业务插件改自持 plugin_enable + 统一准入，不再调用 check_runtime_permission。"""
+    """三业务插件改自持业务开关 + 统一准入，不再调用 check_runtime_permission。"""
     for plugin in PERMISSION_REFERENCING_PLUGINS:
         init = KOMARI_BOT / "plugins" / plugin / "__init__.py"
         if not init.exists():
@@ -126,7 +126,11 @@ def test_three_plugins_no_old_permission_runtime_call() -> None:
         assert "permission_manager" not in text, (
             f"{plugin}/__init__.py 仍引用 permission_manager"
         )
-        assert re.search(r"plugin_enable\s*[:=]", text) or re.search(
+        assert re.search(
+            r"(?:chat|summary|knowledge|help|knowledge_proposals|sentry|sr|roulette"
+            r"|search|fetch)_enabled\s*[:=]",
+            text,
+        ) or re.search(
             r"require\(['\"]group_admission['\"]\)", text
         ), f"{plugin}/__init__.py 未自持开关/未接入统一准入"
 

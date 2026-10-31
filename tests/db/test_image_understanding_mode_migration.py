@@ -271,6 +271,8 @@ async def _insert_chat_row_leaving_image_defaults(
         "agent_max_tool_calls_per_round": 2,
         "agent_max_total_tool_calls": 8,
     }
+    # 0032 边界上聊天开关仍叫 plugin_enable（0035 才改名）。
+    values["plugin_enable"] = values.pop("chat_enabled")
     rows = await connection.fetch(
         "SELECT column_name FROM information_schema.columns"
         f" WHERE table_name = '{_CHAT_TABLE}'"

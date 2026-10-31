@@ -74,12 +74,9 @@ async def test_0034_upgrade_preserves_other_tables_and_has_zero_drift(
         finally:
             await connection.close()
 
-        result = run_bootstrap(url, "upgrade", "head")
+        # 0034 边界：只删除管理配置表，其他表结构与行数据逐项保持原样。
+        result = run_bootstrap(url, "upgrade", "0034")
         assert result.returncode == 0, "management configuration retirement failed"
-        check = run_bootstrap(url, "check")
-        assert check.returncode == 0, (
-            "ORM drift after management configuration retirement"
-        )
         connection = await asyncpg.connect(**scratch)
         try:
             expected = {
@@ -97,9 +94,10 @@ async def test_0034_upgrade_preserves_other_tables_and_has_zero_drift(
         finally:
             await connection.close()
 
-        refusal = run_bootstrap(url, "downgrade", "0033")
-        assert refusal.returncode != 0
-        assert CODE in refusal.stdout + refusal.stderr
+        # 0034 自身拒绝降级：0035 合并进链后，仍在该边界上验证本迁移的守卫。
+        refusal_0034 = run_bootstrap(url, "downgrade", "0033")
+        assert refusal_0034.returncode != 0
+        assert CODE in refusal_0034.stdout + refusal_0034.stderr
         connection = await asyncpg.connect(**scratch)
         try:
             assert await _schema(connection) == expected
@@ -107,8 +105,43 @@ async def test_0034_upgrade_preserves_other_tables_and_has_zero_drift(
                 await connection.fetchval("SELECT version_num FROM alembic_version")
                 == "0034"
             )
+        finally:
+            await connection.close()
+
+        # 0035 之后：业务行继续保留，结构与当前模型零漂移。
+        result = run_bootstrap(url, "upgrade", "head")
+        assert result.returncode == 0, "business capability switch migration failed"
+        check = run_bootstrap(url, "check")
+        assert check.returncode == 0, (
+            "ORM drift after management configuration retirement"
+        )
+        connection = await asyncpg.connect(**scratch)
+        try:
+            assert (
+                await connection.fetchval("SELECT version_num FROM alembic_version")
+                == "0035"
+            )
             for table, rows in before_rows.items():
-                assert await _rows(connection, table) == rows, table
+                remaining = await connection.fetchval(
+                    f'SELECT count(*) FROM "{table}"'
+                )
+                assert remaining == len(rows), table
+            head_schema = await _schema(connection)
+        finally:
+            await connection.close()
+
+        refusal_0035 = run_bootstrap(url, "downgrade", "0034")
+        assert refusal_0035.returncode != 0
+        assert "0035_TSK210_IS_IRREVERSIBLE" in (
+            refusal_0035.stdout + refusal_0035.stderr
+        )
+        connection = await asyncpg.connect(**scratch)
+        try:
+            assert await _schema(connection) == head_schema
+            assert (
+                await connection.fetchval("SELECT version_num FROM alembic_version")
+                == "0035"
+            )
         finally:
             await connection.close()
     finally:

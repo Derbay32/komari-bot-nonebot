@@ -391,7 +391,7 @@ async def handle_group_message(  # noqa: PLR0911 - 每个入口门禁都是独�
 ) -> None:
     """处理群聊消息。"""
     config = get_config()
-    if not config.plugin_enable:
+    if not config.chat_enabled:
         return
 
     handler = _get_or_build_handler()

@@ -27,7 +27,7 @@ def sr_module(app: App) -> Any:
 
 class _StubConfigManager:
     def __init__(self, sr_list: list[str]) -> None:
-        self._config = SimpleNamespace(plugin_enable=True, sr_list=sr_list)
+        self._config = SimpleNamespace(sr_enabled=True, sr_list=sr_list)
 
     async def get_async(self) -> object:
         return self._config

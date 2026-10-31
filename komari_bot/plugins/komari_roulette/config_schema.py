@@ -5,7 +5,7 @@
 
 运行时语义（TSK-269 §1）：
 
-- ``plugin_enable`` 默认 ``false``，动态生效；
+- ``roulette_enabled`` 默认 ``false``，动态生效；
 - 四项道具权重默认各 1、非负、总和必须大于 0；权重只在 ``waiting → active``
   读取一次并随对局冻结，配置更新只影响之后新建的对局；
 - ``action_copy_pool`` / ``final_copy_pool`` 是闭集键 → 非空模板列表的 JSONB
@@ -58,10 +58,12 @@ class DynamicConfigSchema(TypedConfigModel, table=True):
         json_schema_extra={"default_apply_mode": "immediate"},
     )
 
-    # 插件控制
-    plugin_enable: bool = Field(
+    # 业务控制：只限制新的轮盘业务入口，维护与清理照常执行。
+    roulette_enabled: bool = Field(
         default=False,
-        description="插件启用状态",
+        description=(
+            "是否处理新的轮盘业务请求；关闭不暂停既有绝对期限、维护与清理"
+        ),
         json_schema_extra={"apply_mode": "immediate"},
     )
 

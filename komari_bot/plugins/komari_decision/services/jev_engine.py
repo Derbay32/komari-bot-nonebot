@@ -136,10 +136,16 @@ _SUMMARY_NOTIFICATION_REASONS: Final[frozenset[DecisionReason]] = frozenset(
 _SILENT_REASONS: Final[frozenset[DecisionReason]] = frozenset(
     {"duplicate_event", "disabled", "admission_revoked", "interrupted", "filtered"}
 )
-"""绝不取得失败通知资格的原因码。"""
+"""绝不取得失败通知资格的原因码。
+
+``disabled`` 只服务历史判定行的读取与定案：本版本不再产生新的停用终态。
+"""
 
 _REMOVE_REASONS: Final[frozenset[str]] = frozenset({"disabled", "admission_revoked"})
-"""这些原因码的终结行必须把条目从输入窗口移除（即便曾有成功布尔值）。"""
+"""这些原因码的终结行必须把条目从输入窗口移除（即便曾有成功布尔值）。
+
+``disabled`` 只服务历史判定行的读取与定案：本版本不再产生新的停用终态。
+"""
 
 _MAX_RETAINED_RESULTS: Final = 256
 """同次分发结果的内存保留上限（超出后按最早写入淘汰，不会重新执行）。"""
@@ -173,7 +179,6 @@ class _FrozenTask:
 
     config: KomariDecisionConfigSchema
     revision: int | None
-    plugin_enable: bool
     bot_aliases: tuple[str, ...]
     queue_timeout_seconds: float
     reference_timeout_seconds: float
@@ -305,7 +310,7 @@ class _DiagnosticObservation:
 class _HealthState:
     """可变的健康快照视图字段（不对外暴露可变对象）。"""
 
-    runtime_status: Literal["ready", "disabled", "failed"] = "failed"
+    runtime_status: Literal["ready", "failed"] = "failed"
     reason_code: DecisionReason = "initializing"
     last_request_status: Literal["unknown", "success", "failure"] = "unknown"
     last_success_at: datetime | None = None
@@ -402,11 +407,11 @@ class JevDecisionEngine:
 
     async def initialize(self) -> None:
         """初始化持久身份与就绪状态；失败只反映到健康快照。"""
-        await self._ensure_ready(cancel_inflight=False)
+        await self._ensure_ready()
 
     async def refresh(self) -> None:
         """重新检查配置、Prompt 与持久所有权（不发起任何模型请求）。"""
-        await self._ensure_ready(cancel_inflight=True)
+        await self._ensure_ready()
 
     async def close(self) -> None:
         """取消并等待自有任务、定案输入、撤销未交接资格、释放自有资源。"""
@@ -1167,6 +1172,7 @@ class JevDecisionEngine:
     ) -> DecisionResult:
         """排队未被授权时的终态与失败通知资格。"""
         reason = _coerce_reason(reason_code or "", default="queue_timeout")
+        # ``disabled`` 只服务历史行：本版本不再产生新的停用终态。
         status: DecisionStatus = (
             "cancelled"
             if state == STATE_CANCELLED
@@ -1645,7 +1651,6 @@ class JevDecisionEngine:
         return _FrozenTask(
             config=config,
             revision=int(snapshot.revision),
-            plugin_enable=bool(config.plugin_enable),
             bot_aliases=tuple(config.bot_aliases),
             queue_timeout_seconds=float(config.queue_timeout_seconds),
             reference_timeout_seconds=float(config.reference_timeout_seconds),
@@ -1717,8 +1722,6 @@ class JevDecisionEngine:
             return _BYPASS_PATH
         if frozen is None:
             return _CONFIGURATION_INVALID_PATH
-        if not frozen.plugin_enable:
-            return _DISABLED_PATH
         return self._admitted_path(
             request, _Path(kind="platform_summary", input_eligible=True)
         )
@@ -1726,7 +1729,7 @@ class JevDecisionEngine:
     def _ordinary_path(
         self, request: DecisionRequest, frozen: _FrozenTask | None
     ) -> _Path:
-        """普通正文：先按 TSK-180 §2 过滤，再按开关与总结候选分流。"""
+        """普通正文：先按 TSK-180 §2 过滤，再按总结候选分流。"""
         if frozen is None:
             return _CONFIGURATION_INVALID_PATH
         verdict = judge_ordinary_message(
@@ -1734,8 +1737,6 @@ class JevDecisionEngine:
         )
         if verdict.filtered:
             return _FILTERED_PATH
-        if not frozen.plugin_enable:
-            return _DISABLED_PATH
         kind: Literal["full_summary", "ordinary"] = (
             "full_summary" if request.summary_candidate else "ordinary"
         )
@@ -1747,12 +1748,12 @@ class JevDecisionEngine:
             return path
         return _ADMISSION_DENIED_PATH
 
-    async def _ensure_ready(self, *, cancel_inflight: bool) -> None:
+    async def _ensure_ready(self) -> None:
         async with self._readiness_lock:
             if self._closed:
                 return
             await self._ensure_ownership()
-            await self._recheck_readiness(cancel_inflight=cancel_inflight)
+            await self._recheck_readiness()
             self._initialized = True
 
     async def _ensure_ownership(self) -> None:
@@ -1811,18 +1812,13 @@ class JevDecisionEngine:
         with suppress(Exception):
             await previous.close()
 
-    async def _recheck_readiness(self, *, cancel_inflight: bool) -> None:
+    async def _recheck_readiness(self) -> None:
         try:
             snapshot = self._config_source()
         except Exception:
             self._set_runtime("failed", "configuration_invalid")
             return
         value = snapshot.value
-        if not value.plugin_enable:
-            self._set_runtime("disabled", "disabled")
-            if cancel_inflight:
-                self._cancel_owned()
-            return
         if not self._repository.ready:
             # 没有持久所有者就绝不允许报告 ready（初始化尚未尝试时如实说明）。
             self._set_runtime(
@@ -1850,7 +1846,7 @@ class JevDecisionEngine:
 
     def _set_runtime(
         self,
-        status: Literal["ready", "disabled", "failed"],
+        status: Literal["ready", "failed"],
         reason: DecisionReason,
     ) -> None:
         self._health.runtime_status = status
@@ -2124,7 +2120,6 @@ class _Path:
         "platform_summary",
         "full_summary",
         "ordinary",
-        "disabled",
         "admission_denied",
         "configuration_invalid",
     ]
@@ -2348,9 +2343,6 @@ _BYPASS_PATH: Final = _Path(
     terminal_reason="platform_bypass",
     input_eligible=True,
 )
-_DISABLED_PATH: Final = _Path(
-    kind="disabled", terminal_state=STATE_FAILED, terminal_reason="disabled"
-)
 _ADMISSION_DENIED_PATH: Final = _Path(
     kind="admission_denied",
     terminal_state=STATE_CANCELLED,
@@ -2375,7 +2367,6 @@ _TERMINAL_SPECS: Final[dict[str, _TerminalSpec]] = {
         retain_recent=True,
         memory_candidate=True,
     ),
-    "disabled": _TerminalSpec(status="failed", reason="disabled"),
     "admission_denied": _TerminalSpec(status="cancelled", reason="admission_revoked"),
     "configuration_invalid": _TerminalSpec(
         status="failed", reason="configuration_invalid"
@@ -2388,7 +2379,6 @@ _RESERVATION_OUTCOMES: Final[
     ReservationKind.DUPLICATE: ("duplicate", "duplicate_event"),
     ReservationKind.REUSED: ("duplicate", "duplicate_event"),
     ReservationKind.UNAVAILABLE: ("failed", "storage_unavailable"),
-    ReservationKind.DISABLED: ("failed", "disabled"),
     ReservationKind.QUEUE_FULL: ("failed", "queue_full"),
 }
 
@@ -2456,6 +2446,11 @@ def _request_configuration_problem(
 def _coerce_reason(
     value: str, *, default: DecisionReason = "internal_error"
 ) -> DecisionReason:
+    """把持久/线上的原因码收敛到已知集合。
+
+    ``disabled`` 只保留在已知集合里，用于读取历史判定行；本版本不再产生新的
+    停用终态。
+    """
     known: frozenset[str] = frozenset(
         {
             "classified",

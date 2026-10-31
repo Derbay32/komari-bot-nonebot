@@ -7,7 +7,7 @@ Schema + 配置管理器测试替身）验证：
   ``jev_http_timeout_seconds`` / ``jev_request_timeout_seconds``）经既有字段写入
   接口保存，并在读取响应中只返回秘密字段掩码；
 - TSK-190 后只剩 ``jev_request`` 与 ``jev_execution`` 两个分区，保留字段
-  （含新初始化默认启用的 ``plugin_enable``）取值不变；退役字段不再出现；
+  取值不变；退役字段（含 ADR-0018 删除的停用开关）不再出现；
 - 非法截止、空模型、畸形连接地址与畸形凭据在写入边界被拒绝：422 响应、
   审计输出与读取投影都不得回显被拒值（凭据 canary 不得出现），配置保持原样。
 """
@@ -155,8 +155,8 @@ async def test_jev_fields_are_exposed_with_secret_masking(
     assert values["jev_model"] == "jev-1.14.0"
     assert values["jev_http_timeout_seconds"] == 3.0
     assert values["jev_request_timeout_seconds"] == 3.0
-    # TSK-190：新初始化配置默认启用，退役字段不再返回
-    assert values["plugin_enable"] is True
+    # TSK-190 / ADR-0018：退役字段不再返回
+    assert "plugin_enable" not in values
     for retired in RETIRED_DECISION_CONFIG_FIELDS:
         assert retired not in values, retired
 

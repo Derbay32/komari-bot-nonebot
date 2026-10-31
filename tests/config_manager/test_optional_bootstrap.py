@@ -447,7 +447,7 @@ async def test_memory_config_failure_does_not_block_chat_config_warmup(
                 "komari_chat",
                 _valid_data(
                     chat_schema,
-                    plugin_enable=True,
+                    chat_enabled=True,
                     context_messages_limit=17,
                 ),
                 6,

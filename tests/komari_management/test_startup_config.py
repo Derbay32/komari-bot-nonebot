@@ -29,7 +29,7 @@ def test_nonebot_loads_dotenv_and_environment_overrides(
 ) -> None:
     dotenv = tmp_path / ".env"
     dotenv.write_text(
-        "KOMARI_MANAGEMENT_PLUGIN_ENABLE=true\n"
+        "KOMARI_MANAGEMENT_API_ENABLED=true\n"
         f"KOMARI_MANAGEMENT_API_CREDENTIALS='{json.dumps(CREDENTIALS)}'\n"
         'KOMARI_MANAGEMENT_API_ALLOWED_ORIGINS=["https://ui.example.com"]\n'
         "KOMARI_MANAGEMENT_ANNOUNCE_STATUS_PAGE_URL=https://status.example.com\n"
@@ -44,7 +44,7 @@ def test_nonebot_loads_dotenv_and_environment_overrides(
 
     config = nonebot.get_plugin_config(ManagementConfig)
 
-    assert config.komari_management_plugin_enable is True
+    assert config.komari_management_api_enabled is True
     assert config.komari_management_api_credentials[0].token == TOKEN
     assert config.komari_management_api_allowed_origins == ["https://ui.example.com"]
     assert (
@@ -69,12 +69,12 @@ def test_unprefixed_settings_do_not_enable_management(
 ) -> None:
     config = ManagementConfig.model_validate(
         {
-            "plugin_enable": True,
+            "api_enabled": True,
             "api_credentials": CREDENTIALS,
             "api_allowed_origins": ["https://wrong.example.com"],
         }
     )
-    assert config.komari_management_plugin_enable is False
+    assert config.komari_management_api_enabled is False
     assert config.komari_management_api_credentials == []
     assert config.komari_management_api_allowed_origins == []
 
@@ -83,7 +83,7 @@ def test_unprefixed_settings_do_not_enable_management(
     driver = SimpleNamespace(config=Config(_env_file=None))
     monkeypatch.setattr(nonebot.plugin, "get_driver", lambda: driver)
     startup = nonebot.get_plugin_config(ManagementConfig)
-    assert startup.komari_management_plugin_enable is False
+    assert startup.komari_management_api_enabled is False
     assert startup.komari_management_api_credentials == []
 
 
@@ -117,7 +117,7 @@ def test_invalid_dotenv_credentials_fail_validation(
 ) -> None:
     dotenv = tmp_path / ".env"
     dotenv.write_text(
-        "KOMARI_MANAGEMENT_PLUGIN_ENABLE=true\n"
+        "KOMARI_MANAGEMENT_API_ENABLED=true\n"
         'KOMARI_MANAGEMENT_API_CREDENTIALS=[{"credential_id":"dashboard","token":"short","permissions":["*"]}]\n',
         encoding="utf-8",
     )

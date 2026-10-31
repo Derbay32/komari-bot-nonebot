@@ -140,7 +140,6 @@ async def test_reply_send_restricted_blocks_outbound(
         mod,
         "get_context_config",
         lambda: SimpleNamespace(
-            plugin_enable=True,
             face_reaction_enabled=False,
             face_reaction_id=None,
             error_notify_enabled=False,
@@ -151,7 +150,7 @@ async def test_reply_send_restricted_blocks_outbound(
         mod,
         "get_config",
         lambda: SimpleNamespace(
-            plugin_enable=True,
+            chat_enabled=True,
             face_reaction_enabled=False,
             face_reaction_id=None,
         ),

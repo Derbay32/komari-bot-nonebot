@@ -665,7 +665,7 @@ class RouletteMaintenance:
             # The owner's own stop state is part of the post-lock gate: a
             # shutdown that happened while the worker waited on the group lock
             # must abandon the effect.  This is never the business
-            # ``plugin_enable`` switch; maintenance still runs while business
+            # ``roulette_enabled`` switch; maintenance still runs while business
             # is disabled.
             if self._stopped:
                 return False

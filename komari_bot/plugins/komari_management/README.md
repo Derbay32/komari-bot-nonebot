@@ -25,7 +25,7 @@ Swagger/OpenAPI 文档本身可以公开访问，但下列业务接口全部需�
 
 | 环境变量 | 默认值 | 用途 |
 | --- | --- | --- |
-| `KOMARI_MANAGEMENT_PLUGIN_ENABLE` | `false` | 启用管理 API |
+| `KOMARI_MANAGEMENT_API_ENABLED` | `false` | 启用管理 API |
 | `KOMARI_MANAGEMENT_API_CREDENTIALS` | `[]` | 具名凭据 JSON 数组 |
 | `KOMARI_MANAGEMENT_API_ALLOWED_ORIGINS` | `[]` | 前端 Origin JSON 数组 |
 | `KOMARI_MANAGEMENT_ANNOUNCE_STATUS_PAGE_URL` | `https://your.status.page/url/here` | 维护通知状态页 |
@@ -35,7 +35,7 @@ Swagger/OpenAPI 文档本身可以公开访问，但下列业务接口全部需�
 
 后端注册管理 API 需要满足 3 个条件：
 
-- `KOMARI_MANAGEMENT_PLUGIN_ENABLE=true`。
+- `KOMARI_MANAGEMENT_API_ENABLED=true`。
 - `KOMARI_MANAGEMENT_API_CREDENTIALS` 至少包含 1 条格式有效的凭据。
 - NoneBot2 使用 FastAPI Driver。
 
@@ -52,7 +52,7 @@ CORS 不替代 Bearer 鉴权。
 2. 写入部署使用的私有 dotenv 文件。按下例替换 Token 与前端地址，检查凭据值是 JSON 数组。
 
    ```dotenv
-   KOMARI_MANAGEMENT_PLUGIN_ENABLE=true
+   KOMARI_MANAGEMENT_API_ENABLED=true
    KOMARI_MANAGEMENT_API_CREDENTIALS='[{"credential_id":"dashboard","token":"<random-token>","permissions":["*"],"revoked_at":null}]'
    KOMARI_MANAGEMENT_API_ALLOWED_ORIGINS=["https://admin.example.com"]
    ```
@@ -61,6 +61,11 @@ CORS 不替代 Bearer 鉴权。
 4. 使用 Token 请求 `GET /api/v2/komari-management-config/resources`。预期返回 `200`，检查列表中存在其他插件配置且没有 `komari_management`。
 
 ### 存量部署升级
+
+启用开关只读取 `KOMARI_MANAGEMENT_API_ENABLED`。
+旧环境变量名不再生效。
+操作者必须在私有环境配置中完成改名。
+代码不自动修改真实环境文件。
 
 警告：迁移 `0034` 永久删除 `komari_management_config`。
 容器 prestart 会自动执行迁移。

@@ -190,14 +190,10 @@ def is_search_available() -> bool:
     """判断是否具备注册 search_web 工具的条件（策略无感，不猜群/调用者）。
 
     调用者级白名单门控已随 ADR-0012 / TSK-225 移除：群准入由编排层在效果
-    前统一裁决，本 Adapter 只判断自身 search 能力是否就绪（含插件开关）。
+    前统一裁决，本 Adapter 只判断自身 search 能力是否就绪。
     """
     config = _get_config()
-    return (
-        config.plugin_enable
-        and config.search_enabled
-        and bool(config.search_api_key.strip())
-    )
+    return config.search_enabled and bool(config.search_api_key.strip())
 
 
 def is_fetch_available() -> bool:
@@ -206,11 +202,7 @@ def is_fetch_available() -> bool:
     调用者级白名单门控已随 ADR-0012 / TSK-225 移除（见 is_search_available）。
     """
     config = _get_config()
-    return (
-        config.plugin_enable
-        and config.fetch_enabled
-        and bool(config.search_api_key.strip())
-    )
+    return config.fetch_enabled and bool(config.search_api_key.strip())
 
 
 def _normalize_query(query: str) -> str:
@@ -305,8 +297,6 @@ def _get_search_precheck_error(
     normalized_query: str,
 ) -> str | None:
     """返回搜索调用前的配置/查询错误。"""
-    if not config.plugin_enable:
-        return _SEARCH_ERROR_DISABLED
     if not config.search_enabled:
         return _SEARCH_ERROR_DISABLED
     if not api_key:
@@ -322,8 +312,6 @@ def _get_fetch_precheck_error(
     api_key: str,
 ) -> str | None:
     """返回抓取调用前的配置错误。"""
-    if not config.plugin_enable:
-        return _FETCH_ERROR_DISABLED
     if not config.fetch_enabled:
         return _FETCH_ERROR_DISABLED
     if not api_key:

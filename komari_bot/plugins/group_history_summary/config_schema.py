@@ -64,7 +64,9 @@ class DynamicConfigSchema(TypedConfigModel, table=True):
         json_schema_extra={"default_apply_mode": "immediate"},
     )
 
-    plugin_enable: bool = Field(default=True, description="插件启用状态")
+    summary_enabled: bool = Field(
+        default=True, description="是否处理新的群聊总结请求"
+    )
 
     redis_db: int = Field(
         default=0,

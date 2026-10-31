@@ -34,7 +34,7 @@ def help_module(app: App, monkeypatch: pytest.MonkeyPatch) -> Any:
     module = importlib.reload(importlib.import_module(PACKAGE_NAME))
 
     async def _dummy_config() -> SimpleNamespace:
-        return SimpleNamespace(plugin_enable=True, auto_scan_on_startup=False)
+        return SimpleNamespace(help_enabled=True, auto_scan_on_startup=False)
 
     monkeypatch.setattr(module.config_manager, "get_async", _dummy_config)
     return module

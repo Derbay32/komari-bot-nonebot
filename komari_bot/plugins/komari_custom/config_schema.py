@@ -13,7 +13,11 @@ class DynamicConfigSchema(TypedConfigModel, table=True):
     plugin_name: ClassVar[str] = "komari_custom"
     __tablename__ = "komari_custom_config"
 
-    plugin_enable: bool = Field(default=False, description="插件启用状态")
+    knowledge_proposals_enabled: bool = Field(
+        default=False,
+        description="是否处理新的知识库提案与投票",
+        json_schema_extra={"apply_mode": "immediate"},
+    )
     required_votes: int = Field(default=5, ge=2, le=50, description="提案通过所需票数")
     vote_emoji_id: str = Field(default="76", description="投票使用的 QQ 表情 ID")
     proposal_expire_hours: int = Field(

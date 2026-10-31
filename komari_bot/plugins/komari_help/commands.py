@@ -46,7 +46,7 @@ async def _admission_gate(event: MessageEvent) -> bool:
     """统一准入复查与本插件自有开关的前置门。
 
     先由 ``group_admission`` 裁决关联群，获准后读取本插件自身
-    ``plugin_enable`` 进一步收窄；任一环节不满足都静默跳过。``plugin_enable``
+    ``help_enabled`` 进一步收窄；任一环节不满足都静默跳过。``help_enabled``
     只收窄不扩张：准入资格始终由裁决决定。
     """
     group_id = getattr(event, "group_id", None)
@@ -55,7 +55,7 @@ async def _admission_gate(event: MessageEvent) -> bool:
     if adjudicate([group_id]).qualification is not AdmissionQualification.BUSINESS:
         return False
     config = await config_manager.get_async()
-    return bool(getattr(config, "plugin_enable", True))
+    return bool(getattr(config, "help_enabled", True))
 
 
 async def _build_overview() -> str:

@@ -67,8 +67,8 @@ class TogglableConfig:
     "recovery job really drives the runtime state machine" case is observed.
     """
 
-    def __init__(self, *, plugin_enable: bool = True) -> None:
-        self.plugin_enable = plugin_enable
+    def __init__(self, *, roulette_enabled: bool = True) -> None:
+        self.roulette_enabled = roulette_enabled
         self.fail = False
         self.initialize_calls = 0
         self.get_calls = 0
@@ -78,7 +78,7 @@ class TogglableConfig:
         if self.fail:
             message = "config storage unavailable (C1 test port)"
             raise RuntimeError(message)
-        return SimpleNamespace(plugin_enable=self.plugin_enable)
+        return SimpleNamespace(roulette_enabled=self.roulette_enabled)
 
     async def initialize_async(self, *args: object, **kwargs: object) -> Any:
         del args, kwargs
@@ -107,8 +107,8 @@ class BlockingConfig(TogglableConfig):
     never lets the startup install the QQ runtime after shutdown returned.
     """
 
-    def __init__(self, *, plugin_enable: bool = True) -> None:
-        super().__init__(plugin_enable=plugin_enable)
+    def __init__(self, *, roulette_enabled: bool = True) -> None:
+        super().__init__(roulette_enabled=roulette_enabled)
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
 
@@ -127,8 +127,8 @@ class BlockingFailingConfig(TogglableConfig):
     graph and re-registers the owned jobs on top of a stopped process.
     """
 
-    def __init__(self, *, plugin_enable: bool = True) -> None:
-        super().__init__(plugin_enable=plugin_enable)
+    def __init__(self, *, roulette_enabled: bool = True) -> None:
+        super().__init__(roulette_enabled=roulette_enabled)
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
 
@@ -286,7 +286,7 @@ async def test_recovery_job_func_reaches_runtime_state_machine(
         env_config_schema: type[object] | None,
     ) -> TogglableConfig:
         del plugin_name, config_schema, env_config_schema
-        port = TogglableConfig(plugin_enable=True)
+        port = TogglableConfig(roulette_enabled=True)
         config_holder["port"] = port
         return port
 
@@ -333,7 +333,7 @@ async def test_business_disabled_keeps_maintenance_and_never_allows(
     harness: Tsk279Harness,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``plugin_enable=false`` pauses business but keeps recovery scheduled."""
+    """``roulette_enabled=false`` pauses business but keeps recovery scheduled."""
 
     from komari_bot.plugins.komari_roulette.maintenance import (
         CLEANUP_JOB_ID,
@@ -629,13 +629,13 @@ async def test_start_config_acquisition_failure_is_safe_and_recovers(
             )
 
             # Controlled recovery: the dependency comes back.  The real default
-            # config disables business (plugin_enable=false), so the runtime must
+            # config disables business (roulette_enabled=false), so the runtime must
             # land DISABLED with recovery completed - never a fabricated READY.
             ctx.config_getter_state["error"] = None
             await job["func"]()
             disabled = app.runtime.get_state()
             assert disabled.status.value == "disabled", (
-                "recovering with the real default config (plugin_enable=false) "
+                "recovering with the real default config (roulette_enabled=false) "
                 f"must be DISABLED, got {disabled.status.value}"
             )
             assert disabled.recovery_completed is True
@@ -648,7 +648,7 @@ async def test_start_config_acquisition_failure_is_safe_and_recovers(
             # A real live flip through the same registry manager (not a fake
             # port mutation) must reach READY through the periodic entry.
             manager = ctx.config_managers["komari_roulette"]
-            await manager.update_field_async("plugin_enable", value=True)
+            await manager.update_field_async("roulette_enabled", value=True)
             await job["func"]()
             ready = app.runtime.get_state()
             assert ready.status.value == "ready", (
@@ -799,7 +799,7 @@ async def test_stop_during_blocking_config_initialize_never_installs_later(
         env_config_schema: type[object] | None,
     ) -> BlockingConfig:
         del plugin_name, config_schema, env_config_schema
-        port = BlockingConfig(plugin_enable=True)
+        port = BlockingConfig(roulette_enabled=True)
         holder["port"] = port
         constructed.set()
         return port
@@ -862,7 +862,7 @@ async def test_stop_bounded_cancels_a_startup_blocked_in_config_initialize(
         env_config_schema: type[object] | None,
     ) -> BlockingConfig:
         del plugin_name, config_schema, env_config_schema
-        port = BlockingConfig(plugin_enable=True)
+        port = BlockingConfig(roulette_enabled=True)
         holder["port"] = port
         constructed.set()
         return port
@@ -1021,7 +1021,7 @@ async def test_scheduled_recovery_tick_fails_closed_after_dependency_loss(
             # Real live switch through the registry manager, then a real owned
             # tick: the runtime must reach a genuine READY first.
             manager = ctx.config_managers["komari_roulette"]
-            await manager.update_field_async("plugin_enable", value=True)
+            await manager.update_field_async("roulette_enabled", value=True)
             job = ctx.scheduler.get_job(RECOVERY_JOB_ID)
             assert job is not None
             await job["func"]()
@@ -1223,7 +1223,7 @@ async def test_stop_then_failed_config_initialize_never_installs_bootstrap(
         env_config_schema: type[object] | None,
     ) -> BlockingFailingConfig:
         del plugin_name, config_schema, env_config_schema
-        port = BlockingFailingConfig(plugin_enable=True)
+        port = BlockingFailingConfig(roulette_enabled=True)
         holder["port"] = port
         constructed.set()
         return port

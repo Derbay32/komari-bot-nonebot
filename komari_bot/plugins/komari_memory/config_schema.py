@@ -16,13 +16,6 @@ class KomariMemoryConfigSchema(TypedConfigModel, table=True):
         json_schema_extra={"default_apply_mode": "immediate"},
     )
 
-    # 插件控制：Hindsight 服务在每个新任务开始时读取一次。
-    plugin_enable: bool = Field(
-        default=False,
-        description="插件启用状态",
-        json_schema_extra={"apply_mode": "immediate"},
-    )
-
     # TSK-193：Hindsight 共享长期记忆调用侧连接配置。
     # 新任务会话在开始时读取一次快照；已有会话保留其初始设置。
     hindsight_base_url: str = Field(

@@ -135,28 +135,6 @@ async def test_missing_prompt_blocks_new_decisions_only(
         assert harness.transport.requests == []
 
 
-async def test_disabled_switch_blocks_new_decisions_and_refresh_keeps_it_off(
-    decision_database: str,
-) -> None:
-    """AC：显式关闭时报告 disabled；refresh 不得把它变成启用。"""
-    options = HarnessOptions(config={"plugin_enable": False})
-    async with DecisionHarness(decision_database, options) as harness:
-        assert harness.decision is not None
-        health = harness.decision.get_health()
-        assert health.runtime_status == "disabled"
-        assert health.reason_code == "disabled"
-
-        await harness.decision.refresh()
-        assert harness.decision.get_health().runtime_status == "disabled"
-
-        ordinary = await harness.decision.evaluate(make_request())
-        assert ordinary.status == "failed"
-        assert ordinary.reason_code == "disabled"
-        summon = await harness.decision.evaluate(make_request(real_platform_at=True))
-        assert summon.status == "bypass"
-        assert harness.transport.requests == []
-
-
 async def test_close_revokes_unhanded_work_and_refuses_new_work(
     decision_database: str,
 ) -> None:

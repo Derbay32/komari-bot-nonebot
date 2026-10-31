@@ -7,7 +7,6 @@ import json
 from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
-import httpx2
 import pytest
 
 from tests.komari_decision.jev_test_support import (
@@ -22,12 +21,12 @@ from tests.komari_decision.jev_test_support import (
     make_request,
     read_dispatch,
     skip_without_services,
-    update_config_row,
 )
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
+    import httpx2
     from sqlalchemy.ext.asyncio import AsyncSession
 
 pytestmark = pytest.mark.asyncio
@@ -200,71 +199,3 @@ async def test_repeated_cancellation_waits_for_owned_finalization(
             await asyncio.wait_for(
                 asyncio.gather(*tasks, return_exceptions=True), timeout=10
             )
-
-
-@pytest.mark.parametrize("provider_failure", [False, True])
-async def test_disable_before_finalization_does_not_confirm_stale_result(
-    decision_database: str, *, provider_failure: bool
-) -> None:
-    sdk_finished = False
-    disabled = False
-    holders: list[DecisionHarness] = []
-    old_text = "已失效判定的正文不能在成功定案后重新加入输入"
-
-    class SessionProbe:
-        def __init__(self, inner: AsyncSession) -> None:
-            self.inner = inner
-
-        async def execute(self, statement: Any, *args: Any, **kwargs: Any) -> Any:
-            nonlocal disabled
-            if (
-                sdk_finished
-                and not disabled
-                and "SELECT pg_advisory_xact_lock" in str(statement)
-            ):
-                disabled = True
-                engine = holders[0].engine
-                assert engine is not None
-                await update_config_row(engine, {"plugin_enable": False})
-            return await self.inner.execute(statement, *args, **kwargs)
-
-        def __getattr__(self, name: str) -> Any:
-            return getattr(self.inner, name)
-
-    def wrap(factory: Callable[[], AsyncSession]) -> Callable[[], AsyncSession]:
-        return lambda: cast("AsyncSession", SessionProbe(factory()))
-
-    async def responder(
-        request: httpx2.Request, index: int
-    ) -> dict[str, Any] | httpx2.Response:
-        nonlocal sdk_finished
-        sdk_finished = True
-        if provider_failure and index == 0:
-            return httpx2.Response(
-                503, json={"error": "synthetic unavailable"}, request=request
-            )
-        return build_answers(json.loads(request.content)["questions"])
-
-    options = HarnessOptions(session_factory_wrapper=wrap, responder=responder)
-    async with DecisionHarness(decision_database, options) as harness:
-        holders.append(harness)
-        assert harness.decision is not None and harness.engine is not None
-        identity = make_identity()
-        try:
-            result = await harness.decision.evaluate(
-                make_request(identity=identity, text=old_text)
-            )
-        except asyncio.CancelledError:
-            pass
-        else:
-            assert result.status in (
-                {"failed", "cancelled"} if provider_failure else {"cancelled"}
-            )
-        assert disabled
-        await update_config_row(harness.engine, {"plugin_enable": True})
-        follower = make_identity(
-            account_id=identity.account_id, group_id=identity.group_id
-        )
-        result = await harness.decision.evaluate(make_request(identity=follower))
-        assert result.status == "success"
-        assert old_text not in str(harness.transport.state(1))

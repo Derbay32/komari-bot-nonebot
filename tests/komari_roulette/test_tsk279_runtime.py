@@ -278,8 +278,8 @@ class RecordingConfig:
     initialization snapshot forever.
     """
 
-    def __init__(self, *, plugin_enable: bool = True, fails: bool = False) -> None:
-        self.plugin_enable = plugin_enable
+    def __init__(self, *, roulette_enabled: bool = True, fails: bool = False) -> None:
+        self.roulette_enabled = roulette_enabled
         self.fails = fails
         self.calls = 0
         self.read_calls = 0
@@ -288,7 +288,7 @@ class RecordingConfig:
         if self.fails:
             message = "config storage unavailable (TSK-279 test port)"
             raise RuntimeError(message)
-        return SimpleNamespace(plugin_enable=self.plugin_enable)
+        return SimpleNamespace(roulette_enabled=self.roulette_enabled)
 
     async def initialize_async(self) -> Any:
         self.calls += 1
@@ -510,14 +510,14 @@ async def test_plugin_disabled_states_disabled_but_recovery_still_runs() -> None
     api = _runtime_api()
     recovery = RecordingRecovery()
     runtime = api["RouletteRuntime"](
-        config_manager=RecordingConfig(plugin_enable=False),
+        config_manager=RecordingConfig(roulette_enabled=False),
         recovery=recovery,
         admission=_admission_by_group({1}),
     )
     await runtime.start()
     state = runtime.get_state()
     assert state.status is api["RouletteRuntimeStatus"].DISABLED
-    assert state.plugin_enable is False
+    assert state.roulette_enabled is False
     # The switch pauses *business*, not the absolute deadlines: recovery ran.
     assert recovery.calls == 1
     assert state.recovery_completed is True
@@ -591,7 +591,7 @@ async def test_live_config_read_failure_never_keeps_stale_ready() -> None:
     assert runtime.get_state().status is api["RouletteRuntimeStatus"].READY
 
     # The live read now fails: the published state must not keep claiming READY
-    # while ``plugin_enable`` cannot actually be read.
+    # while ``roulette_enabled`` cannot actually be read.
     config.fails = True
     state = runtime.get_state()
     assert state.status is api["RouletteRuntimeStatus"].FAILED
@@ -655,7 +655,7 @@ async def test_dynamic_disable_flips_live_without_restart_or_tick() -> None:
     """The plugin switch is re-read per call, not frozen at ``start()``."""
 
     api = _runtime_api()
-    config = RecordingConfig(plugin_enable=True)
+    config = RecordingConfig(roulette_enabled=True)
     recovery = RecordingRecovery()
     runtime = api["RouletteRuntime"](
         config_manager=config,
@@ -668,7 +668,7 @@ async def test_dynamic_disable_flips_live_without_restart_or_tick() -> None:
 
     # Live flip down: the same runtime must reject business/send immediately,
     # without a restart and without waiting for the next 60s recovery sweep.
-    config.plugin_enable = False
+    config.roulette_enabled = False
     assert runtime.accepting is False
     denied = runtime.authorize(scope="business", group_ids=[1])
     assert denied.allowed is False
@@ -682,7 +682,7 @@ async def test_dynamic_disable_flips_live_without_restart_or_tick() -> None:
     recovery.fail = True
     with suppress(RuntimeError):
         await runtime.run_recovery_tick()
-    config.plugin_enable = True
+    config.roulette_enabled = True
     assert runtime.accepting is False
     assert runtime.authorize(scope="business", group_ids=[1]).allowed is False
 
@@ -1110,15 +1110,15 @@ async def test_real_config_manager_read_api_supports_live_flip(
     manager = ConfigManager("komari_roulette", DynamicConfigSchema)
     try:
         initial = cast("DynamicConfigSchema", await manager.initialize_async())
-        assert initial.plugin_enable is False
-        await manager.update_field_async("plugin_enable", value=True)
+        assert initial.roulette_enabled is False
+        await manager.update_field_async("roulette_enabled", value=True)
         enabled = cast("DynamicConfigSchema", await manager.get_async())
-        assert enabled.plugin_enable is True
-        assert cast("DynamicConfigSchema", manager.get()).plugin_enable is True
-        await manager.update_field_async("plugin_enable", value=False)
+        assert enabled.roulette_enabled is True
+        assert cast("DynamicConfigSchema", manager.get()).roulette_enabled is True
+        await manager.update_field_async("roulette_enabled", value=False)
         disabled = cast("DynamicConfigSchema", await manager.get_async())
-        assert disabled.plugin_enable is False
-        assert cast("DynamicConfigSchema", manager.get()).plugin_enable is False
+        assert disabled.roulette_enabled is False
+        assert cast("DynamicConfigSchema", manager.get()).roulette_enabled is False
     finally:
         await _delete_roulette_config(harness)
 
@@ -1137,7 +1137,7 @@ async def test_real_config_manager_live_flip_denies_business_and_keeps_maintenan
     manager = ConfigManager("komari_roulette", DynamicConfigSchema)
     try:
         await manager.initialize_async()
-        await manager.update_field_async("plugin_enable", value=True)
+        await manager.update_field_async("roulette_enabled", value=True)
         async with harness.scope("dyn-flip") as current:
             await seed_binding(harness.binding_manager, current, 1)
             service = service_for(harness, random_source=CountingRandom())
@@ -1173,7 +1173,7 @@ async def test_real_config_manager_live_flip_denies_business_and_keeps_maintenan
 
             # Flip the *persisted* config through the real manager: authority must
             # follow immediately, with no restart and no recovery tick needed.
-            await manager.update_field_async("plugin_enable", value=False)
+            await manager.update_field_async("roulette_enabled", value=False)
             denied = runtime.authorize(scope="business", group_ids=[1])
             assert denied.allowed is False
             assert denied.reason_code == "plugin_disabled"

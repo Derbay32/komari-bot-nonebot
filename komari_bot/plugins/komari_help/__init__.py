@@ -65,8 +65,8 @@ if driver is not None:
     @driver.on_startup
     async def on_startup() -> None:
         config = cast("DynamicConfigSchema", await config_manager.get_async())
-        if not config.plugin_enable:
-            logger.info("[Komari Help] 插件未启用，跳过初始化")
+        if not config.help_enabled:
+            logger.info("[Komari Help] 帮助检索未启用，跳过初始化")
             return
 
         if not is_orm_database_url_configured():
@@ -111,7 +111,7 @@ async def search_help(
         logger.warning("[Komari Help] 引擎未初始化")
         return []
     config = cast("DynamicConfigSchema", config_manager.get())
-    if not config.plugin_enable:
+    if not config.help_enabled:
         return []
     return await engine.search(query, limit, query_vec=query_embedding)
 
@@ -122,7 +122,7 @@ async def search_by_keyword(keyword: str) -> list[HelpSearchResult]:
         logger.warning("[Komari Help] 引擎未初始化")
         return []
     config = cast("DynamicConfigSchema", config_manager.get())
-    if not config.plugin_enable:
+    if not config.help_enabled:
         return []
     return await engine.search_by_keyword(keyword)
 

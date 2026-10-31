@@ -72,8 +72,8 @@ async def on_startup() -> None:
     """Bot 启动时初始化常识库引擎。"""
     config = cast("DynamicConfigSchema", await config_manager.get_async())
 
-    if not config.plugin_enable:
-        logger.info("[Komari Knowledge] 插件未启用，跳过初始化")
+    if not config.knowledge_enabled:
+        logger.info("[Komari Knowledge] 知识库未启用，跳过初始化")
         return
 
     if not is_orm_database_url_configured():
@@ -121,7 +121,7 @@ async def search_knowledge(
         return []
 
     config = cast("DynamicConfigSchema", config_manager.get())
-    if not config.plugin_enable:
+    if not config.knowledge_enabled:
         return []
 
     return await engine.search(
@@ -141,7 +141,7 @@ async def search_by_keyword(keyword: str) -> list[SearchResult]:
         return []
 
     config = cast("DynamicConfigSchema", config_manager.get())
-    if not config.plugin_enable:
+    if not config.knowledge_enabled:
         return []
 
     return await engine.search_by_keyword(keyword)

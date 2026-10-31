@@ -30,7 +30,7 @@ plugin_name，不 TRUNCATE 任何表）。
   ``DynamicConfigSchema`` 缺省实例（与既有 ``tests/komari_help`` 测试同一
   模式）；
 * 准入裁决：``commands.adjudicate`` 放行为 BUSINESS、``commands.config_manager``
-  返回 ``plugin_enable=True``（与既有 ``tests/komari_help/test_commands.py``
+  返回 ``help_enabled=True``（与既有 ``tests/komari_help/test_commands.py``
   同一模式）；帮助引擎实例经 ``commands.get_engine`` 注入；
 * 连接来源：真实 ``SharedEngineConnectionPool`` 实例的 ``_shared_engine``
   指向隔离库引擎，并在外层包一个 raw asyncpg 语句记录代理；
@@ -636,7 +636,7 @@ async def test_real_help_query_hits_roulette_usage_without_roulette_effects(
             monkeypatch.setattr(
                 commands_module,
                 "config_manager",
-                _StubConfigManager(SimpleNamespace(plugin_enable=True)),
+                _StubConfigManager(SimpleNamespace(help_enabled=True)),
             )
             monkeypatch.setattr(commands_module, "get_engine", lambda: help_engine)
 

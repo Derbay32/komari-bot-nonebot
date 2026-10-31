@@ -122,7 +122,6 @@ class ReservationKind(StrEnum):
     REUSED = "reused"
     DUPLICATE = "duplicate"
     QUEUE_FULL = "queue_full"
-    DISABLED = "disabled"
     UNAVAILABLE = "unavailable"
 
 
@@ -214,7 +213,6 @@ class RecentSettlementFact:
 class _LiveControl:
     """调度事务内读取的实时部署控制值。"""
 
-    plugin_enable: bool
     max_concurrent_decisions: int
     max_queued_messages_per_group: int
     generation: int
@@ -721,13 +719,12 @@ class JevDecisionRepository:
             )
 
     async def _live_control(self, session: AsyncSession) -> _LiveControl | None:
-        """读取实时部署控制（关闭状态与共享容量）。"""
+        """读取实时部署共享容量。"""
         config = await session.get(KomariDecisionConfigSchema, 1)
         scheduler = await session.get(DecisionSchedulerRow, 1)
         if config is None or scheduler is None:
             return None
         return _LiveControl(
-            plugin_enable=bool(config.plugin_enable),
             max_concurrent_decisions=int(config.max_concurrent_decisions),
             max_queued_messages_per_group=int(
                 config.max_queued_messages_per_group
@@ -1308,7 +1305,7 @@ class Ingress:
             return Reservation(
                 kind=ReservationKind.UNAVAILABLE, decision_id=plan.decision_id
             )
-        terminal = self._terminal_plan(plan, control)
+        terminal = self._terminal_plan(plan)
         if terminal is not None:
             state, reason, kind = terminal
             return await self._insert_terminal(
@@ -1356,10 +1353,8 @@ class Ingress:
         )
 
     @staticmethod
-    def _terminal_plan(
-        plan: ReservePlan, control: _LiveControl
-    ) -> tuple[str, str, ReservationKind] | None:
-        """无需执行名额的入口路径（过滤/直通/配置失败/停用）。"""
+    def _terminal_plan(plan: ReservePlan) -> tuple[str, str, ReservationKind] | None:
+        """无需执行名额的入口路径（过滤/直通/配置失败）。"""
         if plan.terminal_state == STATE_BYPASS:
             return (
                 STATE_BYPASS,
@@ -1384,8 +1379,6 @@ class Ingress:
                 plan.terminal_reason or "internal_error",
                 ReservationKind.TERMINAL,
             )
-        if not control.plugin_enable:
-            return (STATE_FAILED, "disabled", ReservationKind.DISABLED)
         return None
 
     async def _queue_is_full(

@@ -67,7 +67,10 @@ def _patch_fake_db(user_data_module: Any, monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setattr(user_data_module, "UserDataDB", _FakeUserDataDB)
 
     async def _get_config_async() -> SimpleNamespace:
-        return SimpleNamespace(plugin_enable=True)
+        return SimpleNamespace(
+            initial_favorability=0,
+            max_favorability_delta_per_reply=5,
+        )
 
     monkeypatch.setattr(
         user_data_module,
@@ -126,52 +129,6 @@ async def test_get_db_failed_initialize_does_not_cache_db(
     assert db.initialized is True
     assert len(_FakeUserDataDB.instances) == 2
     assert _FakeUserDataDB.initialize_calls == 2
-
-
-@pytest.mark.asyncio
-async def test_get_db_rejects_disabled_plugin_before_lazy_initialization(
-    user_data_module: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _patch_fake_db(user_data_module, monkeypatch)
-
-    async def _get_disabled_config() -> SimpleNamespace:
-        return SimpleNamespace(plugin_enable=False)
-
-    monkeypatch.setattr(
-        user_data_module,
-        "_get_config_async",
-        _get_disabled_config,
-    )
-
-    with pytest.raises(user_data_module.UserDataDisabledError, match="已禁用"):
-        await user_data_module.get_db()
-
-    assert _FakeUserDataDB.instances == []
-    assert user_data_module._db is None
-
-
-@pytest.mark.asyncio
-async def test_get_db_does_not_return_cached_db_after_dynamic_disable(
-    user_data_module: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _patch_fake_db(user_data_module, monkeypatch)
-    cached = await user_data_module.get_db()
-
-    async def _get_disabled_config() -> SimpleNamespace:
-        return SimpleNamespace(plugin_enable=False)
-
-    monkeypatch.setattr(
-        user_data_module,
-        "_get_config_async",
-        _get_disabled_config,
-    )
-
-    with pytest.raises(user_data_module.UserDataDisabledError, match="已禁用"):
-        await user_data_module.get_db()
-
-    assert user_data_module._db is cached
 
 
 @pytest.mark.asyncio
@@ -249,7 +206,10 @@ async def test_shutdown_during_lazy_initialize_never_publishes_new_pool(
     monkeypatch.setattr(user_data_module, "UserDataDB", _BlockingDB)
 
     async def _get_config_async() -> SimpleNamespace:
-        return SimpleNamespace(plugin_enable=True)
+        return SimpleNamespace(
+            initial_favorability=0,
+            max_favorability_delta_per_reply=5,
+        )
 
     monkeypatch.setattr(
         user_data_module,

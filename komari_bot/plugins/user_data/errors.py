@@ -1,6 +1,6 @@
 """user_data 插件异常类型单一家园。
 
-四个同族异常类型（两个服务不可用态 + 一个未就绪态 + 一个幂等冲突）统一
+三个同族异常类型（两个服务不可用态 + 一个幂等冲突）统一
 定义于此，``database`` 子模块与插件顶层入口均以 from-import 引用同一类
 对象；``error_code`` 统一为带 :class:`typing.ClassVar` 注解的类属性，
 供上游按结构化错误码分类。
@@ -9,12 +9,6 @@
 from __future__ import annotations
 
 from typing import ClassVar
-
-
-class UserDataDisabledError(RuntimeError):
-    """user_data 已被动态配置关闭。"""
-
-    error_code: ClassVar[str] = "service_unavailable"
 
 
 class UserDataStoppingError(RuntimeError):

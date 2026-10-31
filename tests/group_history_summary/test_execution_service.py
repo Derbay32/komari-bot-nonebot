@@ -125,7 +125,7 @@ def _install_fake_dsh_service(monkeypatch: pytest.MonkeyPatch) -> _FakeDshSummar
 def _build_config(**overrides: Any) -> DynamicConfigSchema:
     defaults: dict[str, Any] = {
         "version": "1.0",
-        "plugin_enable": True,
+        "summary_enabled": True,
         "min_summary_count": 10,
         "max_summary_count": 200,
         "fetch_batch_size": 50,

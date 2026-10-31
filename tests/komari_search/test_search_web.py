@@ -32,7 +32,6 @@ class _FakeConfigManager:
 
     def __init__(self, **overrides: object) -> None:
         defaults: dict[str, object] = {
-            "plugin_enable": True,
             "user_whitelist": [],
             "group_whitelist": [],
             "search_provider": "tavily",
@@ -213,7 +212,7 @@ def test_search_availability_gating_free_depends_on_switch_and_keys(
     性（策略无感，不猜群/调用方）；可用性只取决于 search_enabled 与
     search_api_key 是否就绪。
     """
-    _patch_search_dependencies(monkeypatch, plugin_enable=False)
+    _patch_search_dependencies(monkeypatch, search_enabled=False)
     assert search_module.is_search_available() is False
 
     _patch_search_dependencies(

@@ -13,7 +13,7 @@ import asyncio
 import importlib.util
 import json
 import sys
-from contextlib import asynccontextmanager, contextmanager, suppress
+from contextlib import asynccontextmanager, contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -50,8 +50,6 @@ from tests.komari_decision.jev_test_support import (
     note_scope,
     read_dispatch,
     skip_without_services,
-    update_config_row,
-    wait_until,
 )
 
 if TYPE_CHECKING:
@@ -358,7 +356,7 @@ class _World:
 
 def _install_summary(monkeypatch: pytest.MonkeyPatch, world: _World) -> None:
     summary_config = SimpleNamespace(
-        plugin_enable=True,
+        summary_enabled=True,
         min_summary_count=10,
         max_summary_count=200,
     )
@@ -447,7 +445,7 @@ async def _world(
             )
 
         memory_config = SimpleNamespace(
-            plugin_enable=True,
+            chat_enabled=True,
             face_reaction_enabled=False,
             face_reaction_id=None,
             error_notify_enabled=notify,
@@ -466,7 +464,7 @@ async def _world(
             "get_driver",
             lambda: SimpleNamespace(config=SimpleNamespace(superusers=recipients)),
         )
-        memory_config.plugin_enable = True
+        memory_config.chat_enabled = True
         memory_config.proactive_enabled = True
         chat_config = memory_config
 
@@ -976,17 +974,11 @@ async def test_noul_failure_stops_both_generation_paths(
         assert world.redis.pushed == []
 
 
-async def test_group_revocation_and_inflight_disable_cancellation_prevent_late_effects(
+async def test_group_revocation_prevents_late_handoff(
     decision_database: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """在途取消与撤权：与「已完成结果的持久停用栅栏」是两条不同事实。
-
-    这里使用本地冻结配置加 ``refresh``，证明停用会取消**尚在评估**的分发；
-    已完成结果在持久停用后拒绝交接、且重启启用后仍拒绝，由
-    ``test_completed_result_is_fenced_by_persistent_disable_and_stays_fenced``
-    用真实 ``komari_decision_config`` 提交覆盖。
-    """
+    """群撤权发生在交接之前：持久裁决阻止迟到效果。"""
     admitted = {"value": True}
     gate = asyncio.Event()
     gate.set()
@@ -1017,26 +1009,6 @@ async def test_group_revocation_and_inflight_disable_cancellation_prevent_late_e
         admitted["value"] = False
         assert await first.claim_handoff("chat") is False
 
-        # 判定停用在在途评估期间取消该分发：不产生可交接结果。
-        admitted["value"] = True
-        baseline = len(harness.transport.requests)
-        gate.clear()
-        blocked = await _carrier(world, world.event(text=_NORMAL_TEXT))
-        evaluation = asyncio.create_task(
-            blocked.evaluate(harness.decision, summary_candidate=False)
-        )
-        await wait_until(
-            lambda: len(harness.transport.requests) == baseline + 1,
-            within_seconds=5.0,
-        )
-        harness.set_config({"plugin_enable": False})
-        with suppress(Exception):
-            await harness.decision.refresh()
-        with pytest.raises(asyncio.CancelledError):
-            await evaluation
-        assert await blocked.claim_handoff("chat") is False
-        assert world.fulfillment.pending == []
-        gate.set()
 
 
 async def test_dispatch_carrier_is_unavailable_without_framework_state(
@@ -1203,68 +1175,6 @@ async def test_refused_handoff_never_makes_generation_context_get_msg_calls(
         assert row["handed_off_at"] is None
         assert refused_message_id > warmup.message_id
     note_scope("onebot_v11", str(_BOT_SELF_ID), str(group_id))
-
-
-@pytest.mark.parametrize("route", ["chat", "summary"])
-async def test_completed_result_is_fenced_by_persistent_disable_and_stays_fenced(
-    decision_database: str,
-    monkeypatch: pytest.MonkeyPatch,
-    route: str,
-) -> None:
-    """持久停用栅栏：已完成结果在停用后拒绝交接，持久重启启用后仍然拒绝。
-
-    使用真实迁移定义 ``komari_decision_disable_fence``：提交
-    ``komari_decision_config.plugin_enable = false`` 后，未交接的成功行被改为
-    ``cancelled/disabled`` 并推进调度代次；恢复 ``plugin_enable = true`` 不会
-    还原行状态或代次。对照组证明同一路径在未停用时可以正常领取。
-    """
-    options = _summary_options() if route == "summary" else HarnessOptions()
-    async with _world(monkeypatch, decision_database, options=options) as (
-        world,
-        harness,
-    ):
-        assert harness.decision is not None
-        assert harness.engine is not None
-
-        # 对照组：未停用时同一路由可以成功领取一次。
-        control_event = world.event(
-            text=_SUMMARY_TEXT if route == "summary" else _NORMAL_TEXT,
-            to_me=route == "summary",
-        )
-        control = await _carrier(world, control_event)
-        control_result = await control.evaluate(
-            harness.decision, summary_candidate=route == "summary"
-        )
-        assert control_result.route == route
-        assert await control.claim_handoff(cast("Any", route)) is True
-
-        # 被测分发：判定成功完成，但尚未交接。
-        event = world.event(
-            text=_SUMMARY_TEXT if route == "summary" else _NORMAL_TEXT,
-            to_me=route == "summary",
-        )
-        dispatch = await _carrier(world, event)
-        result = await dispatch.evaluate(
-            harness.decision, summary_candidate=route == "summary"
-        )
-        assert result.route == route
-        assert result.status == "success"
-
-        # 持久停用（真实 PG 提交，触发迁移 0023 的停用栅栏）。
-        await update_config_row(harness.engine, {"plugin_enable": False})
-        row = await _dispatch_row(harness, world, event)
-        assert row is not None
-        assert row["state"] == "cancelled"
-        assert row["reason_code"] == "disabled"
-        assert row["business_route"] == "none"
-        assert await dispatch.claim_handoff(cast("Any", route)) is False
-
-        # 持久重新启用：已撤销的未交接结果不会复活。
-        await update_config_row(harness.engine, {"plugin_enable": True})
-        assert await dispatch.claim_handoff(cast("Any", route)) is False
-        row_after = await _dispatch_row(harness, world, event)
-        assert row_after is not None
-        assert row_after["handed_off_at"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -1597,40 +1507,6 @@ async def test_platform_redelivery_does_not_resubmit_failure_notifications(
         assert row is not None
         assert row["notified_at"] is not None
         assert row["handed_off_at"] is None
-
-
-async def test_failure_notification_is_not_revived_by_persistent_disable_reenable(
-    decision_database: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """持久停用会撤销未提交的失败通知资格；重新启用不会复活。"""
-    options = _exception_options(httpx2.ConnectError(_TRANSPORT_DOWN))
-    async with _world(monkeypatch, decision_database, options=options) as (
-        world,
-        harness,
-    ):
-        assert harness.decision is not None and harness.engine is not None
-        event = world.event(text=_NORMAL_TEXT)
-        dispatch = await _carrier(world, event)
-        result = await dispatch.evaluate(harness.decision, summary_candidate=False)
-        assert result.status == "failed"
-        assert result.reason_code == "network_error"
-        row = await _dispatch_row(harness, world, event)
-        assert row is not None
-        assert row["notification_eligible"] is True
-        assert row["notified_at"] is None
-
-        await update_config_row(harness.engine, {"plugin_enable": False})
-        fenced = await _dispatch_row(harness, world, event)
-        assert fenced is not None
-        assert fenced["state"] == "cancelled"
-        assert fenced["reason_code"] == "disabled"
-        assert fenced["notification_eligible"] is False
-        assert await dispatch.claim_handoff("failure_notification") is False
-
-        await update_config_row(harness.engine, {"plugin_enable": True})
-        assert await dispatch.claim_handoff("failure_notification") is False
-        assert world.bot.calls == []
 
 
 async def test_failure_notification_is_not_revived_by_admission_restore(

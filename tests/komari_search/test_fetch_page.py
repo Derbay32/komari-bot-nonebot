@@ -66,14 +66,6 @@ def test_fetch_availability_disabled_when_fetch_enabled_false(
     assert search_module.is_fetch_available() is False
 
 
-def test_fetch_availability_disabled_when_plugin_enable_false(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """plugin_enable=False 时 is_fetch_available 返回 False。"""
-    _patch_fetch_dependencies(monkeypatch, plugin_enable=False)
-    assert search_module.is_fetch_available() is False
-
-
 def test_fetch_availability_missing_api_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -33,7 +33,7 @@ config_manager_plugin = require("config_manager")
 
 class MyConfig(BaseModel):
     version: str = Field(default="1.0")
-    plugin_enable: bool = Field(default=True)
+    feature_enabled: bool = Field(default=True)
     timeout: int = Field(default=30)
 
 config_manager = config_manager_plugin.get_config_manager("my_plugin", MyConfig)

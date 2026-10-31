@@ -195,7 +195,7 @@ class _Event:
 
 def _chat_config(**overrides: Any) -> SimpleNamespace:
     values: dict[str, Any] = {
-        "plugin_enable": True,
+        "chat_enabled": True,
         "proactive_enabled": False,
         "context_messages_limit": 10,
         "context_max_utf8_bytes": 24_000,
@@ -1316,7 +1316,7 @@ class _FakeHindsightClient:
 
 def _service_config(**overrides: Any) -> SimpleNamespace:
     values: dict[str, Any] = {
-        "plugin_enable": True,
+        "chat_enabled": True,
         "hindsight_base_url": "https://hindsight.example.invalid",
         "hindsight_api_key": "secret-value",
         "hindsight_bank_id": BANK_ID,

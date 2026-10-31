@@ -143,7 +143,7 @@ def test_management_config_schema_defaults_are_safe() -> None:
         announce_status_page_url="https://status.example.com/komari"
     )
 
-    assert config.komari_management_plugin_enable is False
+    assert config.komari_management_api_enabled is False
     assert config.komari_management_api_credentials == []
     assert config.komari_management_api_allowed_origins == []
     assert isinstance(config.komari_management_announce_status_page_url, str)

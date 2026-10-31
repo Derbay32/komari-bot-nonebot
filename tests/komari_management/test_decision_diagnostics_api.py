@@ -348,8 +348,8 @@ async def test_unauthorized_requests_never_touch_repository(app: App) -> None:
 
 
 async def test_health_serializes_passive_snapshot_for_every_status(app: App) -> None:
-    """AC：ready/disabled/failed 都是 200；无观测证据的字段为 null。"""
-    for runtime_status in ("ready", "disabled", "failed"):
+    """AC：ready/failed 都是 200；无观测证据的字段为 null。"""
+    for runtime_status in ("ready", "failed"):
         provider = _HealthProvider(_health_snapshot(runtime_status))
         repository = _RepositorySpy()
         async with _serve(

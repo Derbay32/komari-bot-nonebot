@@ -442,7 +442,7 @@ async def management_env(
     assert admission_package.adjudicate is _REAL_ADJUDICATE
     admission_runtime = await _start_admission(monkeypatch)
     await reset_decision_storage(engine)
-    await write_config_row(engine, overrides={"plugin_enable": True})
+    await write_config_row(engine)
     await write_prompt()
 
     probe = _IoProbe()
@@ -486,7 +486,7 @@ async def management_env(
             driver=SimpleNamespace(type="fastapi", server_app=app),
             config=ManagementConfig.model_validate(
                 {
-                    "komari_management_plugin_enable": True,
+                    "komari_management_api_enabled": True,
                     "komari_management_api_credentials": credentials(),
                     "komari_management_api_allowed_origins": [ORIGIN],
                 }
@@ -660,22 +660,18 @@ async def test_health_stays_passive_and_truthful_across_runtime_states(
     assert env.probe.request_statements() == []
     assert env.probe.request_redis_calls() == []
 
-    # 显式关闭态：路由仍在，健康如实报告 disabled。
+    # 恢复有效配置后回到 ready；健康查询本身仍不产生请求期 I/O。
     await env.manager.update_field_async(
         "jev_api_key",
         CONFIGURED_API_KEY,
     )
-    await env.manager.update_field_async(
-        "plugin_enable",
-        False,  # noqa: FBT003 - 字段值本身是布尔
-    )
     await env.runtime.refresh()
     env.probe.reset()
-    disabled = await env.client.get(f"{API_PREFIX}/health", headers=READ_HEADERS)
-    assert disabled.status_code == 200
-    assert disabled.json()["runtime_status"] == "disabled"
-    assert disabled.json()["reason_code"] == "disabled"
+    recovered = await env.client.get(f"{API_PREFIX}/health", headers=READ_HEADERS)
+    assert recovered.status_code == 200
+    assert recovered.json()["runtime_status"] == "ready"
     assert env.probe.request_statements() == []
+    assert env.probe.request_redis_calls() == []
     # 正控制：同一归属标记下，真实查询请求确实会产生请求期会话与 SQL。
     env.probe.reset()
     still_there = await env.client.get(f"{API_PREFIX}/decisions", headers=READ_HEADERS)
@@ -833,7 +829,7 @@ async def test_credentials_rotate_and_revoke_after_restart(
             driver=SimpleNamespace(type="fastapi", server_app=restarted),
             config=ManagementConfig.model_validate(
                 {
-                    "komari_management_plugin_enable": True,
+                    "komari_management_api_enabled": True,
                     "komari_management_api_credentials": env.credentials(),
                     "komari_management_api_allowed_origins": [ORIGIN],
                 }
@@ -1072,14 +1068,12 @@ async def test_real_scheduler_prune_removes_expired_diagnostics_while_disabled(
         created_at=datetime.now(UTC) - timedelta(days=10)
     )
 
-    await env.manager.update_field_async(
-        "plugin_enable",
-        False,  # noqa: FBT003 - 字段值本身是布尔
-    )
+    # ADR-0018：判定不再有停用开关；用无效请求配置造出「判定不可用但管理面
+    # 仍可查询」的同一场景。
+    await env.manager.update_field_async("jev_api_key", "")
     await env.runtime.refresh()
-    assert env.runtime.get_health().runtime_status == "disabled"
+    assert env.runtime.get_health().runtime_status == "failed"
 
-    # 关闭本身会定案在途分发；清理前后的基线取在关闭结算之后。
     durable_before = await read_dispatch(env.engine, identity)
     assert durable_before is not None
     counts_before = await _table_counts(env.engine)
@@ -1115,10 +1109,11 @@ async def test_real_scheduler_prune_removes_expired_diagnostics_while_disabled(
         assert durable_after == durable_before
         assert await _table_counts(env.engine) == counts_before
 
-        # 判定关闭期间管理面仍可查询（路由未被关闭/失败移除）。
+        # 判定不可用期间管理面仍可查询（路由未被失败移除）。
         health = await env.client.get(f"{API_PREFIX}/health", headers=READ_HEADERS)
         assert health.status_code == 200
-        assert health.json()["runtime_status"] == "disabled"
+        assert health.json()["runtime_status"] == "failed"
+        assert health.json()["reason_code"] == "configuration_invalid"
         pruned = await env.client.get(
             f"{API_PREFIX}/decisions/{expired_row}", headers=READ_HEADERS
         )

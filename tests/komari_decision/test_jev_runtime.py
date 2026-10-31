@@ -236,7 +236,7 @@ async def runtime_env(
     monkeypatch.setattr(nonebot_plugin_orm, "get_session", _shared_get_session)
     admission_runtime = await _start_admission(monkeypatch)
     await reset_decision_storage(engine)
-    await write_config_row(engine, overrides={"plugin_enable": True})
+    await write_config_row(engine)
     await write_prompt()
 
     manager = _CountingConfigManager("komari_decision", KomariDecisionConfigSchema)
@@ -438,33 +438,6 @@ async def test_invalid_credentials_then_corrected_recovers(
     assert runtime_env.transport.requests == []
 
 
-# ------------------------------ 6. 显式关闭保持关闭 ------------------------------
-
-
-async def test_explicit_disable_stays_disabled_across_edits_and_retries(
-    runtime_env: _RuntimeEnv,
-) -> None:
-    runtime = runtime_env.runtime
-    await runtime.startup()
-    await runtime_env.manager.update_field_async(
-        "plugin_enable",
-        False,  # noqa: FBT003 - 字段值本身是布尔
-    )
-    await runtime.refresh()
-    health = runtime.get_health()
-    assert health.runtime_status == "disabled"
-    assert health.reason_code == "disabled"
-
-    # 普通配置编辑 + 重复刷新/启动都不得把显式关闭变成 ready。
-    await runtime_env.manager.update_field_async("bot_aliases", ["小鞠"])
-    await runtime.refresh()
-    await runtime.startup()
-    health = runtime.get_health()
-    assert health.runtime_status == "disabled"
-    assert health.reason_code == "disabled"
-    assert runtime_env.transport.requests == []
-
-
 # ------------------------------ 7. 普通编辑不替换引擎/不取消在途任务 ------------------------------
 
 
@@ -570,7 +543,7 @@ async def _log_ids(engine: AsyncEngine) -> set[str]:
     return {str(row[0]) for row in rows}
 
 
-async def test_prune_while_disabled_removes_only_expired_logs(
+async def test_prune_removes_only_expired_logs(
     runtime_env: _RuntimeEnv,
 ) -> None:
     runtime = runtime_env.runtime
@@ -607,13 +580,6 @@ async def test_prune_while_disabled_removes_only_expired_logs(
         )
     }
 
-    # 判定显式关闭时清理照常运行。
-    await runtime_env.manager.update_field_async(
-        "plugin_enable",
-        False,  # noqa: FBT003 - 字段值本身是布尔
-    )
-    await runtime.refresh()
-    assert runtime.get_health().runtime_status == "disabled"
     removed = await runtime.prune()
     assert removed >= 1
 

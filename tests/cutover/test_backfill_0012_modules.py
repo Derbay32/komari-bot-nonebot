@@ -495,7 +495,7 @@ def test_full_head_upgrade_on_empty_database_succeeds() -> None:
         params,
         _database_url,
     ):
-        assert asyncio.run(_fetch_version(params)) == "0034"
+        assert asyncio.run(_fetch_version(params)) == "0035"
 
 
 def test_policy_missing_failure_keeps_0011_then_repairs() -> None:

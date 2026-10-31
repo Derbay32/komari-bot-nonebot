@@ -362,7 +362,9 @@ async def test_0030_drops_retired_surface_and_preserves_sources_and_admin_values
             )
 
             memory_columns = await _column_names(connection, MEMORY_TABLE)
-            expected_memory = set(KomariMemoryConfigSchema.model_fields)
+            # 0030 边界的历史形状：0035 才退役 plugin_enable，本用例显式固定
+            # 当时的存活列集合，不用当前模型反推历史结构。
+            expected_memory = INTERNAL_FIELDS | set(MEMORY_SURVIVING_VALUES)
             assert memory_columns == expected_memory
             assert not RETIRED_MEMORY_FIELDS & memory_columns
             memory_row = dict(
@@ -557,7 +559,8 @@ async def test_0030_fresh_database_and_legacy_upgrade_keep_hindsight_configurati
             row = dict(
                 await connection.fetchrow(f"SELECT * FROM {MEMORY_TABLE} WHERE id = 1")
             )
-            assert row["plugin_enable"] is True
+            # 0035 已删除停用开关；其余历史值与修订元数据必须原样保留。
+            assert "plugin_enable" not in row
             assert row["hindsight_base_url"] == ""
             assert row["hindsight_request_timeout_seconds"] == 10.0
             assert row["revision"] == 55

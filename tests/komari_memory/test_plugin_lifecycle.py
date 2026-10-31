@@ -112,13 +112,14 @@ async def test_startup_keeps_stable_service_when_config_read_fails(
 
 
 @pytest.mark.asyncio
-async def test_startup_keeps_stable_service_when_memory_is_disabled(
+async def test_startup_keeps_stable_service_when_memory_config_is_incomplete(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """ADR-0018：没有停用开关后，缺失的连接配置同样只让记忆不可用。"""
     async with _loaded_memory_plugin() as module:
 
         async def _config() -> KomariMemoryConfigSchema:
-            return KomariMemoryConfigSchema(plugin_enable=False)
+            return KomariMemoryConfigSchema()
 
         monkeypatch.setattr(module, "get_config_async", _config)
 
@@ -129,7 +130,7 @@ async def test_startup_keeps_stable_service_when_memory_is_disabled(
         with pytest.raises(module.HindsightUnavailableError) as captured:
             async with service.open_session():
                 pass
-        assert captured.value.reason_code == "configuration_disabled"
+        assert captured.value.reason_code == "configuration_incomplete"
         await module.shutdown()
 
 

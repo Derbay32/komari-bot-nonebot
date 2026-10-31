@@ -84,7 +84,7 @@ def _create_bot(ctx: Any, *, self_id: str = "669293859") -> Bot:
 
 
 async def _sr_config() -> SimpleNamespace:
-    return SimpleNamespace(plugin_enable=True, sr_list=["甲"])
+    return SimpleNamespace(sr_enabled=True, sr_list=["甲"])
 
 
 @pytest.mark.asyncio

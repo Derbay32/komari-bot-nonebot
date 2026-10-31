@@ -28,12 +28,11 @@ _PROVIDER_PREFIXES = {
     "exa": "exa_",
 }
 _STORAGE_ONLY_FIELDS = {
-    # 强类型表存储专用字段（单行主键 / CAS 修订号 / 写入时间）与插件开关
-    # 不进入搜索字段描述面。
+    # 强类型表存储专用字段（单行主键 / CAS 修订号 / 写入时间）不进入
+    # 搜索字段描述面。
     "id",
     "revision",
     "updated_at",
-    "plugin_enable",
 }
 
 

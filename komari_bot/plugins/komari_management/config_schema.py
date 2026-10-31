@@ -102,8 +102,8 @@ class ManagementConfig(BaseModel):
         hide_input_in_errors=True,
     )
 
-    komari_management_plugin_enable: bool = Field(
-        default=False, description="是否启用统一管理 API 插件"
+    komari_management_api_enabled: bool = Field(
+        default=False, description="是否启用统一管理 API"
     )
     komari_management_api_credentials: list[ManagementCredentialSchema] = Field(
         default_factory=list,

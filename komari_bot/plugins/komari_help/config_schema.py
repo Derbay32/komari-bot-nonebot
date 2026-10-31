@@ -20,9 +20,9 @@ class DynamicConfigSchema(TypedConfigModel, table=True):
         json_schema_extra={"default_apply_mode": "immediate"},
     )
 
-    plugin_enable: bool = Field(
+    help_enabled: bool = Field(
         default=False,
-        description="插件启用状态",
+        description="是否启用帮助检索",
         json_schema_extra={"apply_mode": "restart"},
     )
 

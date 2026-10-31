@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 
 def _config(*, send_default_pii: bool = False) -> SimpleNamespace:
     return SimpleNamespace(
-        plugin_enable=True,
+        sentry_enabled=True,
         dsn="https://public@example.invalid/1",
         environment="test",
         release="",

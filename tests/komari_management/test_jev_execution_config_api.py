@@ -8,8 +8,8 @@ Schema + 配置管理器测试替身）验证新增 ``jev_execution`` 分区：
   ``optional_reply_probability`` / ``decision_log_retention_days``）以契约默认值
   出现在读取响应中，并归属新的 ``jev_execution`` 分区（位于 ``jev_request``
   之后）；
-- 保留字段（``plugin_enable=True``、``bot_aliases``、五个 Jev 请求字段）取值
-  不变；TSK-190 退庭的 38 个场景/总结字段不再出现在读取投影中；
+- 保留字段（``bot_aliases``、五个 Jev 请求字段）取值不变；TSK-190 退役的
+  38 个场景/总结字段与 ADR-0018 删除的停用开关不再出现在读取投影中；
 - 非法容量、非法截止（零/负/非有限）、越界概率与越界保留天数在写入边界被
   拒绝（422），配置保持原样。
 """
@@ -152,8 +152,7 @@ async def test_jev_execution_defaults_keep_surviving_decision_fields(
 
     assert detail.status_code == 200
     values = detail.json()["values"]
-    # TSK-190：新初始化配置默认启用（运行时仍需 Jev 请求配置才能就绪）
-    assert values["plugin_enable"] is True
+    assert "plugin_enable" not in values
     assert values["bot_aliases"] == ["小鞠", "小鞠知花", "komari"]
     assert values["jev_model"] == "jev-1.14.0"
     assert values["jev_http_timeout_seconds"] == 3.0
@@ -196,7 +195,7 @@ async def test_jev_execution_field_writes_persist_through_management_patch(
     for field_name, value in written_values.items():
         assert detail.json()["values"][field_name] == value, field_name
     # 写入只影响被改字段，其他保留字段默认值原样保留
-    assert detail.json()["values"]["plugin_enable"] is True
+    assert "plugin_enable" not in detail.json()["values"]
     assert detail.json()["values"]["jev_request_timeout_seconds"] == 3.0
 
 

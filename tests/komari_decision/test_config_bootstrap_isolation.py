@@ -207,27 +207,10 @@ async def test_invalid_persisted_config_fails_health_without_default_fallback(
         await runtime.close()
 
 
-async def test_disabled_path_is_unchanged(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """显式关闭仍投影 disabled；不因读取失败或默认值被重新启用。"""
-    storage = _FaultStorage(_stored(_valid_data(plugin_enable=False), 2))
-    runtime = _runtime(monkeypatch, storage)
-
-    try:
-        await runtime.startup()
-
-        state = runtime.get_health()
-        assert state.runtime_status == "disabled"
-        assert state.reason_code == "disabled"
-    finally:
-        await runtime.close()
-
-
 async def test_repaired_source_reaches_normal_path_on_later_refresh(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """修复外部数据源后，后续刷新重新走正常判定路径，无需重建运行时。"""
+    """修复外部数据源后，后续刷新不再报告配置非法，无需重建运行时。"""
     storage = _FaultStorage(_stored({"jev_request_timeout_seconds": 0}, 4))
     runtime = _runtime(monkeypatch, storage)
 
@@ -235,13 +218,14 @@ async def test_repaired_source_reaches_normal_path_on_later_refresh(
         await runtime.startup()
         assert runtime.get_health().runtime_status == "failed"
 
-        storage.entry = _stored(_valid_data(plugin_enable=False), 5)
+        storage.entry = _stored(_valid_data(), 5)
         reads_before_retry = storage.fetch_calls
         await runtime.refresh()
 
         state = runtime.get_health()
-        assert state.runtime_status == "disabled"
-        assert state.reason_code == "disabled"
+        assert state.runtime_status == "failed"
+        # 修复后只剩共享存储/所有权前置条件失败，不再报告配置非法。
+        assert state.reason_code != _EXPECTED_FAILED_REASON
         assert storage.fetch_calls == reads_before_retry + 1
     finally:
         await runtime.close()

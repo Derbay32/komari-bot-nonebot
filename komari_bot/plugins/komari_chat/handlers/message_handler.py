@@ -561,7 +561,7 @@ class MessageHandler:
             chat_enabled = False
             try:
                 notify_superusers = bool(get_context_config().error_notify_enabled)
-                chat_enabled = bool(get_config().plugin_enable)
+                chat_enabled = bool(get_config().chat_enabled)
             except Exception:
                 # 读取失败只静默私聊诊断（不打印原始异常，避免泄漏运行环境细节）。
                 logger.debug("[KomariChat] 失败通知配置读取失败，静默 SUPERUSER 私聊")

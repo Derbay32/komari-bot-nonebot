@@ -1,4 +1,4 @@
-"""TSK-197: KomariMemory keeps exactly the six live Hindsight fields."""
+"""TSK-197/TSK-210: KomariMemory keeps exactly the five live Hindsight fields."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import pytest
 from komari_bot.plugins.komari_memory.config_schema import KomariMemoryConfigSchema
 
 LIVE_FIELDS = {
-    "plugin_enable",
     "hindsight_base_url",
     "hindsight_api_key",
     "hindsight_bank_id",
@@ -68,17 +67,6 @@ def test_memory_config_resource_is_optional_at_startup() -> None:
     assert KomariMemoryConfigSchema.startup_required is False
     assert "startup_required" not in KomariMemoryConfigSchema.model_fields
     assert "startup_required" not in KomariMemoryConfigSchema().model_dump()
-
-
-def test_plugin_enable_defaults_false_and_applies_immediately() -> None:
-    config = KomariMemoryConfigSchema()
-
-    assert config.plugin_enable is False
-    field_extra = KomariMemoryConfigSchema.model_fields[
-        "plugin_enable"
-    ].json_schema_extra
-    assert isinstance(field_extra, dict)
-    assert field_extra["apply_mode"] == "immediate"
 
 
 def test_hindsight_config_defaults_and_secret_metadata() -> None:

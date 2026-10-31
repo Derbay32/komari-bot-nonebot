@@ -22,8 +22,12 @@ class DynamicConfigSchema(TypedConfigModel, table=True):
         json_schema_extra={"default_apply_mode": "immediate"},
     )
 
-    # 插件控制
-    plugin_enable: bool = Field(default=False, description="插件启用状态")
+    # 业务控制：知识库引擎在启动时读取一次，修改需重启后完整生效。
+    knowledge_enabled: bool = Field(
+        default=False,
+        description="是否启用知识库检索",
+        json_schema_extra={"apply_mode": "restart"},
+    )
 
     # 白名单配置
     similarity_threshold: float = Field(

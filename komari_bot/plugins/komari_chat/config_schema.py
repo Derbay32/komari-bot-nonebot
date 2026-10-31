@@ -53,11 +53,14 @@ class KomariChatConfigSchema(TypedConfigModel, table=True):
         ),
     )
 
-    # 插件控制（TSK-192 phase B：chat 自己的业务开关）
-    plugin_enable: bool = Field(
+    # 业务控制（TSK-192 phase B / ADR-0018：chat 自己的群聊消息处理开关）
+    chat_enabled: bool = Field(
         default=False,
-        description="插件启用状态",
-        json_schema_extra={"apply_mode": "restart"},
+        description=(
+            "是否处理新的群聊消息；关闭只阻止新的消息入口，不取消已经受理的"
+            "回复履约与后台任务"
+        ),
+        json_schema_extra={"apply_mode": "immediate"},
     )
 
     # 常识库与聊天检索配置

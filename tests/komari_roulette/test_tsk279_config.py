@@ -142,11 +142,11 @@ def test_config_schema_module_declares_single_row_resource() -> None:
     assert cls.__tablename__ == "komari_roulette_config"
 
 
-def test_config_schema_plugin_enable_defaults_false_and_dynamic() -> None:
+def test_config_schema_roulette_enabled_defaults_false_and_dynamic() -> None:
     cls = _config_schema()
     schema = cls()
-    assert schema.plugin_enable is False
-    field = cls.model_fields["plugin_enable"]
+    assert schema.roulette_enabled is False
+    field = cls.model_fields["roulette_enabled"]
     extra = field.json_schema_extra or {}
     assert extra.get("apply_mode") == "immediate"
 

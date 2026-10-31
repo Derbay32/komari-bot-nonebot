@@ -138,7 +138,7 @@ def _install_config(
     **values: Any,
 ) -> Any:
     config_values = {
-        "plugin_enable": True,
+        "summary_enabled": True,
         "min_summary_count": 10,
         "max_summary_count": 200,
     }
@@ -309,7 +309,7 @@ async def test_disabled_entry_returns_before_permission_and_remote_checks(
     import komari_bot.plugins.group_history_summary as summary_module
 
     calls: list[str] = []
-    _install_config(summary_module, monkeypatch, plugin_enable=False)
+    _install_config(summary_module, monkeypatch, summary_enabled=False)
     _install_permission(summary_module, monkeypatch, allowed=True, calls=calls)
     monkeypatch.setattr(
         summary_module,
@@ -702,7 +702,7 @@ async def test_failure_notification_rechecks_summary_switch_before_notify(
         monkeypatch,
         calls,
         result=_summary_result(status="failed", route="none"),
-        on_evaluate=lambda: setattr(config, "plugin_enable", False),
+        on_evaluate=lambda: setattr(config, "summary_enabled", False),
     )
     matcher = _Matcher()
     notifier = _install_failure_notifier(summary_module, monkeypatch, matcher=matcher)

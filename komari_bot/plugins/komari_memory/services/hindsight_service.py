@@ -48,7 +48,6 @@ _RETAIN_FAILURES_WITHOUT_COOLDOWN: frozenset[str] = frozenset(
 
 HindsightFailureCode = Literal[
     "configuration_unavailable",
-    "configuration_disabled",
     "configuration_incomplete",
     "configuration_invalid",
     "client_unavailable",
@@ -71,7 +70,6 @@ HindsightFailureCode = Literal[
 HINDSIGHT_FAILURE_CODES: frozenset[str] = frozenset(
     {
         "configuration_unavailable",
-        "configuration_disabled",
         "configuration_incomplete",
         "configuration_invalid",
         "client_unavailable",
@@ -127,13 +125,11 @@ class HindsightSettings:
     def from_config(cls, config: object) -> "HindsightSettings":
         """Validate and freeze the configured connection settings.
 
-        Missing, disabled or invalid configuration raises a fixed safe code
-        before any client is built.
+        Missing or invalid configuration raises a fixed safe code before any
+        client is built.
         """
         if config is None:
             raise HindsightUnavailableError("configuration_unavailable")
-        if not bool(getattr(config, "plugin_enable", False)):
-            raise HindsightUnavailableError("configuration_disabled")
 
         base_url = getattr(config, "hindsight_base_url", None)
         api_key = getattr(config, "hindsight_api_key", None)

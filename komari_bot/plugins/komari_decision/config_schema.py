@@ -111,14 +111,6 @@ class KomariDecisionConfigSchema(TypedConfigModel, table=True):
         },
     )
 
-    plugin_enable: bool = Field(
-        default=True,
-        description=(
-            "是否启用 Jev 主动回复判定；关闭时普通正文不再判定，只有平台召唤"
-            "（@ 或回复机器人）进入业务路由。启用但 Jev 请求未配置时显式失败，"
-            "不隐式降级为固定规则"
-        ),
-    )
     bot_aliases: list[str] = Field(
         default_factory=lambda: ["小鞠", "小鞠知花", "komari"],
         sa_type=JSONB,

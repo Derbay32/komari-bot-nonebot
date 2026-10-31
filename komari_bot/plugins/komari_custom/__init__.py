@@ -125,8 +125,8 @@ async def on_startup() -> None:
         coalesce=True,
     )
     config = cast("DynamicConfigSchema", await config_manager.get_async())
-    if not config.plugin_enable:
-        logger.info("[KomariCustom] 插件未启用，跳过初始化")
+    if not config.knowledge_proposals_enabled:
+        logger.info("[KomariCustom] 知识库提案未启用，跳过初始化")
         return
     if not is_orm_database_url_configured():
         logger.warning(
@@ -157,8 +157,9 @@ async def _admission_gate(event: GroupMessageEvent) -> bool:
     """统一准入复查与本插件自有开关的前置门。
 
     先由 ``group_admission`` 裁决关联群（命令只在群内触发）：获准后读取本
-    插件自身 ``plugin_enable`` 进一步收窄；任一环节不满足都静默跳过。
-    ``plugin_enable`` 只收窄不扩张：准入资格始终由裁决决定。
+    插件自身 ``knowledge_proposals_enabled`` 进一步收窄；任一环节不满足都
+    静默跳过。``knowledge_proposals_enabled`` 只收窄不扩张：准入资格始终由
+    裁决决定。
     """
     group_id = getattr(event, "group_id", None)
     if not isinstance(group_id, int) or group_id <= 0:
@@ -166,7 +167,7 @@ async def _admission_gate(event: GroupMessageEvent) -> bool:
     if adjudicate([group_id]).qualification is not AdmissionQualification.BUSINESS:
         return False
     config = cast("DynamicConfigSchema", config_manager.get())
-    return bool(getattr(config, "plugin_enable", True))
+    return bool(getattr(config, "knowledge_proposals_enabled", True))
 
 
 @custom.handle()

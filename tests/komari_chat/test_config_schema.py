@@ -76,9 +76,7 @@ def test_config_schema_declares_immediate_default_apply_mode() -> None:
     assert KomariChatConfigSchema.model_config.get("json_schema_extra") == {
         "default_apply_mode": "immediate"
     }
-    for field_name, field in KomariChatConfigSchema.model_fields.items():
-        if field_name == "plugin_enable":
-            continue
+    for field in KomariChatConfigSchema.model_fields.values():
         extra = field.json_schema_extra
         if isinstance(extra, dict) and "apply_mode" in extra:
             assert extra["apply_mode"] == "immediate"
@@ -375,7 +373,7 @@ TSK192_CHAT_OWNED_FIELDS = {
 def test_phase_b_fields_have_one_chat_owner_with_original_defaults() -> None:
     config = KomariChatConfigSchema()
 
-    assert config.plugin_enable is False
+    assert config.chat_enabled is False
     for field_name, expected in TSK192_CHAT_OWNED_FIELDS.items():
         assert field_name in KomariChatConfigSchema.model_fields, field_name
         assert getattr(config, field_name) == expected, field_name
@@ -391,8 +389,9 @@ def test_retired_memory_search_limit_is_absent_from_live_chat_schema() -> None:
 
 
 def test_phase_b_fields_preserve_validation_and_apply_metadata() -> None:
-    plugin_field = KomariChatConfigSchema.model_fields["plugin_enable"]
-    assert plugin_field.json_schema_extra == {"apply_mode": "restart"}
+    # ADR-0018：群聊消息处理开关改为业务命名并即时生效。
+    chat_field = KomariChatConfigSchema.model_fields["chat_enabled"]
+    assert chat_field.json_schema_extra == {"apply_mode": "immediate"}
 
     bounds = {
         "knowledge_limit": (0, 11),

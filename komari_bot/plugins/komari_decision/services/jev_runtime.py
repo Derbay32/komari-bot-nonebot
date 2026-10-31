@@ -148,7 +148,6 @@ class DecisionRuntime:
         self._failure_reason: DecisionReason | None = None
         self._lifecycle_failure: DecisionReason | None = None
         self._final_snapshot: DecisionHealthSnapshot | None = None
-        self._explicit_disabled_known = False
         self._observed_at = datetime.now(UTC)
 
     # ------------------------------ 对外读取面 ------------------------------
@@ -179,8 +178,8 @@ class DecisionRuntime:
             )
         snapshot = engine.get_health()
         failure = self._lifecycle_failure or self._failure_reason
-        if failure is None or snapshot.runtime_status == "disabled":
-            # 显式关闭永远保持 disabled；引擎自己的请求计数/时间戳原样保留。
+        if failure is None:
+            # 引擎自己的请求计数/时间戳原样保留。
             return snapshot
         return replace(snapshot, runtime_status="failed", reason_code=failure)
 
@@ -341,14 +340,12 @@ class DecisionRuntime:
         """经既有版本机制刷新配置；不可读只报告，不阻止引擎构建。"""
         try:
             await manager.get_async()
-            snapshot = manager.get_cached_versioned_snapshot()
         except Exception as exc:
             logger.warning(
                 "[KomariDecision] Jev 判定配置暂不可用: error={}",
                 type(exc).__name__,
             )
             return False
-        self._explicit_disabled_known = snapshot.value.plugin_enable is False
         return True
 
     async def _ensure_engine(self) -> JevDecisionEngine | None:
@@ -543,10 +540,8 @@ class DecisionRuntime:
 
     def _pre_engine_state(
         self,
-    ) -> tuple[Literal["ready", "disabled", "failed"], DecisionReason]:
-        """引擎尚未可用时的被动三态（不读取任何外部状态）。"""
-        if self._explicit_disabled_known:
-            return ("disabled", "disabled")
+    ) -> tuple[Literal["ready", "failed"], DecisionReason]:
+        """引擎尚未可用时的被动状态（不读取任何外部状态）。"""
         reason = self._lifecycle_failure or self._failure_reason
         if reason is not None:
             return ("failed", reason)

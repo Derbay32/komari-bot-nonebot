@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import sys
 from importlib import import_module
-from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
@@ -31,21 +30,18 @@ if TYPE_CHECKING:
     from nonebug import App
 
 _ERROR_NAMES: tuple[str, ...] = (
-    "UserDataDisabledError",
     "UserDataStoppingError",
     "UserDataUnavailableError",
     "FavorabilityIdempotencyConflictError",
 )
 
 _EXPECTED_BASES: dict[str, type[BaseException]] = {
-    "UserDataDisabledError": RuntimeError,
     "UserDataStoppingError": RuntimeError,
     "UserDataUnavailableError": RuntimeError,
     "FavorabilityIdempotencyConflictError": ValueError,
 }
 
 _EXPECTED_ERROR_CODES: dict[str, str] = {
-    "UserDataDisabledError": "service_unavailable",
     "UserDataStoppingError": "service_unavailable",
     "UserDataUnavailableError": "service_unavailable",
     "FavorabilityIdempotencyConflictError": "idempotency_conflict",
@@ -53,7 +49,6 @@ _EXPECTED_ERROR_CODES: dict[str, str] = {
 
 _ERRORS_MODULE_NAME = "komari_bot.plugins.user_data.errors"
 
-_DISABLED_MESSAGE = "user_data 插件已禁用"
 _STOPPED_MESSAGE = "user_data 已完成 shutdown，不能在同一生命周期内重启"
 
 
@@ -148,35 +143,13 @@ def test_error_code_values_unchanged(user_data_module: Any) -> None:
         assert error_code == expected_code
 
 
-def test_package_top_level_all_exports_four_error_names(
+def test_package_top_level_all_exports_family_error_names(
     user_data_module: Any,
 ) -> None:
-    """验收点 d：包顶层 __all__ 与可访问面仍含四个异常名字。"""
+    """验收点 d：包顶层 __all__ 与可访问面仍含全部存活异常名字。"""
     for name in _ERROR_NAMES:
         assert name in user_data_module.__all__
         assert hasattr(user_data_module, name)
-
-
-@pytest.mark.asyncio
-async def test_user_data_disabled_error_message_preserved(
-    user_data_module: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """验收点 d：UserDataDisabledError 消息正文经既有 raise 路径逐字保持。"""
-
-    async def _disabled_config() -> SimpleNamespace:
-        return SimpleNamespace(plugin_enable=False)
-
-    monkeypatch.setattr(user_data_module, "_get_config_async", _disabled_config)
-
-    with pytest.raises(user_data_module.UserDataDisabledError) as excinfo:
-        await user_data_module.get_db()
-
-    exc = excinfo.value
-    error_code = getattr(exc, "error_code", None)
-    assert str(exc) == _DISABLED_MESSAGE
-    assert isinstance(exc, RuntimeError)
-    assert error_code == "service_unavailable"
 
 
 @pytest.mark.asyncio

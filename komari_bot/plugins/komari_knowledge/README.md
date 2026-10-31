@@ -34,7 +34,7 @@
 
 ```json
 {
-  "plugin_enable": true
+  "knowledge_enabled": true
 }
 ```
 
@@ -99,7 +99,7 @@ poetry run python scripts/migrate_embeddings.py --apply --target knowledge --tar
 
 只有在以下条件都满足时才会挂载管理接口：
 
-- `komari_management.plugin_enable = true`
+- `KOMARI_MANAGEMENT_API_ENABLED = true`
 - `KOMARI_MANAGEMENT_API_CREDENTIALS` 至少包含一条有效具名凭据
 - 当前 NoneBot 驱动是 FastAPI
 
@@ -233,7 +233,7 @@ for item in results:
 
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
-| `plugin_enable` | `false` | 插件总开关 |
+| `knowledge_enabled` | `false` | 知识库开关，重启后完整生效 |
 | `similarity_threshold` | `0.65` | 向量检索最低相似度阈值 |
 | `query_rewrite_rules` | `{"你": "小鞠", "您的": "小鞠的"}` | 查询重写规则 |
 | `layer1_limit` | `3` | Layer 1 关键词匹配返回上限 |
@@ -257,7 +257,7 @@ for item in results:
 
 检查：
 
-- `komari_management.plugin_enable` 是否为 `true`
+- `KOMARI_MANAGEMENT_API_ENABLED` 是否为 `true`
 - `KOMARI_MANAGEMENT_API_CREDENTIALS` 是否至少包含一条有效凭据
 - `.env` / `env.example` 中的驱动是否仍为 `DRIVER=~fastapi`
 

@@ -102,8 +102,18 @@ def _inject_package_exports(plugin_name: str, exports: dict[str, object]) -> Non
 
 class _DummyConfigManager:
     def get(self) -> object:
+        # ADR-0018：按业务能力命名的开关替身，默认全部启用。
         return SimpleNamespace(
-            plugin_enable=True,
+            chat_enabled=True,
+            summary_enabled=True,
+            knowledge_enabled=True,
+            help_enabled=True,
+            knowledge_proposals_enabled=True,
+            sentry_enabled=True,
+            sr_enabled=True,
+            roulette_enabled=True,
+            search_enabled=True,
+            fetch_enabled=True,
             llm_model="deepseek-chat",
             llm_temperature=1.0,
             llm_max_tokens=8192,

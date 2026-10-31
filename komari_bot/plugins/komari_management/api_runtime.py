@@ -68,8 +68,8 @@ def register_management_api_for_driver(
     logger: Any,
 ) -> bool:
     """按驱动与集中配置决定是否挂载统一管理 API。"""
-    if not config.komari_management_plugin_enable:
-        logger.info("[Komari Management] 插件未启用，跳过管理 API 注册")
+    if not config.komari_management_api_enabled:
+        logger.info("[Komari Management] 管理 API 未启用，跳过注册")
         return False
 
     settings = resolve_management_settings(

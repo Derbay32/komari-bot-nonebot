@@ -29,8 +29,8 @@ class ExampleConfigSchema(BaseModel):
         description="最后更新时间戳",
     )
 
-    # 插件控制
-    plugin_enable: bool = Field(default=False, description="插件启用状态")
+    # 业务开关：按实际业务能力命名，不要用笼统的插件总开关
+    feature_enabled: bool = Field(default=False, description="业务功能启用状态")
 
     # 你的自定义字段
     # custom_field: str = Field(default="", description="自定义配置")

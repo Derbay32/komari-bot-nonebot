@@ -402,7 +402,7 @@ def _install_vote_state(
     class _ConfigManager:
         @staticmethod
         def get() -> SimpleNamespace:
-            return SimpleNamespace(plugin_enable=True, vote_emoji_id="128077")
+            return SimpleNamespace(knowledge_proposals_enabled=True, vote_emoji_id="128077")
 
     bot = _Bot(fetch_users=fetch_users)
     monkeypatch.setattr(vote_handler.state, "repository", repository)

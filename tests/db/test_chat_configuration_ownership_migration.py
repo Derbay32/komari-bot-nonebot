@@ -573,6 +573,8 @@ async def test_migration_uses_source_row_when_both_target_rows_are_missing() -> 
                 *MOVED_TO_CHAT,
                 *QUERY_REWRITE_TARGET,
                 "plugin_enable",
+                # 0035 才出现的列名，不参与 0032 边界比对
+                "chat_enabled",
             }
             for field, expected in MOVED_TO_CHAT.items():
                 if field in RETIRED_CHAT_FIELDS:

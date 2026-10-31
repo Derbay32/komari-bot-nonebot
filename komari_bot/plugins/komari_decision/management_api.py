@@ -100,7 +100,7 @@ _REGISTRATION_FLAG: Final = "_komari_decision_api_registered"
 class DecisionHealthResponse(BaseModel):
     """被动健康快照的精确字段；没有观测证据的字段保持 ``null``。"""
 
-    runtime_status: Literal["ready", "disabled", "failed"]
+    runtime_status: Literal["ready", "failed"]
     reason_code: DecisionReason
     last_request_status: Literal["unknown", "success", "failure"]
     last_success_at: datetime | None

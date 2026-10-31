@@ -32,7 +32,7 @@ type DecisionReason = Literal[
     "provider_error",
     "protocol_error",
     "input_unavailable",
-    "disabled",
+    "disabled",  # 仅历史判定行：当前版本不再产生新的停用结果
     "admission_revoked",
     "interrupted",
     "configuration_invalid",
@@ -191,7 +191,7 @@ class DecisionResult:
 class DecisionHealthSnapshot:
     """被动健康快照；没有观测证据的字段保持未知。"""
 
-    runtime_status: Literal["ready", "disabled", "failed"] = "failed"
+    runtime_status: Literal["ready", "failed"] = "failed"
     reason_code: DecisionReason = "initializing"
     last_request_status: Literal["unknown", "success", "failure"] = "unknown"
     last_success_at: datetime | None = None

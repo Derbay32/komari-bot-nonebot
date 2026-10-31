@@ -46,6 +46,7 @@ _KNOWLEDGE_ROW = {
 
 def _config(**overrides: Any) -> SimpleNamespace:
     values: dict[str, Any] = {
+        "knowledge_enabled": True,
         "query_rewrite_rules": {},
         "total_limit": 5,
         "layer1_limit": 0,

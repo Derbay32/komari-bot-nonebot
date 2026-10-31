@@ -31,7 +31,9 @@ podman compose up -d
 5. 部署本项目配套的 [Komari Bot Console](https://github.com/Derbay32/komari-bot-console)，并连接到该项目的管理端点。
 6. 在配置页面设置模型配置，并放行你需要让机器人发言的群。
 
-**Tips：更新只需要更新容器的镜像即可**
+升级前必须核对目标版本的迁移要求。
+配置开关整合要求停机升级。
+环境变量改名与升级影响见[配置开关决策](<docs/adr/0018-business-capability-switches.md#升级影响>)。
 
 ## 文档
 

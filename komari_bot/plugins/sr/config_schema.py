@@ -31,8 +31,12 @@ class DynamicConfigSchema(TypedConfigModel, table=True):
         json_schema_extra={"default_apply_mode": "immediate"},
     )
 
-    # 插件控制
-    plugin_enable: bool = Field(default=False, description="插件启用状态")
+    # 业务控制
+    sr_enabled: bool = Field(
+        default=False,
+        description="是否启用神人榜抽签",
+        json_schema_extra={"apply_mode": "immediate"},
+    )
 
     # 白名单配置
     # sr 数据配置

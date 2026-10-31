@@ -49,7 +49,9 @@ komari-bot/
 │       ├── 0030_hindsight_memory_retirement.py # 旧记忆配置/Prompt 退役（不可逆）
 │       ├── 0031_unused_memory_search_limit.py # 删除无调用方的召回数量配置（不可逆）
 │       ├── 0032_agent_run_retirement.py     # Agent Run 存储退役
-│       └── 0033_dsh_execution_retirement.py # 网关与旧提示词存储退役
+│       ├── 0033_dsh_execution_retirement.py # 网关与旧提示词存储退役
+│       ├── 0034_management_dotenv_config.py # 管理配置转为环境配置
+│       └── 0035_business_capability_switches.py # 业务开关改名与依赖停用项删除
 │
 ├── komari_bot/                           # ★ 核心代码
 │   ├── core/                             # 核心启动与平台基础件（依赖 NoneBot 运行时）
@@ -113,7 +115,7 @@ komari-bot/
 基础服务层（被依赖，不应依赖业务插件）
   config_manager ───────────── 动态配置存储（PostgreSQL 强类型表 + .env 初始化）
   komari_context ───────────── 近期上下文 Redis 客户端唯一所有者
-  permission_manager ───────── 权限检查（白名单、插件开关、SUPERUSER）
+  group_admission ──────────── 统一群准入裁决与逐效果检查
   user_ban ─────────────────── 全局 QQ 用户封禁（chat / command；ORM 表 + revision 缓存）
   embedding_provider ───────── 向量化 + Rerank 服务
   komari_agent ─────────────── DSH 进程、任务桥接与受鉴权管理入口
@@ -186,6 +188,13 @@ SUPERUSER 消息 → komari_debug（命令处理器）
 
 ### 1. 配置管理 (`config_manager`)
 
+修改业务开关名称或作用范围前，读取 [ADR-0018](<docs/adr/0018-business-capability-switches.md>)。
+业务开关按业务能力命名。
+必需依赖不提供独立停用开关。
+迁移 `0035` 保留改名项的已有值。
+网页能力总开关合并到搜索与抓取开关。
+新安装的搜索与抓取均默认关闭。
+
 - **存储源**：业务插件动态配置统一存储在 PostgreSQL 强类型单行表 `komari_<插件>_config`（迁移 0002 建表、0004 为 komari_chat 补充、0026 新增 komari_context、0027 完成 chat/context 字段所有权迁移）；每张表固定主键 `id=1`、CAS 修订号 `revision`（写操作原子自增）、写入时间 `updated_at`（存储层显式赋值）；可扩展字段（列表/字典/嵌套配置）保留 JSONB 列
 - **聊天配置**：`komari_chat_config` 保存主动回复频控与回复履约策略。
 - 回复履约策略包括租约、批次、重试、新鲜度和墓碑保留。
@@ -257,6 +266,9 @@ Jev 提示词仍使用 PostgreSQL 资源 `komari_decision`。
 环境变量统一使用 `KOMARI_MANAGEMENT_` 前缀。
 凭据与 Origin 使用 JSON 数组。
 全部自身配置重启生效，已加载凭据的定时撤销仍按请求检查。
+管理启用字段为 `komari_management_api_enabled`。
+对应环境变量为 `KOMARI_MANAGEMENT_API_ENABLED`。
+旧环境变量名不再生效。
 管理插件不注册自身动态配置资源。
 迁移 `0034` 不可逆删除 `komari_management_config`。
 升级前必须准备私有环境配置，代码不自动导出凭据或回退数据库。
@@ -318,16 +330,13 @@ debug 只返回安全结果，不保留逐轮明细或用量聚合。
 - Rerank 响应的索引必须唯一且在候选范围内，分数必须为有限数，返回条数不得超过 `top_n`。
 - 日志只允许模型、数量、字符数、内容哈希、尝试次数、错误类型和状态码；禁止记录输入正文、query、payload、响应正文或 API Key。
 
-### 3. 权限管理 (`permission_manager`)
+### 3. 统一群准入 (`group_admission`)
 
-```python
-from komari_bot.plugins.permission_manager import check_runtime_permission
-ok, reason = await check_runtime_permission(bot, event, config)
-```
-
-- **禁止** 在 matcher 创建时用 `rule=` 做静态权限检查（会捕获模块加载时的旧配置）
-- **必须** 在处理器内调用 `check_runtime_permission()` 动态检查
-- `SUPERUSERS` 通过 `.env` 配置，白名单等动态配置通过 PostgreSQL 管理
+修改群行为限制前，读取 [ADR-0012](<docs/adr/0012-unified-group-admission.md>)。
+编排层在业务效果发生前重新检查群准入。
+适配器不解释群准入策略。
+各业务插件独立检查自身业务开关。
+业务开关不替代群准入或用户封禁。
 
 ### 3.1 用户封禁 (`user_ban`)
 
@@ -343,7 +352,8 @@ ok, reason = await check_runtime_permission(bot, event, config)
 ### 3.2 用户数据 (`user_data`)
 
 - **生命周期**：仅通过 NoneBot Driver 的 `on_startup` / `on_shutdown` 钩子初始化与关闭，不使用框架不会识别的模块魔术变量
-- **动态禁用**：每次数据库入口（包括已有缓存）都实时检查 `plugin_enable`；禁用时抛出 `UserDataDisabledError`，禁止通过懒加载绕过开关
+- **必需依赖**：用户数据不提供停用开关。
+- **失败边界**：好感度读取失败时，聊天停止回复。
 - **原子初始化**：表结构由 Alembic 基线 0001 统一管理（启动期与懒路径均无 DDL）；连接与引擎生命周期归 nonebot-plugin-orm 托管（`get_session`），Repository 单飞确认存储可连接，失败保持未初始化状态
 - **并发清理**：关闭流程与懒初始化共用初始化锁，先清空全局引用再关闭，避免继续分发正在关闭的实例
 
@@ -360,7 +370,7 @@ ok, reason = await check_runtime_permission(bot, event, config)
 
 ### 3.4 俄罗斯轮盘 (`komari_roulette`)
 
-- **启动与配置**：`QQ_BOTS` 非空时注册官 Bot 适配器；可信官 Bot 数字 QQ 按 `QQ_OFFICIAL_BOT_QQ_BY_APP` 启动配置。迁移 0019/0020/0021 建立游戏、收据/履约和强类型配置；`plugin_enable` 默认 false，动态生效。按共享 ORM → 合法配置 → binding/admission → storage/recovery 顺序启动，首次成功恢复前不放行业务。
+- **启动与配置**：`QQ_BOTS` 非空时注册官 Bot 适配器；可信官 Bot 数字 QQ 按 `QQ_OFFICIAL_BOT_QQ_BY_APP` 启动配置。迁移 0019/0020/0021 建立游戏、收据/履约和强类型配置；`roulette_enabled` 默认 false，动态生效。按共享 ORM → 合法配置 → binding/admission → storage/recovery 顺序启动，首次成功恢复前不放行业务。
 - **领域与事务**：2～6 人、6 发弹仓、15 分钟绝对行动期限；稳定 `join_seq` 不重排或复用。开始时冻结名字、编号顺序与道具权重。命令、收据、游戏状态和胜场通过 PG 事务/约束/锁/CAS 一致提交，不新增轮盘专用 Redis 依赖。
 - **QQ 交互**：仅群 @ `/轮盘 …`，目标用稳定玩家编号，不依赖第二个 mention。按钮只填入命令，用户手动发送才执行。终局为完整普通单段，无引用/粗体/按钮；提及使用胜者已知 OpenID，不从昵称猜测。
 - **一次履约**：领域提交后冻结文案与投影；配置变化不重渲染旧收据。发送开始后异常、取消或缺失合法平台 ID 保持 UNKNOWN / `PENDING_CONFIRMATION`，不得回滚领域事实、重抽、重发或猜测确认。后台无合法入站消息 ID 不创建群消息 outbox。
@@ -386,8 +396,9 @@ TSK-197 已物理删除旧四层运行代码、专用配置列与记忆总结 Pr
 导出完成前不得删除正式来源存储。
 
 - 顶层暴露面只有 `KomariMemoryConfigSchema` / `HindsightMemoryService` / `HindsightRecallSession` / `HindsightRetainRequest` / `HindsightUnavailableError` / `get_hindsight_memory`。
-- 配置只保留 `plugin_enable` 与 5 个 `hindsight_*` 字段。
-- `plugin_enable` 保留 opt-out；`startup_required=False` 保留。
+- 配置只保留 5 个 `hindsight_*` 字段。
+- 共享记忆不提供停用开关。
+- `startup_required=False` 保留。
 - 启动创建一个稳定 caller，并尝试一次有界探测；配置读取失败不中止其他插件。
 - 每个回复任务打开一个会话；会话冻结一份设置快照，并复用一个官方客户端。
 - 就绪要求读取目标 bank 配置成功，并完成一次真实 `arecall` 探测。
@@ -528,12 +539,12 @@ Jev 请求截止覆盖连接、发送、接收与响应校验。
 重启不恢复旧队列或补做旧请求。
 判定日志清理不删除持久事件去重身份。
 
-`plugin_enable` 在新配置中默认为 `true`。
-迁移保留已有的显式关闭值。
-运行状态区分 `ready`、`disabled`、`failed`。
-启用但缺少有效连接或 Prompt 时报告 `failed`。
+System One 不提供人为停用开关。
+运行状态区分 `ready` 与 `failed`。
+缺少有效连接或 Prompt 时报告 `failed`。
 判定初始化失败不阻止独立功能启动。
-停用撤销尚未交接结果的生效资格。
+保留群准入撤权与进程关闭取消。
+历史停用原因仍可查询，不作为新的运行状态。
 
 技术失败通知直接使用 `GroupTaskFailureNotifier.notify`。
 通知前先领取持久化的 `failure_notification` 资格。
@@ -790,4 +801,4 @@ KOMARI_TEST_POSTGRES_URL=postgresql+asyncpg://user:pass@host:5432/komari_bot_tes
 
 ---
 
-*本文件由 AI 生成于 2026-04-26，最后更新于 DSH 执行退役（TSK-207）。发现不一致请以实际代码为准并更新本文档。*
+*本文件由 AI 生成于 2026-04-26，最后更新于配置业务开关整合（TSK-210）。发现不一致请以实际代码为准并更新本文档。*

@@ -224,7 +224,7 @@ async def test_exact_route_surface_and_idempotent_registration() -> None:
     assert registered_api_routes(plane.app) == EXPECTED_ROUTES
 
 
-async def test_control_plane_needs_no_plugin_enable_or_admission_gate() -> None:
+async def test_control_plane_needs_no_roulette_enabled_or_admission_gate() -> None:
     """控制面注册不读动态配置、不过群准入闸门（观测/运维通道）。"""
 
     plane = build_control_plane(observation=None)
@@ -823,7 +823,7 @@ async def test_real_management_assembly_mounts_roulette_routes() -> None:
     logger = _FakeLogger()
     config = ManagementConfig.model_validate(
         {
-            "komari_management_plugin_enable": True,
+            "komari_management_api_enabled": True,
             "komari_management_api_credentials": management_credentials(),
             "komari_management_api_allowed_origins": [],
         }

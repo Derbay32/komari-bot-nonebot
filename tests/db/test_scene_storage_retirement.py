@@ -67,9 +67,14 @@ RETIRED_TABLES: tuple[str, ...] = (
 )
 
 #: 0025 之后判定配置表应有的列（顺序无关，用集合比较）。
-EXPECTED_CONFIG_COLUMNS: frozenset[str] = frozenset(
+LEGACY_CONFIG_COLUMNS: frozenset[str] = frozenset(
     (*STORAGE_COLUMNS, *RETAINED_DECISION_CONFIG_FIELDS)
 )
+"""0025 至 0034 边界形状：0024 保留字段全量（含 0035 才退役的停用开关）。"""
+EXPECTED_CONFIG_COLUMNS: frozenset[str] = LEGACY_CONFIG_COLUMNS - frozenset(
+    {"plugin_enable"}
+)
+"""head 形状：0024 保留字段中除去 0035 退役的停用开关。"""
 
 SKIP_NO_POSTGRES = pytest.mark.skipif(
     not POSTGRES_URL, reason="未设置 KOMARI_TEST_POSTGRES_URL，跳过迁移集成测试"
@@ -238,12 +243,12 @@ async def test_fresh_install_reaches_head_without_scene_storage() -> None:
             # 当前共享 schema 约定：配置列没有 server default
             assert (
                 await connection.fetchval(
-                    "SELECT column_default FROM information_schema.columns"
+                    "SELECT count(*) FROM information_schema.columns"
                     " WHERE table_schema = 'public'"
                     " AND table_name = 'komari_decision_config'"
-                    " AND column_name = 'plugin_enable'"
+                    " AND column_default IS NOT NULL"
                 )
-                is None
+                == 0
             )
         finally:
             await connection.close()
@@ -325,7 +330,7 @@ async def test_populated_0024_upgrade_retires_only_scene_storage() -> None:
             await connection.close()
 
         # 0024 时代列集合 = 3 存储 + 13 保留 + 38 退役
-        assert before_config_columns == set(EXPECTED_CONFIG_COLUMNS) | set(
+        assert before_config_columns == set(LEGACY_CONFIG_COLUMNS) | set(
             RETIRED_DECISION_CONFIG_FIELDS
         )
         assert before_config[1] == disabled_row
@@ -407,11 +412,11 @@ async def test_populated_0024_upgrade_retires_only_scene_storage() -> None:
             assert before_config_columns - after_config_columns == set(
                 RETIRED_DECISION_CONFIG_FIELDS
             )
-            assert after_config_columns == set(EXPECTED_CONFIG_COLUMNS)
+            assert after_config_columns == set(LEGACY_CONFIG_COLUMNS)
             # 4. 运维值、revision、updated_at 原样保留；行数不改写
             after_config = await _config_rows(connection)
             assert set(after_config) == set(before_config)
-            surviving = sorted(EXPECTED_CONFIG_COLUMNS)
+            surviving = sorted(LEGACY_CONFIG_COLUMNS)
             for row_id, before_row in before_config.items():
                 assert _project(after_config[row_id], surviving) == _project(
                     before_row, surviving
@@ -438,8 +443,8 @@ async def test_populated_0024_upgrade_retires_only_scene_storage() -> None:
 
 @SKIP_NO_POSTGRES
 @pytest.mark.asyncio
-async def test_new_configuration_is_enabled_by_default_but_unconfigured() -> None:
-    """无行库升级后仍无行；新初始化配置启用但没有任何可用 Jev 连接。"""
+async def test_new_configuration_is_unconfigured_without_a_disable_switch() -> None:
+    """无行库升级后仍无行；新初始化配置没有停用开关，也没有可用 Jev 连接。"""
     if not same_database(POSTGRES_URL, SQLALCHEMY_URL):
         pytest.skip("KOMARI_TEST_POSTGRES_URL 与 SQLALCHEMY_DATABASE_URL 不一致")
     scratch = await recreate_scratch_database(_scratch_name("tsk190empty"))
@@ -457,7 +462,7 @@ async def test_new_configuration_is_enabled_by_default_but_unconfigured() -> Non
                 == 0
             )
             # 列无 server default：init 由配置管理器按 Pydantic 默认值执行，
-            # 因此升级不会把插件开关写进任何存量行
+            # 因此升级不会把配置值写进任何存量行
             defaults = {
                 str(row["column_name"]): row["column_default"]
                 for row in await connection.fetch(
@@ -475,9 +480,8 @@ async def test_new_configuration_is_enabled_by_default_but_unconfigured() -> Non
         schema = ensure_typed_config_model("komari_decision")
         assert schema is not None
         config = cast("type[Any]", schema)()
-        # 新初始化的配置默认启用，但仍然没有可用连接（enabled-but-unconfigured）
-        assert config.plugin_enable is True
-        assert schema.model_fields["plugin_enable"].default is True
+        # ADR-0018：判定不再提供停用开关；新初始化仍然没有可用连接。
+        assert "plugin_enable" not in schema.model_fields
         assert config.jev_base_url == ""
         assert config.jev_api_key == ""
         assert config.startup_required is False
@@ -513,7 +517,7 @@ async def test_downgrade_from_0025_is_rejected_without_restoring_storage() -> No
             tables = await _public_tables(connection)
             assert not set(RETIRED_TABLES) & tables
             assert await _columns(connection, DECISION_CONFIG_TABLE) == (
-                set(EXPECTED_CONFIG_COLUMNS)
+                set(LEGACY_CONFIG_COLUMNS)
             )
         finally:
             await connection.close()

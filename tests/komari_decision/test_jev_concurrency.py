@@ -661,29 +661,6 @@ async def test_forged_result_route_cannot_claim(decision_database: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_disable_trigger_invalidates_unhanded_late_results(
-    decision_database: str,
-) -> None:
-    """AC：停用撤销未交接资格；恢复启用不会复活迟到结果。"""
-    async with DecisionHarness(decision_database) as harness:
-        assert harness.decision is not None and harness.engine is not None
-        identity = make_identity()
-        request = make_request(identity=identity)
-        result = await harness.decision.evaluate(request)
-        assert result.status == "success"
-
-        await update_config_row(harness.engine, {"plugin_enable": False})
-        row = await read_dispatch(harness.engine, identity)
-        assert row is not None
-        assert row["state"] == "cancelled"
-        assert row["reason_code"] == "disabled"
-        assert await harness.decision.claim_handoff(request, result, "chat") is False
-
-        await update_config_row(harness.engine, {"plugin_enable": True})
-        assert await harness.decision.claim_handoff(request, result, "chat") is False
-
-
-@pytest.mark.asyncio
 async def test_handoff_rechecks_live_admission(decision_database: str) -> None:
     """AC：交接前重新裁决准入；撤销后结果失效且不可复活。"""
     admitted = {"value": True}
@@ -708,44 +685,6 @@ async def test_handoff_rechecks_live_admission(decision_database: str) -> None:
 
         admitted["value"] = True
         assert await harness.decision.claim_handoff(request, result, "chat") is False
-
-
-@pytest.mark.asyncio
-async def test_disable_during_reference_read_blocks_the_model_call(
-    decision_database: str,
-) -> None:
-    """AC：持有引用读取期间 false→true 停用后不得再发起 SDK 请求。"""
-    reference_started = asyncio.Event()
-    release = asyncio.Event()
-
-    async def reference_reader(
-        _identity: EventIdentity, message_id: str
-    ) -> Any:
-        reference_started.set()
-        await release.wait()
-        return make_message(
-            group_id=_identity.group_id, message_id=message_id, text="引用原文"
-        )
-
-    options = HarnessOptions(reference_reader=reference_reader)
-    async with DecisionHarness(decision_database, options) as harness:
-        assert harness.decision is not None and harness.engine is not None
-        identity = make_identity()
-        request = make_request(
-            identity=identity,
-            target=make_message(identity=identity, reference_ids=("ref-1",)),
-        )
-        pending = asyncio.create_task(harness.decision.evaluate(request))
-        await asyncio.wait_for(reference_started.wait(), timeout=5)
-        # 停用再启用：config_source 之后仍会看到 true，但持久撤销已经生效
-        await update_config_row(harness.engine, {"plugin_enable": False})
-        await update_config_row(harness.engine, {"plugin_enable": True})
-        release.set()
-        result = await asyncio.wait_for(pending, timeout=15)
-
-        assert result.status == "cancelled"
-        assert result.reason_code in {"disabled", "interrupted", "admission_revoked"}
-        assert harness.transport.requests == []
 
 
 @pytest.mark.asyncio

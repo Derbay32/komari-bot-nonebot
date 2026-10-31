@@ -36,7 +36,7 @@ def custom_module(app: App, monkeypatch: pytest.MonkeyPatch) -> Any:
         monkeypatch.setitem(sys.modules, PACKAGE_NAME, shim)
 
     async def _dummy_config() -> SimpleNamespace:
-        return SimpleNamespace(plugin_enable=True)
+        return SimpleNamespace(knowledge_proposals_enabled=True)
 
     monkeypatch.setattr(module.config_manager, "get_async", _dummy_config)
     return module
